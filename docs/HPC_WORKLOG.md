@@ -1,568 +1,60 @@
 # HPC / Inkly Worklog
 
-This is a sanitized project worklog for durable collaboration history. Machine-specific paths, credentials, and temporary debugging details are intentionally omitted.
+This is the public high-level development history for Inkly.
 
-## 2026-09-10 — Repository audit and stabilization
+Detailed cluster validation evidence, raw scheduler output, node identifiers, job identifiers, account information, and infrastructure investigation records are maintained separately from the public repository.
 
-- Audited personal branches and classified them as current, stale, superseded, or unfinished.
-- Preserved unfinished repository-assistant work without merging it into `dev`.
-- Confirmed the current architecture is Ollama-backed, Slurm-aware, plugin-based, and retrieval-assisted.
-- Confirmed Python 3.9 can compile the current source tree.
+## Phase 1 — Gaussian Documentation Integration
 
-### PR #111 — Date-relative jobs/database tests
+Completed:
 
-- Replaced stale hard-coded dates in jobs/database flow tests with values relative to the current UTC date.
-- Production code was unchanged.
-- Result after merge: 95 tests passing.
-- Merge SHA: `8f65702e8cf51199297b696c192a4633b07dee0c`.
+- integrated the Gaussian documentation scraper with Inkly
+- connected scraper-produced SQLite documentation to Inkly retrieval
+- added source and provenance labeling
+- added retrieval limits and failure handling
+- added regression coverage
+- benchmarked local retrieval performance
+- prevented external-cluster documentation from being presented as verified Cuttlefish commands
 
-### PR #112 — CI quality baseline
+## Phase 1 — Installation Validation
 
-- Added a `Quality` workflow for pushes and pull requests.
-- Test matrix covers Python 3.9 and 3.11.
-- Added Ruff lint and format checks.
-- Added `ruff.toml` targeting Python 3.9 with a conservative lint rule set.
-- Merge SHA: `0f6c7955926357b050204e5e21bdfeff0e234faa`.
+Completed:
 
-## 2026-09-10 to 2026-09-11 — Retrieval and prompt diagnosis
+- validated clean Inkly installation
+- identified and fixed stale installed-runtime behavior
+- verified the installed ink launcher uses the expected runtime
+- validated missing and corrupt Gaussian documentation database handling
+- verified cluster-specific questions fail safely when trusted local evidence is unavailable
 
-### Retrieval findings
+## Phase 1B — Cuttlefish Gaussian Operational Validation
 
-- Profiled plugin discovery/execution and found plugin overhead to be small relative to model generation.
-- Found that retrieval accepted zero-score results when `min_score = 0.0` and `fallback_to_all_plugins = true`.
-- Verified safer defaults:
-  - `min_score = 0.01`
-  - `fallback_to_all_plugins = false`
-- Verified relevant queries still selected useful plugins such as queue status, node information, and Gaussian documentation.
+Validated:
 
-### Prompt findings
+- Gaussian availability and access behavior
+- Gaussian module loading
+- successful Gaussian execution
+- Gaussian scratch behavior
+- Slurm CPU allocation behavior
+- physical-core-aware Gaussian CPU selection
+- dynamic Gaussian CPU binding
+- Slurm memory enforcement
+- separation of Slurm memory and Gaussian internal memory
+- conservative automatic Gaussian memory sizing
+- trusted Cuttlefish cluster-profile integration
 
-- A fresh conversation did not eliminate slow/irrelevant responses, so stored history was not the primary cause.
-- Direct tests showed the assembled response contract itself materially affected output quality and latency.
-- A simplified contract produced substantially better literal-instruction behavior while preserving HPC responses.
-
-### PR #113 — Retrieval and response-contract fix
-
-Changes included:
-
-- Safer retrieval defaults in the config template, config dataclass, and retriever constructor.
-- A revised response contract that no longer forces unrelated/literal requests into an HPC framing.
-- Regression coverage showing unrelated queries can return no plugins.
-
-Validation before merge:
-
-- 95 tests passed.
-- Ruff lint passed.
-- Ruff format check passed.
-- `git diff --check` passed.
-
-Merge SHA: `1ef6b9010ad930bb509d4f0052f0e53669017e60`.
-
-## 2026-09-11 — Installed runtime validation
-
-- Synced the relevant merged runtime files and retrieval settings into the installed Inkly environment used for smoke testing.
-- Confirmed the installed retrieval config uses the safer defaults.
-
-### Literal instruction tests
-
-Observed examples:
-
-- Raw Ollama: exact output succeeded in roughly 4-5 seconds.
-- Full Inkly: returned `FINAL_OK Hello` instead of exactly `FINAL_OK`, with highly variable latency.
-- Staged runtime timing showed one run at about 3.9 seconds total, with model generation dominating and retrieval/history overhead near zero.
-
-Conclusion at this stage:
-
-- Persistent Python/plugin overhead was not the main problem.
-- The response contract still influenced exact-output compliance.
-- End-to-end latency was variable rather than consistently slow.
-
-### PR #114 — Exact-output instruction
-
-Added an explicit contract rule:
-
-> If the user asks for an exact response, return only the exact requested text and nothing else.
-
-Validation before merge:
-
-- 95 tests passed.
-- Ruff lint passed.
-- Ruff format check passed.
-- Direct experimental contract test returned exact output.
-
-Merge SHA: `22d9d5531586c10db07afcf863d8bb9d01d4e1b7`.
-
-## 2026-09-11 — Post-PR #114 diagnosis
-
-After installing the merged runtime, the real `ink` command still produced `FINAL_OK Hello` and one run took over 30 seconds.
-
-Further isolation ruled out several suspected causes:
-
-- Piping the admin Ollama wrapper through stdout did not reproduce the failure by itself.
-- The exact prompt produced by the real `handle_query()` path was captured and tested directly.
-- That full production prompt reproduced `FINAL_OK Hello` even when sent straight to Ollama.
-
-This demonstrated that the remaining exact-output issue was caused by the production prompt wording itself, not by installation drift, plugin retrieval, conversation history, CLI argument handling, or stdout piping.
-
-### Simplified production-contract experiment
-
-A shorter contract retained the important rules while removing extra wording around plugin/history context and unavailable cluster information.
-
-Results:
-
-- Literal test: returned exactly `FINAL_OK` in about 5.1 seconds.
-- Real HPC validation: answered a queue-status question using cluster/plugin context and reported 14 running jobs.
-- The queue answer remained concise and grounded.
-- That HPC run took about 18.3 seconds, confirming latency remains variable and should be investigated separately from prompt correctness.
-
-Current conclusion:
-
-1. Simplifying the production response contract is the next correctness change to test and merge.
-2. Retrieval behavior is substantially improved.
-3. Plugin/runtime overhead is not the primary latency source.
-4. End-to-end model/admin-wrapper latency variance remains an open performance issue.
-5. `dev` should not yet be declared the final known-good collaboration baseline until the simplified contract and final smoke tests are complete.
-
-## Collaboration sequence after stabilization
-
-Once personal `dev` is known-good:
-
-1. Record the exact known-good SHA.
-2. Sync that exact history to `thealice-lab/hpc-ink-setup`.
-3. Verify the organization fork matches.
-4. Return to `gaussian-docs-scraper`.
-5. Integrate scraper-backed Gaussian documentation on a dedicated integration branch rather than directly on `dev`.
-
-## 2026-09-11 — Terminal-newline isolation
-
-Further testing overturned the earlier conclusion that the response contract itself needed to be simplified.
-
-### Branch-runtime failure
-
-A source-runtime smoke test using the simplified contract still returned:
-
-`FINAL_OK Hello`
-
-and one run took about 41.6 seconds.
-
-This showed that contract simplification alone did not explain the production behavior.
-
-### Transport isolation
-
-The admin Ollama wrapper was then launched using the same subprocess shape as Inkly, with stdin, stdout, and stderr all piped.
-
-Result:
-
-- Return code: 0
-- Output: exactly `FINAL_OK`
-- Runtime: about 6.5 seconds
-
-This ruled out the fully piped subprocess transport as the cause.
-
-### Exact prompt comparison
-
-The real branch-generated prompt was captured and compared with the successful manual prompt.
-
-The meaningful differences were:
-
-- one response-contract sentence was wrapped across two lines in the generated prompt
-- the generated prompt did not end with a newline
-
-Changing only the wrapped sentence to one line did not fix the issue; the result was still `FINAL_OK Hello`.
-
-This ruled out line wrapping as the cause.
-
-### Terminal-newline tests
-
-The minimal production prompt, which ends with a newline, was executed five times.
-
-Results:
-
-- exact output succeeded 5/5
-- runtimes were roughly 3.1 to 5.0 seconds
-
-Next, exactly one terminal newline was added to the captured branch-generated prompt without otherwise changing the prompt.
-
-Results:
-
-- exact output succeeded 5/5
-- runtimes were roughly 3.1 to 5.0 seconds
-
-Finally, exactly one terminal newline was added to the original verbose production prompt from the real `handle_query()` path.
-
-Results:
-
-- exact output succeeded 5/5
-- runtimes were roughly 3.3 to 5.3 seconds
-
-### Revised conclusion
-
-The evidence strongly indicates that the admin Ollama wrapper/model path is sensitive to whether the prompt is terminated by a newline.
-
-The earlier response-contract simplification hypothesis is therefore superseded. The existing production contract should remain intact.
-
-The next fix is intentionally small:
-
-1. make `assemble_prompt()` return a prompt ending in exactly one newline
-2. add regression coverage for the terminal newline
-3. validate exact-output and real HPC behavior before merging
-4. continue treating large latency variance as a separate performance issue
-
-### Branch-runtime validation after terminal-newline fix
-
-The actual source runtime was tested with the newline fix in place.
-
-Exact-output test:
-
-- Query: `Reply with exactly: FINAL_OK`
-- Streamed output: exactly `FINAL_OK`
-- Returned response: exactly `FINAL_OK`
-- Runtime: about 4.0 seconds
-
-Real HPC queue test:
-
-- Query: `What jobs are running in the queue right now?`
-- Response used real queue/plugin context
-- Reported 14 running jobs at test time
-- Response remained concise and did not invent commands or unrelated advice
-- Runtime: about 7.4 seconds
-
-Conclusion:
-
-The terminal-newline fix now passes both literal exact-output behavior and real HPC plugin-context behavior through the actual branch runtime.
-
-## 2026-09-11 — Final installed runtime validation
-
-After merging PR #116, the installed Inkly runtime was synchronized with `dev`.
-
-Final real `ink` tests:
-
-- Exact-output query returned exactly `FINAL_OK`.
-- Exact-output runtime: about 30.6 seconds.
-- Queue query returned a grounded response reporting 14 running jobs at test time.
-- Queue-query runtime: about 7.9 seconds.
-
-Conclusion:
-
-- Prompt correctness is functionally validated.
-- Retrieval/plugin behavior is working.
-- `28b4077b76d6c6ade7059425d17ea73585ec2add` is the functionally known-good baseline.
-- End-to-end latency variance remains an open performance issue.
-
-## 2026-09-14 — Alice Lab dev synchronization
-
-The Alice Lab fork remote was verified and personal `dev` was pushed to the organization fork without modifying `main` or copying stale branches.
-
-Verification:
-
-- Personal remote: `origin/dev`
-- Alice Lab remote: `alice/dev`
-- Both resolved to `ed0de023c7e27dbdbfadfec9589912f87cfaab81`
-- The functionally validated Inkly code baseline remains `28b4077b76d6c6ade7059425d17ea73585ec2add`
-- The later `ed0de02...` history includes the runtime-validation tracking update
-- Alice Lab `main` was left untouched
-
-The Alice Lab synchronization prerequisite is now complete. The next tracked phase is Gaussian documentation integration.
-
-## 2026-09-14 — Gaussian/Inkly integration architecture
-
-The project direction was clarified after reviewing HPC meeting notes.
-
-Phase 1 will use direct local retrieval rather than MCP:
-
-documentation sources -> scraper -> ~/.inkly/{domain}.db -> standardized retrieval interface -> bounded source-labeled context -> Inkly model -> answer
-
-Decisions:
-- Inkly and the scraper are two components of the same overall HPC assistant system.
-- GitHub Copilot is not part of the planned architecture.
-- The scraper-produced SQLite databases are the initial knowledge source.
-- Inkly should retrieve only passages relevant to the current user query.
-- A standardized internal documentation-search interface will separate Inkly from the underlying storage implementation.
-- Scraped content will be treated as untrusted reference material and will carry provenance.
-- Phase 1 must be benchmarked for retrieval and end-to-end latency before adding another server layer.
-
-Future Phase 2:
-- Evaluate a shared central knowledge database/service.
-- Allow multiple approved models or applications to use the same knowledge if practical.
-- Define a standardized network tool/API.
-- Evaluate MCP as an optional interoperability wrapper rather than a Phase 1 dependency.
-- Define authentication and permissions before supporting remote clients.
-
-User-study planning:
-- Tentative target is November-December 2026.
-- Study location may need to be outside UNCW.
-- The study should measure real HPC task completion, answer quality, latency, confusion, and failure recovery.
-
-Licensing:
-- The scraper currently lacks an explicit license.
-- Nathan's authorship and Git history should be preserved.
-- An explicit license should be selected before the projects are distributed as one product, with terms matching the desired commercial/source-sharing policy.
-
-## 2026-09-14 — Licensing direction
-
-Selected licensing direction for the combined Inkly/scraper system:
-
-- AGPL-3.0-only for open/source-sharing use.
-- A separate commercial license for organizations that want proprietary use without AGPL obligations.
-- Preserve Nathan's authorship and Git history.
-- Confirm contributor ownership/relicensing permission before representing that one person can issue proprietary licenses for all existing scraper contributions.
-
-Engineering integration can continue while that contributor-rights confirmation is documented.
-
-## 2026-09-14 — Scraper portability milestone
-
-Completed the first Phase 1 scraper engineering change on `thealice-lab/gaussian-docs-scraper` branch `integration/inkly-phase1`.
-
-Changes:
-- Removed the committed Nathan-specific Windows database output path from `configs/gaussian.toml`.
-- Kept the portable default at `~/.inkly/{domain}.db` through `Path.home()`.
-- Added `expanduser()` handling so explicit `~` paths resolve correctly.
-- Stopped serializing the default output path into generated TOML, avoiding machine-specific absolute paths; custom paths are still preserved.
-- Added regression tests for tilde expansion, default-path omission, and custom-path preservation.
-
-Validation:
-- Targeted config suite: 26 tests passed.
-- Full scraper suite: 151 tests passed.
-- `git diff --check` passed.
-- `python -m pip check` reported no broken requirements.
-- Phase 1 development/testing on Cuttlefish uses the same `inkly-test` virtual environment for Inkly and the scraper.
-
-Scraper commit: `884cdb7f6f064c2255334ddedeb32ac8a9dd3be7` (`Make scraper output paths portable`).
-
-## 2026-09-14 — Standardized documentation search interface
-
-Completed the next Phase 1 scraper milestone on `thealice-lab/gaussian-docs-scraper` branch `integration/inkly-phase1`.
-
-Changes:
-- Added `gaussian_scraper.search.search_docs(domain, query, top_k=5, ...)` as the stable internal documentation-search boundary.
-- Kept `PassageIndex`, TF-IDF ranking, and SQLite loading behind that interface so Inkly does not need to depend on scraper retrieval internals.
-- Updated the existing `search_docs.py` CLI to call the standardized interface.
-- Added focused tests covering a real SQLite-backed search and the missing-domain failure path.
-
-Validation:
-- Focused search/index tests: 12 tests passed.
-- Full scraper suite: 153 tests passed.
-- `git diff --check` and staged diff checks passed before commit.
-
-Scraper commit: `71a9c011cd91c5e1fdff005bf942608771940ee9` (`Add standardized documentation search interface`).
-
-## 2026-09-14 — Scraper package installation setup
-
-Made the scraper consumable as a normal Python package for local Phase 1 Inkly integration.
-
-Changes:
-- Added `setup.py` with Python 3.9+ metadata and the scraper runtime dependencies.
-- Verified `python -m pip install -e .` installs the scraper into the active environment and makes `gaussian_scraper.search.search_docs` importable from the separate Inkly repository.
-- Expanded the scraper README with virtual-environment, editable-install, verification, and Inkly shared-environment instructions.
-- Recorded that the normal Inkly installation path should eventually provision/verify this dependency so end users do not have to remember separate manual setup commands.
-
-Validation:
-- Full scraper suite: 153 tests passed.
-- `python -m pip check` reported no broken requirements.
-- `git diff --check` and staged diff checks passed.
-- Import verification succeeded both from the scraper repository and from the separate Inkly repository while using the shared `inkly-test` environment.
-
-Scraper commit: `8b8cb4b1402c1486bc944360e028847ec395a225` (`Add scraper package installation setup`).
-
-## 2026-09-14 — One-command Inkly setup
-
-Completed the normal-user bootstrap path on `integration/gaussian-docs` so Inkly and the Gaussian documentation scraper can be provisioned through one setup command.
-
-Changes:
-- Added executable `setup.sh` as the user-facing setup entry point.
-- Added `requirements.txt` with the Python 3.9/3.10 `tomli` compatibility dependency.
-- `setup.sh` creates and reuses a private `~/.inkly/venv`, installs Inkly requirements, clones the scraper integration branch, installs the scraper into the private environment, runs Inkly's existing Python installer, and verifies `gaussian_scraper.search.search_docs` is importable.
-- Updated `install.py` so the installed `ink` launcher uses the exact Python interpreter that ran the installer; normal users therefore do not need to activate Inkly's virtual environment before running `ink`.
-- Added focused regression coverage for the installed launcher's interpreter and executable bit.
-- Updated the README so normal users run `bash setup.sh`; `install.py` remains the internal installer.
-
-Validation:
-- Focused installer regression test: 1 passed.
-- Full Inkly test suite: 96 passed.
-- `bash -n setup.sh` passed.
-- `git diff --check` and staged diff checks passed.
-- A fresh end-to-end setup completed successfully under an isolated temporary home directory without touching the user's existing Inkly installation.
-- The temporary install contained the private Python environment, scraper checkout, Inkly runtime, launcher, jobs database, and config.
-- The installed launcher's shebang pointed to the temporary Inkly private Python interpreter.
-- Re-running `setup.sh` against the same temporary installation completed successfully and reused the existing environment and scraper checkout.
-
-Inkly commit: `db575774bd39eb3a8919e0041cdf23f2869f6b7a` (`Add one-command Inkly setup`).
-
-## 2026-09-28 — Installed Ink validation and Alice Lab branch sync
-
-Returned to the Cuttlefish Phase 1 Gaussian integration work on branch `integration/gaussian-docs`.
-
-Initial validation:
-- Working tree was clean.
-- Full Inkly test suite passed: 115 tests.
-- `python -m py_compile` passed.
-- `git diff --check` passed.
-- Ruff lint passed.
-- Ruff formatting check passed.
-
-Launcher/runtime investigation:
-- The repository `./ink` launcher was newer than the installed `~/.inkly/bin/ink`.
-- The installed runtime under `~/.inkly/lib/inkly` was also older than the current integration branch.
-- This caused `ink` and `./ink` to behave differently.
-- `./ink` correctly intercepted Cuttlefish-specific Gaussian questions and withheld unverified external cluster commands.
-- The stale installed `ink` sometimes fell through to the model path, took roughly 27-34 seconds, and could return generic HPC instructions that were not verified for Cuttlefish.
-
-Installed-runtime update:
-- Created a backup of the existing Inkly installation before making changes.
-- Ran the repository's existing `python install.py` installer instead of manually copying runtime files.
-- The installer copied the current Inkly runtime into `~/.inkly/lib/inkly` and installed the current launcher into `~/.inkly/bin/ink`.
-- Verified the installed launcher uses the intended Python interpreter.
-- Verified the installed runtime contains the deterministic source-scoping logic.
-
-Post-install Cuttlefish validation:
-- `ink How do I run Gaussian on Cuttlefish?` returned the expected cluster-specific unavailable/not-verified response in about 0.077 seconds.
-- `ink How do I submit a Gaussian job on Cuttlefish?` returned the same guarded response in about 0.072 seconds.
-- The normal `ink` command now behaves like the validated source `./ink` path for these cluster-specific requests.
-
-Repository synchronization:
-- Confirmed Alice Lab `dev` is an ancestor of the Gaussian integration branch with no missing `dev` commits.
-- Confirmed the organization repository contains `main`, `dev`, and `integration/gaussian-docs`.
-- Did not bulk-copy old personal feature branches because many are historical and are not required for the current integration work.
-- The personal `integration/gaussian-docs` branch contained one later documentation-only commit, `6bba0246` (`Record Phase 1 HPC validation and benchmark`).
-- Fast-forwarded the local branch to that commit.
-- Pushed the complete branch to `thealice-lab/hpc-ink-setup`.
-- Local, personal GitHub, and Alice Lab copies of `integration/gaussian-docs` were synchronized at `6bba0246e46946c220b99bcccd75e0f6db6e15cf`.
+## Current Phase 1B Work
 
 Next:
-- Commit and push this progress log.
-- Merge `integration/gaussian-docs` into the Alice Lab `dev` branch through a pull request.
-- Perform a fresh-install validation from updated `dev` to prove a normal user gets the correct `ink` command immediately after installation.
 
-## 2026-09-28 — Fresh-install Gaussian source-scoping regression
+- validate Inkly's complete user-facing Gaussian SBATCH generation
+- verify generated jobs follow the trusted Cuttlefish rules
+- add regression coverage for final job-generation behavior
+- complete reproducible Cuttlefish setup documentation
+- validate setup with a fresh Cuttlefish user account
+- merge validated Phase 1B work through the normal ALICE development flow
 
-Alice Lab PR #1 was merged into `dev` as merge commit `8c8ffe36b136ab180fe3f0d772d40d408a2bd55f`.
+## Publication Policy
 
-An isolated fresh-install validation was then performed using a temporary HOME so the existing user installation was not reused.
+The public repository should contain only the information needed to understand, install, develop, test, and safely use Inkly.
 
-Fresh-install results:
-- `setup.sh` completed successfully.
-- The private Inkly Python environment was created.
-- The Gaussian scraper package installed successfully.
-- The installed `ink` launcher used the private Inkly Python interpreter.
-- Running `ink` from outside the repository returned exactly `FINAL_OK` for the exact-output test.
-
-A source-scoping regression was discovered during the clean-install Gaussian test.
-
-Query:
-`How do I run Gaussian on Cuttlefish?`
-
-The fresh installation did not yet contain `~/.inkly/gaussian.db`. In this state, `docs_gaussian` returned a generic documentation-unavailable result rather than the cluster-specific unavailable marker expected by the runtime safety guard. The request therefore fell through to the LLM, which produced an unverified Cuttlefish-specific Gaussian command.
-
-This is not acceptable behavior. Missing, corrupt, or empty documentation must never allow the model to invent local cluster commands.
-
-Root cause:
-- The runtime deterministic guard activates when `docs_gaussian` emits the cluster-unavailable marker.
-- The plugin emitted that marker when external matches existed.
-- Missing/corrupt databases and no-relevant-match paths returned generic messages without the marker.
-- The LLM was therefore allowed to generate a cluster-specific answer.
-
-A dedicated hotfix branch will make all cluster-specific Gaussian failure paths emit the deterministic unavailable marker and will add regression coverage for missing database, corrupt database, and no-relevant-match cases.
-
-Personal PR #122 remains open and must not be closed until the hotfix is merged into Alice Lab `dev` and the clean-install test passes.
-
-
-## 2026-09-28 — Fresh-install Gaussian source-scoping hotfix validated
-
-Implemented the clean-install Gaussian source-scoping fix on branch
-`fix/fresh-install-gaussian-source-scoping`.
-
-Changes:
-- Cluster-specific Gaussian queries now emit the deterministic unavailable marker when documentation retrieval is unavailable.
-- Missing scraper/database, corrupt database, and no-relevant-match paths can no longer fall through to the LLM for local Gaussian commands.
-- General Gaussian questions retain their existing behavior.
-- Added regression coverage for all three clean-install/failure paths.
-
-Validation:
-- Targeted Gaussian/source-scoping tests: 16 passed.
-- Full Inkly suite: 118 passed.
-- `git diff --check` passed.
-- Ruff lint passed.
-- Ruff formatting check passed.
-
-Fresh-install regression validation:
-- Created a new isolated HOME.
-- Ran the normal `setup.sh` installation from the hotfix branch.
-- Confirmed no `~/.inkly/gaussian.db` existed in the clean installation.
-- Ran the installed `ink` command from outside the repository.
-- Exact-output test returned exactly `FINAL_OK`.
-- `How do I run Gaussian on Cuttlefish?` returned the deterministic unavailable/not-verified response in about 0.06 seconds.
-- `How do I submit a Gaussian job on Cuttlefish?` returned the same guarded response in about 0.05 seconds.
-- No Gaussian module, executable, scheduler command, path, or other Cuttlefish-specific value was invented.
-
-The clean-install regression is fixed and validated. Next step is to commit/push the hotfix, merge it into Alice Lab `dev`, then repeat the final installed-dev smoke test before closing personal PR #122 as superseded.
-
-## 2026-09-28 — Added Gaussian operational validation gate
-
-Reviewed the remaining Phase 1 work and identified a missing validation step.
-
-Existing testing proves that:
-- Gaussian documentation can be scraped and stored.
-- Inkly can retrieve that documentation.
-- External documentation is source-labeled and prevented from becoming unverified Cuttlefish facts.
-- Retrieval and response paths function end-to-end.
-
-However, these tests do not prove that the retrieved documentation is actually useful for creating correct Gaussian jobs on Cuttlefish.
-
-Added a new Phase 1B operational-validation section before Phase 2.
-
-Phase 1B will:
-- collect known-good Gaussian job scripts that previously ran successfully on Cuttlefish
-- identify the actual local SBATCH, Gaussian, resource, environment, scratch, and I/O requirements
-- compare scraper-retrieved guidance against those known-good jobs
-- distinguish verified Cuttlefish facts from useful external guidance and conflicting/outdated material
-- test Inkly-generated Gaussian SBATCH files against known-good local examples
-- add regression cases for verified local job patterns
-- perform non-destructive scheduler/script validation where possible
-- eventually run a minimal controlled Gaussian job if permitted
-- create a repeatable Gaussian job-generation evaluation for future scraper/database changes
-
-This operational validation is now considered part of Phase 1 completion before moving to Phase 2/MCP infrastructure work.
-
-
-## 2026-09-28 — Final merged-dev fresh-install validation
-
-Alice Lab PR #2 was merged into `dev` as
-`d78c58759aa27fda0913e6e185a50c2c496a68ef`.
-
-A final fresh-install validation was performed from that exact merged `dev`
-commit using a new isolated HOME.
-
-Results:
-- `setup.sh` completed successfully.
-- The Gaussian scraper dependency installed successfully.
-- The installed `ink` launcher worked from outside the repository.
-- The fresh installation intentionally had no `~/.inkly/gaussian.db`.
-- Exact-output testing returned exactly `FINAL_OK`.
-- `How do I run Gaussian on Cuttlefish?` returned the deterministic unavailable/not-verified response in about 0.06 seconds.
-- `How do I submit a Gaussian job on Cuttlefish?` returned the same guarded response in about 0.06 seconds.
-- No unverified Gaussian module, executable, scheduler command, partition, or path was generated.
-
-The clean-install Gaussian source-scoping regression is therefore fixed and
-validated on the authoritative Alice Lab `dev` branch.
-
-The next Gaussian engineering stage is Phase 1B operational validation:
-compare scraper retrieval and Inkly-generated Gaussian SBATCH files against
-known-good jobs that actually ran successfully on Cuttlefish.
-
-
-## 2026-09-28 — Personal repository synchronization complete
-
-After final validation, the authoritative Alice Lab `dev` history was pushed to
-the personal repository's `dev` branch.
-
-Both repositories now point to the same validated `dev` commit:
-`2a8f814`.
-
-GitHub automatically recognized personal PR #122 as merged because its
-integration history is now contained in personal `dev`. No separate manual
-merge or close operation is required.
-
-The Gaussian integration and fresh-install source-scoping work is now complete.
-Before beginning Phase 1B, the operational-validation methodology will be
-reviewed to determine the strongest way to measure whether scraper knowledge
-actually improves useful and correct Gaussian SBATCH generation on Cuttlefish.
+Raw cluster validation artifacts and unnecessary infrastructure details should remain outside the public repository.

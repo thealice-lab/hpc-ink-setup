@@ -54,7 +54,7 @@ def test_ensure_ready_starts_tunnel_when_enabled(monkeypatch, tmp_path):
         make_config(
             tmp_path,
             tunnel_enabled=True,
-            ssh_target="rrv9177@gpuj042",
+            ssh_target="testuser@gpu-node",
         )
     )
 

@@ -32,7 +32,7 @@ def test_generate_ollama_calls_tunnel_manager(monkeypatch):
     cfg = make_config()
     cfg.ollama.mode = "ssh_tunnel"
     cfg.ollama.tunnel_enabled = True
-    cfg.ollama.ssh_target = "rrv9177@gpu1"
+    cfg.ollama.ssh_target = "testuser@gpu-node"
 
     backend = LLMBackend(cfg)
 
@@ -59,7 +59,7 @@ def test_generate_ollama_uses_direct_host(monkeypatch):
     cfg = make_config()
     cfg.ollama.mode = "direct_host"
     cfg.ollama.use_direct_host = True
-    cfg.ollama.direct_host = "gpu1"
+    cfg.ollama.direct_host = "gpu-node"
     cfg.ollama.direct_port = 11434
 
     backend = LLMBackend(cfg)
@@ -75,7 +75,7 @@ def test_generate_ollama_uses_direct_host(monkeypatch):
     result = backend.generate("hello")
 
     assert result == "ok"
-    assert captured["env"]["OLLAMA_HOST"] == "http://gpu1:11434"
+    assert captured["env"]["OLLAMA_HOST"] == "http://gpu-node:11434"
 
 
 def test_generate_ollama_admin_command_uses_stdin(monkeypatch):

@@ -164,12 +164,14 @@ ink
 
 ## Installation for Users
 
-This section covers the normal user-side installation path.
+> **Cuttlefish users:** Follow [`docs/CUTTLEFISH_SETUP.md`](docs/CUTTLEFISH_SETUP.md) for the current Cuttlefish setup and validation procedure.
+
+This section covers the general user-side installation path.
 
 ### 1. Clone the repository
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/thealice-lab/hpc-ink-setup.git
 cd hpc-ink-setup
 ```
 
