@@ -8,3 +8,21 @@ __pycache__/
 /__pycache__
 __pycache__/config.cpython-313.pyc
 tests/__pycache__/test_toml_parser_basic.cpython-313-pytest-9.0.2.pyc
+
+# Local test and coverage data
+.coverage
+.coverage.*
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+
+# HPC / Slurm runtime artifacts
+*.out
+*.err
+*.log
+*.stats
+*.time
+fort.*
+
+# Raw Gaussian validation artifacts
+benchmarks/gaussian/live_tests/
