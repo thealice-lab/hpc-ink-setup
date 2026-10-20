@@ -32,8 +32,11 @@ inkly_home = "~/.inkly"
 # Location for Inkly-managed launchers or executables.
 bin_dir = "~/.inkly/bin"
 
-# Root directory for all logs.
+# Directory for private diagnostic events.
 log_dir = "~/.inkly/logs"
+
+# Full conversation history stays private; legacy history remains a recovery copy.
+conversation_dir = "~/.inkly/conversations"
 
 # Logging & Research Controls
 #
@@ -50,10 +53,10 @@ level = "info"
 # Schema version for log format compatibility.
 schema_version = 1
 
-# Log user prompts (sanitized by default).
+# Record prompt metadata (character counts only).
 log_user_prompts = true
 
-# Log AI responses.
+# Record response metadata (character counts only).
 log_ai_responses = true
 log_raw_ai_responses = false
 
@@ -61,8 +64,7 @@ log_raw_ai_responses = false
 # Log job success/failure outcomes.
 log_job_outcomes = false
 
-# EXPERIMENTAL / RESEARCH ONLY
-# Raw prompts disabled by default for public release
+# Raw diagnostic content is unsupported; full history has separate private storage.
 log_raw_prompts = false
 
 # Where logs are written.
@@ -73,6 +75,23 @@ global_log = false
 # Log rotation and size limits.
 max_log_file_mb = 10
 max_log_files = 5
+
+# Set the lab-only Unix group before enabling. The installer can create this root.
+# Existing directories must already have the configured group and mode 3770.
+# See docs/SHARED_OBSERVABILITY.md before enabling.
+[logging.shared]
+enabled = true
+directory = "/scratch/inklys-logs"
+group = "hpc_pulatovd_lab"
+# Zero leaves shared files until the storage administrator removes them.
+retention_days = 0
+approval_reference = ""
+# Mirror all history privately to history-<Unix UID>/ under the scratch root.
+archive_conversations = true
+# Share filtered full chat snapshots with the configured group for Inkly improvements.
+# Never enter passwords, tokens or private keys. Filtering is not a secrecy guarantee.
+# Set enabled = false above to stop all scratch logging while retaining private history.
+share_conversations = true
 
 # In-Memory History
 #

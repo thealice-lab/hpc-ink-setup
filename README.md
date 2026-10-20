@@ -222,6 +222,7 @@ The main config sections are:
 - `[install]`
 - `[state]`
 - `[logging]`
+- `[logging.shared]`
 - `[logging.history]`
 - `[intelligence]`
 - `[conversation]`
@@ -409,6 +410,21 @@ Inkly stores persistent per-user conversation history under:
 ```
 
 This allows follow-up questions to make sense without forcing the user to restate earlier context.
+
+Set `[state].conversation_dir` to use another private, per-account location.
+History directories use mode `0700` and files use `0600` on Linux. Existing history
+is preserved in the default directory as a private recovery copy; configured
+storage outages fall back to that copy and synchronize on the next successful write.
+Conversation text is never included in diagnostic events.
+
+Private diagnostic JSONL events use `[state].log_dir` (default `~/.inkly/logs`).
+New Cuttlefish installs enable shared collection at `/scratch/inklys-logs` for
+`hpc_pulatovd_lab` members only. The installer can create the root and purpose README, and explains access
+and opt-out settings. It separates metadata diagnostics, group-readable filtered
+chat snapshots and owner-private full archives. Never enter credentials: filtering
+cannot catch every secret. Administrators manage scratch cleanup. See
+[shared observability](docs/SHARED_OBSERVABILITY.md)
+for configuration, privacy rules, migration behavior, and the two-account verification checklist.
 
 Conversation behavior is configured under:
 

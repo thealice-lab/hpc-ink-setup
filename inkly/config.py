@@ -67,6 +67,7 @@ class StateConfig:
     inkly_home: Path = Path("~/.inkly")
     bin_dir: Path = Path("~/.inkly/bin")
     log_dir: Path = Path("~/.inkly/logs")
+    conversation_dir: Path = Path("~/.inkly/conversations")
 
     def resolve(self) -> "StateConfig":
         """Resolve and expand all paths to absolute paths.
@@ -80,16 +81,18 @@ class StateConfig:
             StateConfig: The StateConfig object with resolved paths (self).
 
         """
-        self.inkly_home = Path(self.inkly_home).expanduser()
-        self.bin_dir = Path(self.bin_dir).expanduser()
-        self.log_dir = Path(self.log_dir).expanduser()
+        for name in ("inkly_home", "bin_dir", "log_dir", "conversation_dir"):
+            value = getattr(self, name)
+            if not isinstance(value, (str, Path)) or not str(value).strip():
+                raise ConfigError(f"state.{name} must be a non-empty path")
+            setattr(self, name, Path(os.path.abspath(Path(value).expanduser())))
         return self
 
     def validate(self) -> "StateConfig":
         """Validates that all paths are properly set
 
-        Validation checks that bin_dir and log_dir all live under inkly_home
-        to prevent misconfiguration that could lead to data being stored in unintended locations.
+        Launchers must live under inkly_home. Private history and diagnostic
+        locations can be configured independently and are checked when opened.
 
         Parameters:
             None
@@ -105,11 +108,6 @@ class StateConfig:
             self.bin_dir.relative_to(self.inkly_home)
         except ValueError:
             raise ConfigError("bin_dir must live under inkly_home")
-
-        try:
-            self.log_dir.relative_to(self.inkly_home)
-        except ValueError:
-            raise ConfigError("log_dir must live under inkly_home")
 
         return self
 
@@ -134,6 +132,40 @@ class LoggingHistoryConfig:
 
 
 @dataclass
+class SharedLoggingConfig:
+    enabled: bool = False
+    directory: str = "/scratch/inklys-logs"
+    group: str = ""
+    retention_days: int = 0
+    approval_reference: str = ""
+    archive_conversations: bool = True
+    share_conversations: bool = True
+
+    def validate(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("logging.shared.enabled must be a boolean")
+        if not isinstance(self.archive_conversations, bool):
+            raise ConfigError("logging.shared.archive_conversations must be a boolean")
+        if not isinstance(self.share_conversations, bool):
+            raise ConfigError("logging.shared.share_conversations must be a boolean")
+        if not self.enabled:
+            return self
+        for name in ("directory", "group"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"logging.shared.{name} must be set")
+        directory = Path(self.directory).expanduser()
+        if not directory.is_absolute():
+            raise ConfigError("logging.shared.directory must be absolute")
+        self.directory = os.path.abspath(directory)
+        if type(self.retention_days) is not int or self.retention_days < 0:
+            raise ConfigError("logging.shared.retention_days must be >= 0")
+        if not isinstance(self.approval_reference, str):
+            raise ConfigError("logging.shared.approval_reference must be a string")
+        return self
+
+
+@dataclass
 class LoggingConfig:
     enabled: bool = True
     level: Literal["debug", "info", "warning", "error"] = "info"
@@ -154,14 +186,18 @@ class LoggingConfig:
     max_log_files: int = 5
 
     history: LoggingHistoryConfig = field(default_factory=LoggingHistoryConfig)
+    shared: SharedLoggingConfig = field(default_factory=SharedLoggingConfig)
 
     @property
     def max_bytes(self) -> int:
         return self.max_log_file_mb * 1024 * 1024
 
     def validate(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("logging.enabled must be a boolean")
         if not self.enabled:
             return self
+        self.shared.validate()
         if self.log_raw_prompts and not self.log_user_prompts:
             raise ConfigError("log_raw_prompts requires log_user_prompts = true")
         if self.log_raw_ai_responses and not self.log_ai_responses:
@@ -171,15 +207,19 @@ class LoggingConfig:
         if self.level not in allowed_levels:
             raise ConfigError(f"Invalid logging.level: {self.level}")
 
-        if self.schema_version <= 0:
-            raise ConfigError("logging.schema_version must be >= 1")
-        if self.max_log_file_mb <= 0:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ConfigError("logging.schema_version must be 1")
+        if type(self.max_log_file_mb) is not int or self.max_log_file_mb <= 0:
             raise ConfigError("logging.max_log_file_mb must be > 0")
-        if self.max_log_files <= 0:
+        if type(self.max_log_files) is not int or self.max_log_files <= 0:
             raise ConfigError("logging.max_log_files must be > 0")
-        if not self.per_user_logs and not self.global_log:
+        if self.global_log:
+            raise ConfigError("Use logging.shared instead of global_log")
+        if self.log_raw_prompts or self.log_raw_ai_responses:
+            raise ConfigError("Raw content is not supported in diagnostic logs")
+        if not self.per_user_logs and not self.shared.enabled:
             raise ConfigError(
-                "At least one of per_user_logs or global_log must be enabled"
+                "Enable per_user_logs or logging.shared when logging is enabled"
             )
 
         self.history.validate()
@@ -446,9 +486,31 @@ class TomlParser:
         history = LoggingHistoryConfig(**logging_raw.get("history", {}))
 
         logging_cfg = LoggingConfig(
-            **{k: v for k, v in logging_raw.items() if k != "history"}, history=history
+            **{
+                key: value
+                for key, value in logging_raw.items()
+                if key not in {"history", "shared"}
+            },
+            history=history,
+            shared=SharedLoggingConfig(**logging_raw.get("shared", {})),
         )
         logging_cfg.validate()
+
+        if logging_cfg.enabled and logging_cfg.shared.enabled:
+            shared_dir = Path(logging_cfg.shared.directory)
+            private_dirs = (
+                state.inkly_home.absolute(),
+                state.log_dir,
+                state.conversation_dir,
+                Path.home() / ".inkly" / "conversations",
+            )
+            for private_dir in private_dirs:
+                if (
+                    shared_dir == private_dir
+                    or shared_dir in private_dir.parents
+                    or private_dir in shared_dir.parents
+                ):
+                    raise ConfigError("Shared logs must be separate from private state")
 
         intelligence_raw = dict(raw.get("intelligence") or {})
 
