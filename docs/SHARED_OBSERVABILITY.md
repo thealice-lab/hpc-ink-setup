@@ -117,6 +117,26 @@ read-only. Other shapes are rejected, not stripped. Checks follow the
 
 ## Opt out
 
+### Owner-only scratch setup without a lab group
+
+For a personal deployment, run from the source checkout with Inkly's Python:
+
+```bash
+~/.inkly/venv/bin/python tools/configure_private_scratch.py --install-runtime
+```
+
+This backs up configuration/runtime privately, creates `/scratch/inklys-logs` at
+mode `0700`, disables group sharing, and keeps metadata diagnostics in both
+`~/.inkly/logs/` and `/scratch/inklys-logs/logs/`. Complete history uses
+`/scratch/inklys-logs/conversations/` with the home recovery copy retained.
+Files are `0600`: only the owner and administrators can read them. Other users'
+histories are not collected. An existing shared/foreign-owned root is refused,
+not converted. Set `[logging] private_scratch_dir = ""` to stop the extra private
+diagnostic destination; change `state.conversation_dir` back to its home default
+to stop scratch history writes. Existing scratch files are not deleted.
+
+### Disable group sharing
+
 Edit `~/.inkly/config.toml` before the next query:
 
 ```toml

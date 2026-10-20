@@ -214,6 +214,14 @@ class DiagnosticSession:
                     max_files,
                 )
             )
+        private_scratch = getattr(self.config, "private_scratch_dir", "")
+        if private_scratch and all(
+            Path(private_scratch).expanduser().absolute() != sink.directory.absolute()
+            for sink in self.sinks
+        ):
+            self.sinks.append(
+                EventSink(private_scratch, self.session_id, max_bytes, max_files)
+            )
         shared = getattr(self.config, "shared", None)
         if shared is not None and shared.enabled:
             self.sinks.append(

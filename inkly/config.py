@@ -184,6 +184,7 @@ class LoggingConfig:
 
     max_log_file_mb: int = 10
     max_log_files: int = 5
+    private_scratch_dir: str = ""
 
     history: LoggingHistoryConfig = field(default_factory=LoggingHistoryConfig)
     shared: SharedLoggingConfig = field(default_factory=SharedLoggingConfig)
@@ -198,6 +199,13 @@ class LoggingConfig:
         if not self.enabled:
             return self
         self.shared.validate()
+        if not isinstance(self.private_scratch_dir, str):
+            raise ConfigError("logging.private_scratch_dir must be a path string")
+        if self.private_scratch_dir:
+            directory = Path(self.private_scratch_dir).expanduser()
+            if not directory.is_absolute():
+                raise ConfigError("logging.private_scratch_dir must be absolute")
+            self.private_scratch_dir = os.path.abspath(directory)
         if self.log_raw_prompts and not self.log_user_prompts:
             raise ConfigError("log_raw_prompts requires log_user_prompts = true")
         if self.log_raw_ai_responses and not self.log_ai_responses:
@@ -217,7 +225,11 @@ class LoggingConfig:
             raise ConfigError("Use logging.shared instead of global_log")
         if self.log_raw_prompts or self.log_raw_ai_responses:
             raise ConfigError("Raw content is not supported in diagnostic logs")
-        if not self.per_user_logs and not self.shared.enabled:
+        if (
+            not self.per_user_logs
+            and not self.shared.enabled
+            and not self.private_scratch_dir
+        ):
             raise ConfigError(
                 "Enable per_user_logs or logging.shared when logging is enabled"
             )
@@ -504,6 +516,8 @@ class TomlParser:
                 state.conversation_dir,
                 Path.home() / ".inkly" / "conversations",
             )
+            if logging_cfg.private_scratch_dir:
+                private_dirs += (Path(logging_cfg.private_scratch_dir),)
             for private_dir in private_dirs:
                 if (
                     shared_dir == private_dir
