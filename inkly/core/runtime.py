@@ -5,6 +5,7 @@ from threading import BoundedSemaphore
 import textwrap
 
 from inkly.core.conversation import ConversationManager
+from inkly.core.diagnostics import DiagnosticSession
 from inkly.llm.backend import LLMBackend
 from inkly.plugins.manager import PluginManager
 from inkly.retrieval.retriever import PluginRetriever
@@ -317,6 +318,13 @@ class InklyRuntime:
         )
 
     def handle_query(self, user_id: str, query: str) -> str:
+        with DiagnosticSession(self.config) as diagnostics:
+            diagnostics.emit("user_prompt", {"chars": len(query)})
+            response = self._handle_query(user_id, query, diagnostics)
+            diagnostics.emit("ai_response", {"chars": len(response)})
+            return response
+
+    def _handle_query(self, user_id: str, query: str, diagnostics) -> str:
         """
         Handle a user query end-to-end:
         - Appends the user turn to the conversation
@@ -364,6 +372,9 @@ class InklyRuntime:
                             retriever.select_plugins(query, discovered)
                         )
                 except Exception:
+                    diagnostics.emit(
+                        "error", {"component": "retrieval", "code": "retrieval_failed"}
+                    )
                     # On error, optionally fall back to all plugins
                     if retrieval_cfg.fallback_to_all_plugins:
                         selected_plugins = list(discovered.values())
@@ -400,6 +411,9 @@ class InklyRuntime:
                 try:
                     plugin_outputs[plugin_name] = plugin.run(query)
                 except Exception as exc:
+                    diagnostics.emit(
+                        "error", {"component": "plugin", "code": "plugin_failed"}
+                    )
                     plugin_outputs[plugin_name] = f"Plugin error: {exc}"
 
             # When the Gaussian documentation plugin explicitly says that local
@@ -410,6 +424,7 @@ class InklyRuntime:
                 query=query,
             )
             if source_scoped_response is not None:
+                diagnostics.emit("guardrail_block", {"code": "cluster_scope_withheld"})
                 self.conversation.append_turn(
                     user_id, "assistant", source_scoped_response
                 )
@@ -433,6 +448,9 @@ class InklyRuntime:
             try:
                 response = self.backend.generate(prompt)
             except Exception as exc:
+                diagnostics.emit(
+                    "error", {"component": "backend", "code": "backend_failed"}
+                )
                 # On backend error, log the error in the conversation
                 self.conversation.append_turn(
                     user_id,

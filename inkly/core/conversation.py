@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+from inkly.core.permissions import open_shared_directory
+from inkly.core.shared_conversations import publish_conversation_snapshot
+from inkly.core.storage import (
+    atomic_history,
+    history_lock,
+    private_directory,
+    private_open,
+)
 
 
 class ConversationManager:
@@ -23,15 +37,148 @@ class ConversationManager:
         # Master on/off switch for conversation persistence.
         self.enabled = self.config.conversation.enabled
 
-        # Per-user conversation files live under ~/.inkly/conversations.
-        self.base_dir = Path.home() / ".inkly" / "conversations"
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.recovery_dir = Path.home() / ".inkly" / "conversations"
+        state = getattr(config, "state", None)
+        configured = getattr(state, "conversation_dir", self.recovery_dir)
+        self.base_dir = Path(os.path.abspath(Path(configured).expanduser()))
+        self._storage_warning_shown = False
+        logging = getattr(config, "logging", None)
+        self.shared = (
+            getattr(logging, "shared", None)
+            if getattr(logging, "enabled", False)
+            else None
+        )
+        self.archive_dir = None
+        if (
+            os.name == "posix"
+            and self.shared is not None
+            and self.shared.enabled
+            and self.shared.archive_conversations
+        ):
+            self.archive_dir = Path(self.shared.directory) / f"history-{os.getuid()}"
+
+    @staticmethod
+    def _filename(user_id: str) -> str:
+        if not isinstance(user_id, str):
+            raise TypeError("Conversation user IDs must be strings")
+        if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", user_id):
+            return user_id + ".json"
+        return "user-" + hashlib.sha256(user_id.encode("utf-8")).hexdigest() + ".json"
+
+    def _directories(self) -> list[Path]:
+        directories = list(dict.fromkeys((self.recovery_dir, self.base_dir)))
+        if self.archive_dir is not None:
+            try:
+                descriptor = open_shared_directory(
+                    Path(self.shared.directory), self.shared.group
+                )
+                os.close(descriptor)
+                directories.append(self.archive_dir)
+            except OSError:
+                self._warn_storage()
+        return directories
+
+    def _warn_storage(self) -> None:
+        if not self._storage_warning_shown:
+            try:
+                warnings.warn(
+                    "Inkly history storage is unavailable or invalid; originals are "
+                    "preserved and private recovery is used when possible.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+            except RuntimeWarning:
+                pass
+            self._storage_warning_shown = True
+
+    def _lock_directory(self) -> Path:
+        for directory in self._directories():
+            try:
+                return private_directory(directory)
+            except OSError:
+                self._warn_storage()
+        raise OSError("No usable private conversation storage is available")
+
+    def _load_sources(self, name: str) -> tuple[list[dict], list[Path]]:
+        merged = []
+        seen = set()
+        writable = []
+        for directory in self._directories():
+            try:
+                private_directory(directory)
+                try:
+                    descriptor = private_open(directory / name, os.O_RDONLY)
+                except FileNotFoundError:
+                    records = []
+                else:
+                    with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+                        records = json.load(source)
+                if not isinstance(records, list) or any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("role"), str)
+                    or not isinstance(item.get("content"), str)
+                    for item in records
+                ):
+                    raise ValueError("Invalid conversation history")
+            except (OSError, ValueError):
+                self._warn_storage()
+                continue
+            writable.append(directory)
+            occurrences = {}
+            for record in records:
+                record = record.copy()
+                original = {
+                    key: value for key, value in record.items() if key != "turn_id"
+                }
+                digest = hashlib.sha256(
+                    json.dumps(original, sort_keys=True, ensure_ascii=False).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                occurrence = occurrences.get(digest, 0)
+                occurrences[digest] = occurrence + 1
+                turn_id = record.get("turn_id")
+                if not isinstance(turn_id, str) or not turn_id:
+                    turn_id = f"legacy-{digest}-{occurrence}"
+                record["turn_id"] = turn_id
+                if turn_id not in seen:
+                    merged.append(record)
+                    seen.add(turn_id)
+        if not writable:
+            raise OSError("No usable private conversation storage is available")
+        merged.sort(key=lambda record: str(record.get("timestamp", "")))
+        return merged, writable
+
+    def _persist(self, name: str, records: list[dict], directories: list[Path]) -> None:
+        saved = False
+        for directory in directories:
+            try:
+                if directory == self.archive_dir:
+                    descriptor = open_shared_directory(
+                        Path(self.shared.directory), self.shared.group
+                    )
+                    os.close(descriptor)
+                atomic_history(directory / name, records)
+                saved = True
+            except OSError:
+                self._warn_storage()
+        if not saved:
+            raise OSError("Conversation could not be saved to private storage")
+        if (
+            self.shared is not None
+            and self.shared.enabled
+            and self.shared.share_conversations
+        ):
+            try:
+                publish_conversation_snapshot(self.shared, name, records)
+            except (OSError, ValueError):
+                self._warn_storage()
 
     def _conversation_file(self, user_id: str) -> Path:
         """
         Return the JSON file path for one user's conversation history.
         """
-        return self.base_dir / f"{user_id}.json"
+        return self.base_dir / self._filename(user_id)
 
     def _read_full_history(self, user_id: str) -> List[Dict[str, Any]]:
         """
@@ -44,61 +191,50 @@ class ConversationManager:
         if not self.enabled:
             return []
 
-        path = self._conversation_file(user_id)
-        if not path.exists():
-            return []
-
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return []
-
-        if not isinstance(data, list):
-            return []
-
-        valid: List[Dict[str, Any]] = []
-        for item in data:
-            if (
-                isinstance(item, dict)
-                and isinstance(item.get("role"), str)
-                and isinstance(item.get("content"), str)
-            ):
-                valid.append(item)
-
-        return valid
+        name = self._filename(user_id)
+        with history_lock(self._lock_directory(), name):
+            history, _ = self._load_sources(name)
+            return history
 
     def _write_full_history(self, user_id: str, history: List[Dict[str, Any]]) -> None:
         """
         Persist the full conversation history for a user.
         """
-        path = self._conversation_file(user_id)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+        if not self.enabled:
+            return
+        name = self._filename(user_id)
+        with history_lock(self._lock_directory(), name):
+            _, directories = self._load_sources(name)
+            self._persist(name, history, directories)
+
+    def _append_records(self, user_id: str, turns: list[tuple[str, str]]) -> None:
+        if not self.enabled:
+            return
+        name = self._filename(user_id)
+        with history_lock(self._lock_directory(), name):
+            history, directories = self._load_sources(name)
+            for role, content in turns:
+                history.append(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "turn_id": uuid4().hex,
+                        "role": role,
+                        "content": content,
+                    }
+                )
+            self._persist(name, history, directories)
 
     def append_turn(self, user_id: str, role: str, content: str) -> None:
         """
         Append one conversation turn to persistent storage.
         """
-        if not self.enabled:
-            return
-
-        history = self._read_full_history(user_id)
-        history.append(
-            {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "role": role,
-                "content": content,
-            }
-        )
-        self._write_full_history(user_id, history)
+        self._append_records(user_id, [(role, content)])
 
     def append_exchange(self, user_id: str, question: str, answer: str) -> None:
         """
         Append a user/assistant exchange as two back-to-back turns.
         """
-        self.append_turn(user_id, "user", question)
-        self.append_turn(user_id, "assistant", answer)
+        self._append_records(user_id, [("user", question), ("assistant", answer)])
 
     def load_recent(self, user_id: str) -> List[Dict[str, Any]]:
         """

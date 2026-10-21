@@ -4,7 +4,9 @@ import shutil
 from pathlib import Path
 import sys
 
-from inkly.config import TomlParser
+from inkly.config import ConfigError, TomlParser
+from inkly.core.shared_storage import prepare_shared_storage
+from inkly.core.storage import private_directory
 
 # Bootstrap Paths & Environment
 #
@@ -54,7 +56,8 @@ def setup_runtime_dirs():
 
     STATE_CFG.inkly_home.mkdir(parents=True, exist_ok=True)
     STATE_CFG.bin_dir.mkdir(parents=True, exist_ok=True)
-    STATE_CFG.log_dir.mkdir(parents=True, exist_ok=True)
+    private_directory(STATE_CFG.log_dir)
+    private_directory(STATE_CFG.conversation_dir)
 
     # Internal library directory for Inkly runtime code
     LIB_DIR = STATE_CFG.inkly_home / "lib"
@@ -85,6 +88,63 @@ def initialize_jobs_database():
     from inkly.db import initialize_jobs_db
 
     initialize_jobs_db(STATE_CFG.inkly_home / "jobs.db")
+
+
+def setup_shared_storage(shared, *, logging_enabled=True):
+    """Best-effort shared scratch setup without compromising private storage."""
+    print_shared_logging_notice(shared, logging_enabled=logging_enabled)
+    if not logging_enabled:
+        return False
+    if not shared.group:
+        print(
+            "Shared scratch setup skipped: configure logging.shared.group with a "
+            "lab-only Unix group and ensure your account belongs to it.",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        prepare_shared_storage(shared)
+    except (OSError, ValueError, ConfigError):
+        print(
+            "Shared scratch setup unavailable: ask the lab administrator to check "
+            "group membership, directory access and storage. Private history remains available.",
+            file=sys.stderr,
+        )
+        return False
+    print("Shared scratch directory and purpose README are ready.")
+    if not shared.enabled:
+        print("Shared diagnostic collection remains disabled in configuration.")
+    return True
+
+
+def print_shared_logging_notice(shared, *, logging_enabled=True):
+    """Explain the collection boundary before setting up shared storage."""
+    print("\nInkly shared logging notice:")
+    print(f"Scratch destination: {shared.directory}")
+    print(
+        f"Readers: every member of the configured Unix group ({shared.group or 'not configured'})."
+    )
+    print(
+        "An NFSv4 collector directory also grants its owner access to shared records."
+    )
+    print("When enabled, existing and future chats are shared to help improve Inkly.")
+    print(
+        "Chats may contain personal details, cluster information and unpublished work."
+    )
+    print(
+        "Never enter passwords, credentials, tokens or private keys. Filtering is not a guarantee."
+    )
+    print("To opt out, set [logging.shared] enabled = false in ~/.inkly/config.toml.")
+    print("For diagnostics only, set [logging.shared] share_conversations = false.")
+    print(
+        "Your original private history remains in your home; administrators can access it."
+    )
+    print(
+        "Scratch files remain until administrator cleanup; opting out does not erase old shared files."
+    )
+    print(
+        f"Shared collection is currently {'ENABLED' if shared.enabled and logging_enabled else 'DISABLED'}.\n"
+    )
 
 
 # Ink Launcher Installation
@@ -181,6 +241,7 @@ def main():
     STATE_CFG = cfg.state
 
     setup_runtime_dirs()
+    setup_shared_storage(cfg.logging.shared, logging_enabled=cfg.logging.enabled)
     initialize_jobs_database()
     install_ink()
     configure_shell_path()
