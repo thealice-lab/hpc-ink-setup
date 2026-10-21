@@ -418,7 +418,7 @@ storage outages fall back to that copy and synchronize on the next successful wr
 Conversation text is never included in diagnostic events.
 
 Private diagnostic JSONL events use `[state].log_dir` (default `~/.inkly/logs`).
-New Cuttlefish installs enable shared collection at `/scratch/inklys-logs` for
+New Cuttlefish installs enable shared collection at `/scratch/inklys-logs/shared` for
 `hpc_pulatovd_lab` members only. The installer can create the root and purpose README, and explains access
 and opt-out settings. It separates metadata diagnostics, group-readable filtered
 chat snapshots and owner-private full archives. Never enter credentials: filtering

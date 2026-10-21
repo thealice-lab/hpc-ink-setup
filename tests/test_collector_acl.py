@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from inkly.config import SharedLoggingConfig
+from inkly.config import SharedLoggingConfig, TomlParser
 from inkly.core import permissions
 from inkly.core.diagnostics import EventSink
 from inkly.core.shared_conversations import publish_conversation_snapshot
@@ -17,6 +17,19 @@ from tests.test_observability_permissions import basic_entries, encode_acl
 LAB = 987654321
 COLLECTOR = 123456789
 READER = permissions.NFS4_METADATA_MASK | 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Cuttlefish uses POSIX absolute paths")
+def test_default_collection_root_does_not_overlap_private_scratch(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[state]\nconversation_dir = "/scratch/inklys-logs/conversations"\n'
+        '[logging]\nprivate_scratch_dir = "/scratch/inklys-logs/logs"\n'
+        '[logging.shared]\nenabled = true\ngroup = "synthetic-lab"\n',
+        encoding="utf-8",
+    )
+    config = TomlParser(path).load()
+    assert config.logging.shared.directory == "/scratch/inklys-logs/shared"
 
 
 def named_entries(*, directory=False, owner=COLLECTOR):

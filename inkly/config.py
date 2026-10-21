@@ -134,7 +134,7 @@ class LoggingHistoryConfig:
 @dataclass
 class SharedLoggingConfig:
     enabled: bool = False
-    directory: str = "/scratch/inklys-logs"
+    directory: str = "/scratch/inklys-logs/shared"
     group: str = ""
     retention_days: int = 0
     approval_reference: str = ""

@@ -81,7 +81,7 @@ max_log_files = 5
 # See docs/SHARED_OBSERVABILITY.md before enabling.
 [logging.shared]
 enabled = true
-directory = "/scratch/inklys-logs"
+directory = "/scratch/inklys-logs/shared"
 group = "hpc_pulatovd_lab"
 # Zero leaves shared files until the storage administrator removes them.
 retention_days = 0

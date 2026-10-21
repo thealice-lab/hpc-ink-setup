@@ -2,7 +2,8 @@
 
 Inkly can write diagnostic metadata and filtered conversation snapshots to
 approved lab storage without granting access to another user's home directory.
-The Cuttlefish template uses `/scratch/inklys-logs`; scratch is not durable.
+The Cuttlefish template uses `/scratch/inklys-logs/shared`; scratch is not durable.
+The separate `logs/` and `conversations/` siblings may hold owner-private data.
 
 ## Collection and readers
 
@@ -60,7 +61,7 @@ per_user_logs = true
 
 [logging.shared]
 enabled = true
-directory = "/scratch/inklys-logs"
+directory = "/scratch/inklys-logs/shared"
 group = "approved-lab-group"
 retention_days = 0
 archive_conversations = true
