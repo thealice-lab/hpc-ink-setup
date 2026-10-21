@@ -27,7 +27,7 @@ NEVER enter passwords, tokens or private keys into Inkly. Common credential
 markers cause whole turns to be withheld, but filtering cannot detect every
 secret. history-<Unix UID>/ directories contain each owner's complete private
 archive (0700 directories, 0600 JSON files), including withheld originals.
-Set logging.shared.enabled = false in ~/.inkly/config.toml to stop all scratch
+Set logging.shared.enabled = false in ~/.inkly/config.toml to stop shared-root
 collection. Private history in your home remains available to you and admins.
 
 Each writer owns separate files. The lab group may read, but not edit, them.
@@ -36,7 +36,7 @@ access to all cluster users. Administrators manage scratch removal; Inkly does
 not delete shared files when retention_days = 0. Scratch can disappear without
 notice, so private recovery histories remain in each owner's home directory.
 
-Deployment guidance: https://github.com/thealice-lab/hpc-ink-setup/pull/5#issuecomment-6323225603
+See docs/SHARED_OBSERVABILITY.md for configuration, access, recovery and opt-outs.
 See logging_schema.md for diagnostic and conversation formats.
 """
 

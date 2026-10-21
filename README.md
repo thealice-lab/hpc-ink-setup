@@ -423,7 +423,7 @@ New Cuttlefish installs enable shared collection at `/scratch/inklys-logs` for
 and opt-out settings. It separates metadata diagnostics, group-readable filtered
 chat snapshots and owner-private full archives. Never enter credentials: filtering
 cannot catch every secret. Administrators manage scratch cleanup. See
-[the deployment guidance](https://github.com/thealice-lab/hpc-ink-setup/pull/5#issuecomment-6323225603)
+[the shared logging guide](docs/SHARED_OBSERVABILITY.md)
 for configuration, privacy rules, migration behavior, and the two-account verification checklist.
 
 Conversation behavior is configured under:

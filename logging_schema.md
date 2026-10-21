@@ -55,7 +55,7 @@ Completed segments are renamed to `.jsonl`. Readers can identify an incomplete
 last line in an active file after an I/O interruption; completed lines are
 independent JSON objects. Different users/processes never append to one shared file.
 
-See [the deployment guidance](https://github.com/thealice-lab/hpc-ink-setup/pull/5#issuecomment-6323225603) for permissions,
+See [the shared logging guide](docs/SHARED_OBSERVABILITY.md) for permissions,
 retention, configuration, and deployment verification.
 
 ## Filtered full-history chat snapshots
