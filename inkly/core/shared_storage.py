@@ -8,7 +8,7 @@ from pathlib import Path
 from inkly.core.permissions import (
     open_shared_directory,
     shared_group_id,
-    validate_shared_acl,
+    grant_shared_file_access,
     validate_shared_directory,
 )
 
@@ -21,7 +21,7 @@ Inkly usage, errors and improvements. It is not public or durable storage.
 inkly-*.jsonl diagnostic files contain allowlisted metadata, never chat text.
 chat-<UID>-<subject>.jsonl files contain complete filtered conversation snapshots
 for improvements. They can include personal details and unpublished research;
-everyone in the configured group can read them. They are not anonymous.
+the configured group and NFSv4 directory collector can read them. They are not anonymous.
 
 NEVER enter passwords, tokens or private keys into Inkly. Common credential
 markers cause whole turns to be withheld, but filtering cannot detect every
@@ -31,7 +31,8 @@ Set logging.shared.enabled = false in ~/.inkly/config.toml to stop shared-root
 collection. Private history in your home remains available to you and admins.
 
 Each writer owns separate files. The lab group may read, but not edit, them.
-Keep the directory at mode 3770 and shared files at mode 0640. Do not broaden
+Use group mode 3770 or the documented sticky NFSv4 collector ACL layout.
+Shared files have mode 0640 and validated reader ACLs. Do not broaden
 access to all cluster users. Administrators manage scratch removal; Inkly does
 not delete shared files when retention_days = 0. Scratch can disappear without
 notice, so private recovery histories remain in each owner's home directory.
@@ -44,14 +45,15 @@ See logging_schema.md for diagnostic and conversation formats.
 def prepare_shared_storage(shared) -> Path:
     """Create only a missing root; never repair or widen an existing root."""
     settings = replace(shared, enabled=True).validate()
-    group_id = shared_group_id(settings.group)
     directory = Path(settings.directory)
     created = False
-    try:
-        directory.mkdir(mode=0o700)
-        created = True
-    except FileExistsError:
-        pass
+    if not directory.exists() and not directory.is_symlink():
+        group_id = shared_group_id(settings.group)
+        try:
+            directory.mkdir(mode=0o700)
+            created = True
+        except FileExistsError:
+            pass
 
     if created:
         descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -71,17 +73,16 @@ def prepare_shared_storage(shared) -> Path:
             descriptor = os.open(
                 "README.md",
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o640,
+                0o600,
                 dir_fd=root,
             )
         except FileExistsError:
             return directory
         try:
-            os.fchmod(descriptor, 0o640)
             info = os.fstat(descriptor)
-            if info.st_gid != group_id or info.st_nlink != 1:
+            if info.st_nlink != 1:
                 raise PermissionError("Shared README has unsafe ownership")
-            validate_shared_acl(descriptor, directory=False)
+            grant_shared_file_access(descriptor, root, settings.group)
             with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as output:
                 output.write(PURPOSE)
                 output.flush()

@@ -11,7 +11,7 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from inkly.core.permissions import open_shared_directory, validate_shared_acl
+from inkly.core.permissions import grant_shared_file_access, open_shared_directory
 from inkly.core.storage import private_directory
 
 
@@ -73,7 +73,7 @@ class EventSink:
         if self.root_descriptor is None:
             self._open_root()
         self.active_name = f"inkly-{self.session_id}-{self.segment:06d}.active.jsonl"
-        mode = 0o640 if self.shared is not None else 0o600
+        mode = 0o600
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         if os.name == "posix":
             self.descriptor = os.open(
@@ -81,16 +81,16 @@ class EventSink:
             )
             os.fchmod(self.descriptor, mode)
             info = os.fstat(self.descriptor)
-            root_info = os.fstat(self.root_descriptor)
             if (
                 info.st_uid != os.getuid()
                 or not stat.S_ISREG(info.st_mode)
                 or info.st_nlink != 1
-                or (self.shared is not None and info.st_gid != root_info.st_gid)
             ):
                 raise PermissionError("Diagnostic file ownership is invalid")
             if self.shared is not None:
-                validate_shared_acl(self.descriptor, directory=False)
+                grant_shared_file_access(
+                    self.descriptor, self.root_descriptor, self.shared.group
+                )
         else:
             self.descriptor = os.open(self.directory / self.active_name, flags, mode)
 

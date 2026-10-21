@@ -426,6 +426,10 @@ cannot catch every secret. Administrators manage scratch cleanup. See
 [the shared logging guide](docs/SHARED_OBSERVABILITY.md)
 for configuration, privacy rules, migration behavior, and the two-account verification checklist.
 
+An explicitly provisioned NFSv4 collector layout also lets the directory owner
+review shared logs without joining the lab group. Only that owner and approved
+lab accounts can contribute; private histories retain owner-only access.
+
 Conversation behavior is configured under:
 
 ```toml

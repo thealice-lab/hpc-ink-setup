@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from inkly.core.permissions import open_shared_directory, validate_shared_acl
+from inkly.core.permissions import (
+    grant_shared_file_access,
+    open_shared_directory,
+    validate_shared_file,
+)
 
 
 CREDENTIAL_MARKERS = re.compile(
@@ -87,10 +91,14 @@ def publish_conversation_snapshot(shared, name: str, history: list[dict]) -> Non
                 not stat.S_ISREG(existing.st_mode)
                 or existing.st_nlink != 1
                 or existing.st_uid != os.getuid()
-                or existing.st_gid != os.fstat(root).st_gid
                 or stat.S_IMODE(existing.st_mode) != 0o640
             ):
                 raise PermissionError("Unexpected shared conversation file")
+            previous = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root)
+            try:
+                validate_shared_file(previous, root, shared.group)
+            finally:
+                os.close(previous)
         descriptor = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -99,13 +107,8 @@ def publish_conversation_snapshot(shared, name: str, history: list[dict]) -> Non
         )
         os.fchmod(descriptor, 0o600)
         info = os.fstat(descriptor)
-        if (
-            info.st_uid != os.getuid()
-            or info.st_gid != os.fstat(root).st_gid
-            or info.st_nlink != 1
-        ):
+        if info.st_uid != os.getuid() or info.st_nlink != 1:
             raise PermissionError("Invalid shared conversation ownership")
-        validate_shared_acl(descriptor, directory=False)
         session_id = uuid4().hex
         with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as output:
             for index, turn in enumerate(history):
@@ -113,8 +116,7 @@ def publish_conversation_snapshot(shared, name: str, history: list[dict]) -> Non
                 output.write(json.dumps(event, separators=(",", ":")) + "\n")
             output.flush()
             os.fsync(descriptor)
-        os.fchmod(descriptor, 0o640)
-        validate_shared_acl(descriptor, directory=False)
+        grant_shared_file_access(descriptor, root, shared.group)
         os.rename(temporary, filename, src_dir_fd=root, dst_dir_fd=root)
         os.fsync(root)
     finally:

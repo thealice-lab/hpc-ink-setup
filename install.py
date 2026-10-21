@@ -124,6 +124,9 @@ def print_shared_logging_notice(shared, *, logging_enabled=True):
     print(
         f"Readers: every member of the configured Unix group ({shared.group or 'not configured'})."
     )
+    print(
+        "An NFSv4 collector directory also grants its owner access to shared records."
+    )
     print("When enabled, existing and future chats are shared to help improve Inkly.")
     print(
         "Chats may contain personal details, cluster information and unpublished work."

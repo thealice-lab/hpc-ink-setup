@@ -77,7 +77,7 @@ max_log_file_mb = 10
 max_log_files = 5
 
 # Set the lab-only Unix group before enabling. The installer can create this root.
-# Existing directories must already have the configured group and mode 3770.
+# Existing roots require group/mode 3770 or the documented NFSv4 collector ACL.
 # See docs/SHARED_OBSERVABILITY.md before enabling.
 [logging.shared]
 enabled = true
