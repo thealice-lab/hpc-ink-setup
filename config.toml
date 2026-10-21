@@ -78,7 +78,7 @@ max_log_files = 5
 
 # Set the lab-only Unix group before enabling. The installer can create this root.
 # Existing directories must already have the configured group and mode 3770.
-# See docs/SHARED_OBSERVABILITY.md before enabling.
+# Deployment guidance: https://github.com/thealice-lab/hpc-ink-setup/pull/5#issuecomment-6323225603
 [logging.shared]
 enabled = true
 directory = "/scratch/inklys-logs"

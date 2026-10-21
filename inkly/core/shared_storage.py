@@ -36,8 +36,8 @@ access to all cluster users. Administrators manage scratch removal; Inkly does
 not delete shared files when retention_days = 0. Scratch can disappear without
 notice, so private recovery histories remain in each owner's home directory.
 
-See the hpc-ink-setup docs/SHARED_OBSERVABILITY.md operational runbook and
-logging_schema.md for configuration, privacy, recovery and reader instructions.
+Deployment guidance: https://github.com/thealice-lab/hpc-ink-setup/pull/5#issuecomment-6323225603
+See logging_schema.md for diagnostic and conversation formats.
 """
 
 
