@@ -146,6 +146,9 @@ ink
 
 ## Requirements
 
+For the Windows TENSOR export → HPC Inkly → TENSOR analysis workflow, see
+[the TENSOR handoff guide](docs/TENSOR.md).
+
 ### For users
 
 - a Linux environment with Python 3
