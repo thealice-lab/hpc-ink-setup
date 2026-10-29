@@ -1,6 +1,8 @@
 ## 🐙 Inkly
 AI-Assisted Interface for Slurm-Based HPC Clusters
 
+> **Installing on Cuttlefish?** The current Gaussian-enabled Inkly is on the `dev` branch. Follow the [Cuttlefish setup guide](https://github.com/thealice-lab/hpc-ink-setup/blob/dev/docs/CUTTLEFISH_SETUP.md), which clones `dev` for you. This README describes the earlier container release.
+
 Inkly is a cluster-aware command-line assistant for Slurm-based HPC environments.
 It integrates GitHub Copilot CLI with live cluster context and safety guardrails.
 
