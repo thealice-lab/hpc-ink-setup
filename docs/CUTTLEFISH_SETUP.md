@@ -16,13 +16,15 @@ Do not use another person's Cuttlefish account or Inkly installation.
 
 ## 1. Clone Inkly
 
+Until `main` is updated with the validated Gaussian work, clone the `dev` branch. The current `main` does not contain `setup.sh` or this guide.
+
 ```bash
 cd ~
-git clone https://github.com/thealice-lab/hpc-ink-setup.git
+git clone --branch dev https://github.com/thealice-lab/hpc-ink-setup.git
 cd hpc-ink-setup
 ```
 
-If you were assigned a development branch, switch to it before installing:
+If you were assigned a different development branch, switch to it before installing:
 
 ```bash
 git fetch origin
@@ -106,6 +108,17 @@ readlink -f "$(which ink)"
 ```
 
 ## Troubleshooting
+
+### bash: setup.sh: No such file or directory
+
+You cloned the default branch (`main`), which does not currently contain `setup.sh`. Switch to `dev`:
+
+```bash
+cd ~/hpc-ink-setup
+git fetch origin
+git checkout dev
+git pull --ff-only origin dev
+```
 
 ### ink: command not found
 
