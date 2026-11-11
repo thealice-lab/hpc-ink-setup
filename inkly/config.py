@@ -1,57 +1,17 @@
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 
 try:
     import tomllib  # Python 3.11+
 except ModuleNotFoundError:
     import tomli as tomllib  # Python <=3.10
+import sys
 from typing import Literal
 
 
 class ConfigError(Exception):
     """Raised when the configuration file is invalid or incomplete."""
-
-
-@dataclass
-class NodeConfig:
-    """Configuration related to Node.js installation and management.
-
-    Attributes:
-        node_version (str): The specific version of Node.js to install (e.g. "18.16.0").
-            Alias versions like "lts", "stable", or "latest" are not supported on HPC.
-        install_if_missing (bool): Whether to attempt installation if Node.js is not found.
-        allow_curl (bool): Whether to allow using curl for installation.
-        allow_wget (bool): Whether to allow using wget for installation.
-        nvm_version (str): The version of nvm to use for managing Node.js versions.
-    """
-
-    node_version: str
-    install_if_missing: bool = True
-    allow_curl: bool = True
-    allow_wget: bool = True
-    nvm_version: str = "0.39.7"
-
-    def validate(self) -> "NodeConfig":
-        """Validates the NodeConfig variables
-
-        This method should be called after initialization to ensure the config is correct.
-
-        Parameters:
-            None
-
-        Returns:
-            NodeConfig: The validated NodeConfig object (self).
-
-        Raises:
-            ValueError: If any of the config variables are invalid.
-        """
-
-        if self.node_version in ("lts", "stable", "latest"):
-            raise ConfigError(
-                "Alias-based Node versions are not supported on HPC. "
-                "Use an explicit version."
-            )
-        return self
 
 
 @dataclass
@@ -96,18 +56,18 @@ class InstallConfig:
 
 @dataclass
 class StateConfig:
-    """Configuration related to where Inkly stores its state, logs, and binaries.
+    """Configuration related to where Inkly stores its state, logs, and executables.
 
     Attributes:
         inkly_home (Path): The root directory for all Inkly state and data.
-        bin_dir (Path): The directory where Inkly-managed binaries (like Node.js) are stored.
+        bin_dir (Path): The directory where Inkly-managed launchers or executables are stored.
         log_dir (Path): The directory where Inkly stores logs.
-
     """
 
     inkly_home: Path = Path("~/.inkly")
     bin_dir: Path = Path("~/.inkly/bin")
     log_dir: Path = Path("~/.inkly/logs")
+    conversation_dir: Path = Path("~/.inkly/conversations")
 
     def resolve(self) -> "StateConfig":
         """Resolve and expand all paths to absolute paths.
@@ -121,16 +81,18 @@ class StateConfig:
             StateConfig: The StateConfig object with resolved paths (self).
 
         """
-        self.inkly_home = Path(self.inkly_home).expanduser()
-        self.bin_dir = Path(self.bin_dir).expanduser()
-        self.log_dir = Path(self.log_dir).expanduser()
+        for name in ("inkly_home", "bin_dir", "log_dir", "conversation_dir"):
+            value = getattr(self, name)
+            if not isinstance(value, (str, Path)) or not str(value).strip():
+                raise ConfigError(f"state.{name} must be a non-empty path")
+            setattr(self, name, Path(os.path.abspath(Path(value).expanduser())))
         return self
 
     def validate(self) -> "StateConfig":
         """Validates that all paths are properly set
 
-        Validation checks that bin_dir and log_dir all live under inkly_home
-        to prevent misconfiguration that could lead to data being stored in unintended locations.
+        Launchers must live under inkly_home. Private history and diagnostic
+        locations can be configured independently and are checked when opened.
 
         Parameters:
             None
@@ -146,11 +108,6 @@ class StateConfig:
             self.bin_dir.relative_to(self.inkly_home)
         except ValueError:
             raise ConfigError("bin_dir must live under inkly_home")
-
-        try:
-            self.log_dir.relative_to(self.inkly_home)
-        except ValueError:
-            raise ConfigError("log_dir must live under inkly_home")
 
         return self
 
@@ -175,6 +132,40 @@ class LoggingHistoryConfig:
 
 
 @dataclass
+class SharedLoggingConfig:
+    enabled: bool = False
+    directory: str = "/scratch/inklys-logs/shared"
+    group: str = ""
+    retention_days: int = 0
+    approval_reference: str = ""
+    archive_conversations: bool = True
+    share_conversations: bool = True
+
+    def validate(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("logging.shared.enabled must be a boolean")
+        if not isinstance(self.archive_conversations, bool):
+            raise ConfigError("logging.shared.archive_conversations must be a boolean")
+        if not isinstance(self.share_conversations, bool):
+            raise ConfigError("logging.shared.share_conversations must be a boolean")
+        if not self.enabled:
+            return self
+        for name in ("directory", "group"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"logging.shared.{name} must be set")
+        directory = Path(self.directory).expanduser()
+        if not directory.is_absolute():
+            raise ConfigError("logging.shared.directory must be absolute")
+        self.directory = os.path.abspath(directory)
+        if type(self.retention_days) is not int or self.retention_days < 0:
+            raise ConfigError("logging.shared.retention_days must be >= 0")
+        if not isinstance(self.approval_reference, str):
+            raise ConfigError("logging.shared.approval_reference must be a string")
+        return self
+
+
+@dataclass
 class LoggingConfig:
     enabled: bool = True
     level: Literal["debug", "info", "warning", "error"] = "info"
@@ -193,16 +184,28 @@ class LoggingConfig:
 
     max_log_file_mb: int = 10
     max_log_files: int = 5
+    private_scratch_dir: str = ""
 
     history: LoggingHistoryConfig = field(default_factory=LoggingHistoryConfig)
+    shared: SharedLoggingConfig = field(default_factory=SharedLoggingConfig)
 
     @property
     def max_bytes(self) -> int:
         return self.max_log_file_mb * 1024 * 1024
 
     def validate(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("logging.enabled must be a boolean")
         if not self.enabled:
             return self
+        self.shared.validate()
+        if not isinstance(self.private_scratch_dir, str):
+            raise ConfigError("logging.private_scratch_dir must be a path string")
+        if self.private_scratch_dir:
+            directory = Path(self.private_scratch_dir).expanduser()
+            if not directory.is_absolute():
+                raise ConfigError("logging.private_scratch_dir must be absolute")
+            self.private_scratch_dir = os.path.abspath(directory)
         if self.log_raw_prompts and not self.log_user_prompts:
             raise ConfigError("log_raw_prompts requires log_user_prompts = true")
         if self.log_raw_ai_responses and not self.log_ai_responses:
@@ -212,18 +215,245 @@ class LoggingConfig:
         if self.level not in allowed_levels:
             raise ConfigError(f"Invalid logging.level: {self.level}")
 
-        if self.schema_version <= 0:
-            raise ConfigError("logging.schema_version must be >= 1")
-        if self.max_log_file_mb <= 0:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ConfigError("logging.schema_version must be 1")
+        if type(self.max_log_file_mb) is not int or self.max_log_file_mb <= 0:
             raise ConfigError("logging.max_log_file_mb must be > 0")
-        if self.max_log_files <= 0:
+        if type(self.max_log_files) is not int or self.max_log_files <= 0:
             raise ConfigError("logging.max_log_files must be > 0")
-        if not self.per_user_logs and not self.global_log:
+        if self.global_log:
+            raise ConfigError("Use logging.shared instead of global_log")
+        if self.log_raw_prompts or self.log_raw_ai_responses:
+            raise ConfigError("Raw content is not supported in diagnostic logs")
+        if (
+            not self.per_user_logs
+            and not self.shared.enabled
+            and not self.private_scratch_dir
+        ):
             raise ConfigError(
-                "At least one of per_user_logs or global_log must be enabled"
+                "Enable per_user_logs or logging.shared when logging is enabled"
             )
 
         self.history.validate()
+        return self
+
+
+@dataclass
+class IntelligenceConfig:
+    """Configuration for structured cluster intelligence prompt enrichment."""
+
+    enabled: bool = True
+    window_days: int = 90
+    min_jobs_required: int = 500
+    auto_refresh: bool = False
+
+    def validate(self) -> "IntelligenceConfig":
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("intelligence.enabled must be a boolean")
+
+        if not isinstance(self.window_days, int):
+            raise ConfigError("intelligence.window_days must be an integer")
+        if self.window_days <= 0:
+            raise ConfigError("intelligence.window_days must be > 0")
+
+        if not isinstance(self.min_jobs_required, int):
+            raise ConfigError("intelligence.min_jobs_required must be an integer")
+        if self.min_jobs_required < 0:
+            raise ConfigError("intelligence.min_jobs_required must be >= 0")
+
+        if not isinstance(self.auto_refresh, bool):
+            raise ConfigError("intelligence.auto_refresh must be a boolean")
+
+        return self
+
+
+@dataclass
+class ConversationConfig:
+    enabled: bool = True
+    max_messages: int = 20
+    summarize: bool = True
+    summary_trigger: int = 30
+    max_summary_chars: int = 1200
+
+    def validate(self) -> "ConversationConfig":
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("conversation.enabled must be a boolean")
+
+        if not isinstance(self.max_messages, int) or self.max_messages <= 0:
+            raise ConfigError("conversation.max_messages must be > 0")
+
+        if not isinstance(self.summarize, bool):
+            raise ConfigError("conversation.summarize must be a boolean")
+
+        if not isinstance(self.summary_trigger, int) or self.summary_trigger <= 0:
+            raise ConfigError("conversation.summary_trigger must be > 0")
+
+        if self.summary_trigger < self.max_messages:
+            raise ConfigError(
+                "conversation.summary_trigger must be >= conversation.max_messages"
+            )
+
+        if not isinstance(self.max_summary_chars, int) or self.max_summary_chars <= 0:
+            raise ConfigError("conversation.max_summary_chars must be > 0")
+
+        return self
+
+
+@dataclass
+class LLMConfig:
+    model: str = "llama3"
+
+    def validate(self) -> "LLMConfig":
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ConfigError("llm.model must be a non-empty string")
+        return self
+
+
+@dataclass
+class CoreConfig:
+    max_concurrent_requests: int = 4
+    max_prompt_length: int = 8000
+
+    def validate(self) -> "CoreConfig":
+        if not isinstance(self.max_concurrent_requests, int):
+            raise ConfigError("core.max_concurrent_requests must be an integer")
+        if self.max_concurrent_requests <= 0:
+            raise ConfigError("core.max_concurrent_requests must be > 0")
+
+        if not isinstance(self.max_prompt_length, int):
+            raise ConfigError("core.max_prompt_length must be an integer")
+        if self.max_prompt_length <= 0:
+            raise ConfigError("core.max_prompt_length must be > 0")
+
+        return self
+
+
+@dataclass
+class RetrievalConfig:
+    enabled: bool = True
+    top_k: int = 3
+    fallback_to_all_plugins: bool = False
+    min_score: float = 0.01
+    index_path: str = "~/.inkly/retrieval_index.json"
+
+    def validate(self) -> "RetrievalConfig":
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("retrieval.enabled must be a boolean")
+
+        if not isinstance(self.top_k, int) or self.top_k <= 0:
+            raise ConfigError("retrieval.top_k must be > 0")
+
+        if not isinstance(self.fallback_to_all_plugins, bool):
+            raise ConfigError("retrieval.fallback_to_all_plugins must be a boolean")
+
+        if not isinstance(self.min_score, (int, float)):
+            raise ConfigError("retrieval.min_score must be a number")
+
+        if not isinstance(self.index_path, str) or not self.index_path.strip():
+            raise ConfigError("retrieval.index_path must be a non-empty string")
+
+        return self
+
+
+@dataclass
+class OllamaServiceConfig:
+    """
+    Configuration for reaching an Ollama model.
+
+    Supported modes:
+    - "cli_run": use local `ollama run <model>`
+    - "direct_host": use OLLAMA_HOST against a remote/admin server
+    - "ssh_tunnel": use local SSH tunnel to remote Ollama
+    - "admin_command": send prompt to an admin-managed wrapper command
+    """
+
+    mode: str = "cli_run"
+
+    # admin_command mode
+    command_path: str = ""
+    command_args: list[str] = field(default_factory=list)
+
+    # ssh_tunnel mode
+    tunnel_enabled: bool = False
+    ssh_target: str = ""
+    remote_host: str = "127.0.0.1"
+    remote_port: int = 11434
+    local_host: str = "127.0.0.1"
+    local_port: int = 11434
+    startup_timeout_sec: int = 20
+    manage_server: bool = False
+
+    # direct_host mode
+    use_direct_host: bool = False
+    direct_host: str = ""
+    direct_port: int = 11434
+
+    def validate(self) -> "OllamaServiceConfig":
+        allowed_modes = {"cli_run", "direct_host", "ssh_tunnel", "admin_command"}
+        if self.mode not in allowed_modes:
+            raise ConfigError(f"ollama.mode must be one of {sorted(allowed_modes)}")
+
+        if not isinstance(self.command_path, str):
+            raise ConfigError("ollama.command_path must be a string")
+
+        if not isinstance(self.command_args, list):
+            raise ConfigError("ollama.command_args must be a list of strings")
+
+        for arg in self.command_args:
+            if not isinstance(arg, str):
+                raise ConfigError("ollama.command_args entries must be strings")
+
+        if not isinstance(self.tunnel_enabled, bool):
+            raise ConfigError("ollama.tunnel_enabled must be a boolean")
+
+        if not isinstance(self.manage_server, bool):
+            raise ConfigError("ollama.manage_server must be a boolean")
+
+        if not isinstance(self.ssh_target, str):
+            raise ConfigError("ollama.ssh_target must be a string")
+
+        if not isinstance(self.remote_host, str) or not self.remote_host.strip():
+            raise ConfigError("ollama.remote_host must be a non-empty string")
+
+        if not isinstance(self.local_host, str) or not self.local_host.strip():
+            raise ConfigError("ollama.local_host must be a non-empty string")
+
+        if not isinstance(self.remote_port, int) or self.remote_port <= 0:
+            raise ConfigError("ollama.remote_port must be > 0")
+
+        if not isinstance(self.local_port, int) or self.local_port <= 0:
+            raise ConfigError("ollama.local_port must be > 0")
+
+        if (
+            not isinstance(self.startup_timeout_sec, int)
+            or self.startup_timeout_sec <= 0
+        ):
+            raise ConfigError("ollama.startup_timeout_sec must be > 0")
+
+        if not isinstance(self.use_direct_host, bool):
+            raise ConfigError("ollama.use_direct_host must be a boolean")
+
+        if not isinstance(self.direct_host, str):
+            raise ConfigError("ollama.direct_host must be a string")
+
+        if not isinstance(self.direct_port, int) or self.direct_port <= 0:
+            raise ConfigError("ollama.direct_port must be > 0")
+
+        if self.mode == "admin_command" and not self.command_path.strip():
+            raise ConfigError(
+                "ollama.command_path must be set when ollama.mode = 'admin_command'"
+            )
+
+        if self.mode == "ssh_tunnel" and not self.ssh_target.strip():
+            raise ConfigError(
+                "ollama.ssh_target must be set when ollama.mode = 'ssh_tunnel'"
+            )
+
+        if self.mode == "direct_host" and not self.direct_host.strip():
+            raise ConfigError(
+                "ollama.direct_host must be set when ollama.mode = 'direct_host'"
+            )
+
         return self
 
 
@@ -233,10 +463,15 @@ class LoggingConfig:
 @dataclass
 class InklyConfig:
     raw_config: dict
-    node: NodeConfig
     install: InstallConfig
     state: StateConfig
     logging: LoggingConfig
+    intelligence: IntelligenceConfig
+    conversation: ConversationConfig
+    llm: LLMConfig
+    ollama: OllamaServiceConfig
+    core: CoreConfig
+    retrieval: RetrievalConfig
 
 
 class TomlParser:
@@ -255,8 +490,6 @@ class TomlParser:
         with self.path.open("rb") as f:
             raw = tomllib.load(f)
 
-        node = NodeConfig(**self._require(raw, "node")).validate()
-
         install = InstallConfig(**raw.get("install", {})).validate()
 
         state = StateConfig(**self._require(raw, "state")).resolve().validate()
@@ -265,10 +498,83 @@ class TomlParser:
         history = LoggingHistoryConfig(**logging_raw.get("history", {}))
 
         logging_cfg = LoggingConfig(
-            **{k: v for k, v in logging_raw.items() if k != "history"}, history=history
+            **{
+                key: value
+                for key, value in logging_raw.items()
+                if key not in {"history", "shared"}
+            },
+            history=history,
+            shared=SharedLoggingConfig(**logging_raw.get("shared", {})),
         )
         logging_cfg.validate()
 
+        if logging_cfg.enabled and logging_cfg.shared.enabled:
+            shared_dir = Path(logging_cfg.shared.directory)
+            private_dirs = (
+                state.inkly_home.absolute(),
+                state.log_dir,
+                state.conversation_dir,
+                Path.home() / ".inkly" / "conversations",
+            )
+            if logging_cfg.private_scratch_dir:
+                private_dirs += (Path(logging_cfg.private_scratch_dir),)
+            for private_dir in private_dirs:
+                if (
+                    shared_dir == private_dir
+                    or shared_dir in private_dir.parents
+                    or private_dir in shared_dir.parents
+                ):
+                    raise ConfigError("Shared logs must be separate from private state")
+
+        intelligence_raw = dict(raw.get("intelligence") or {})
+
+        conversation_data = raw.get("conversation", {}) or {}
+        llm_data = raw.get("llm", {}) or {}
+        core_data = raw.get("core", {}) or {}
+
+        conversation_cfg = ConversationConfig(**conversation_data).validate()
+        llm_cfg = LLMConfig(**llm_data).validate()
+        core_cfg = CoreConfig(**core_data).validate()
+        retrieval_data = raw.get("retrieval", {}) or {}
+
+        # Apply environment overrides
+        env_map = {
+            "enabled": ("INKLY_INTELLIGENCE_ENABLED", lambda v: v.lower() == "true"),
+            "window_days": ("INKLY_INTELLIGENCE_WINDOW_DAYS", int),
+            "min_jobs_required": ("INKLY_INTELLIGENCE_MIN_JOBS_REQUIRED", int),
+            "auto_refresh": (
+                "INKLY_INTELLIGENCE_AUTO_REFRESH",
+                lambda v: v.lower() == "true",
+            ),
+        }
+
+        for key, (env_var, cast) in env_map.items():
+            if env_var in os.environ:
+                try:
+                    intelligence_raw[key] = cast(os.environ[env_var])
+                    # debugging output
+                    print(
+                        f"[ink] ENV override: {env_var} -> {intelligence_raw[key]}",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    raise ConfigError(f"Invalid value for {env_var}")
+
+        intelligence = IntelligenceConfig(**intelligence_raw).validate()
+        retrieval_cfg = RetrievalConfig(**retrieval_data).validate()
+
+        ollama_data = raw.get("ollama", {}) or {}
+        ollama_cfg = OllamaServiceConfig(**ollama_data).validate()
+
         return InklyConfig(
-            raw_config=raw, node=node, install=install, state=state, logging=logging_cfg
+            raw_config=raw,
+            install=install,
+            state=state,
+            logging=logging_cfg,
+            intelligence=intelligence,
+            conversation=conversation_cfg,
+            llm=llm_cfg,
+            core=core_cfg,
+            retrieval=retrieval_cfg,
+            ollama=ollama_cfg,
         )

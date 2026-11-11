@@ -1,0 +1,25 @@
+schema_version = 1
+name = "Cuttlefish"
+
+# Used for automatic profile detection.
+host_patterns = ["cuttlefish*"]
+
+scheduler = "slurm"
+verified_on = "2026-09-28"
+
+[software.gaussian]
+installed = true
+runtime_verified = true
+runtime_verified_on = "2026-09-29"
+
+access_group = "gaussian"
+advertised_default_module = "gaussian/avx2/g16_rev_c02"
+scratch_template = "/scratch/gaussian/{user}"
+
+[software.gaussian.slurm]
+verified_partition = "general"
+cpu_hint = "nomultithread"
+cpu_selection = "one logical CPU per unique physical core from the allocated cpuset"
+cpu_launch = "g16 -c=<selected_cpu_ids>"
+auto_memory_fraction = 0.75
+memory_rounding = "down"
