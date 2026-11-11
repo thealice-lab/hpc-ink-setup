@@ -146,6 +146,16 @@ ink
 
 ## Requirements
 
+For the Windows TENSOR export → HPC Inkly → TENSOR analysis workflow, see
+[the TENSOR handoff guide](docs/TENSOR.md).
+
+The guided helper reuses consistent exported CPU/memory settings, previews the
+cluster allocation, asks before submission and returns the verified log through
+one OpenSSH connection. TENSOR retains scientific preparation and analysis.
+Conversational Gaussian job generation, automatic documentation database
+provisioning and independent shared-logging access verification remain separate
+work; this file workflow does not imply those tasks are complete.
+
 ### For users
 
 - a Linux environment with Python 3

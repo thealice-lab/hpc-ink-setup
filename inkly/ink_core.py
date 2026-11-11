@@ -66,6 +66,15 @@ def main() -> int:
     Returns:
         Exit code (0 for success, 1 for failure)
     """
+    if sys.argv[1:] == ["tensor"]:
+        from inkly.gaussian.tensor import main as tensor_main
+
+        return tensor_main()
+    if sys.argv[1:] == ["tensor", "--session"]:
+        from inkly.gaussian.tensor import main as tensor_main
+
+        return tensor_main(session=True)
+
     # Build query from command-line arguments.
     query = _build_query(sys.argv[1:])
 

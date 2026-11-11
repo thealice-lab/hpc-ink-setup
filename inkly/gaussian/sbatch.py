@@ -1,5 +1,7 @@
 """Deterministic Gaussian SBATCH generation for verified Cuttlefish settings."""
 
+from __future__ import annotations
+
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 import re
 import shlex
@@ -79,7 +81,7 @@ PY_CPUS
 
 # Read the original input and write a separate runtime copy.
 # Update resource directives in each Link1 section, not just the first.
-python3 - "$INPUT_FILE" "$RUNTIME_INPUT" "$GAUSSIAN_MEM_MB" "$REQUESTED_CPUS" <<'PY_INPUT'
+python3 - "$INPUT_FILE" "$RUNTIME_INPUT" "$GAUSSIAN_MEM_MB" "$REQUESTED_CPUS" "${TENSOR_OUTPUT:-0}" <<'PY_INPUT'
 from pathlib import Path
 import re
 import sys
@@ -88,6 +90,7 @@ source = Path(sys.argv[1])
 target = Path(sys.argv[2])
 memory_mb = int(sys.argv[3])
 cpus = int(sys.argv[4])
+tensor_output = len(sys.argv) > 5 and sys.argv[5] == "1"
 
 resource_directive = re.compile(r"^\s*%(?:mem|nproc|nprocshared)\s*=", re.I)
 unsupported_directive = re.compile(
@@ -105,6 +108,10 @@ def update_section(lines):
             has_route = True
         if header and unsupported_directive.match(line):
             raise ValueError("Unsupported Gaussian CPU/Linda directive")
+        if header and tensor_output and re.match(r"^\s*%rwf\s*=", line, re.I):
+            rwf_name = Path(line.split("=", 1)[1].strip()).name
+            output.append(f"%rwf={target.parent / rwf_name}\n")
+            continue
         if header and resource_directive.match(line):
             continue
         output.append(line)
@@ -131,7 +138,11 @@ except (OSError, UnicodeError, ValueError) as exc:
 PY_INPUT
 
 echo "Starting Gaussian with $REQUESTED_CPUS physical cores"
-g16 -c="$CPU_IDS" < "$RUNTIME_INPUT"
+if [[ "${TENSOR_OUTPUT:-0}" == 1 ]]; then
+    g16 -c="$CPU_IDS" < "$RUNTIME_INPUT" >&3
+else
+    g16 -c="$CPU_IDS" < "$RUNTIME_INPUT"
+fi
 """
 
 
@@ -147,7 +158,14 @@ def _safe_name(value, name):
     return value
 
 
-def generate_sbatch(spec: GaussianJobSpec, profile: dict) -> str:
+def generate_sbatch(
+    spec: GaussianJobSpec,
+    profile: dict,
+    *,
+    tensor_output: bool = False,
+    input_sha256: str | None = None,
+    hours: int = 1,
+) -> str:
     """Generate a standalone, single-node Cuttlefish Gaussian SBATCH script."""
     if not isinstance(spec, GaussianJobSpec):
         raise TypeError("spec must be a GaussianJobSpec")
@@ -223,6 +241,24 @@ def generate_sbatch(spec: GaussianJobSpec, profile: dict) -> str:
         f"GAUSSIAN_GROUP={shlex.quote(group)}",
         "",
     ]
-    return "\n".join(lines) + _RUNTIME.replace(
+    runtime = _RUNTIME.replace(
         "__SCRATCH_ROOT__", scratch.replace("{user}", "${REAL_USER}")
     )
+    if not tensor_output:
+        return "\n".join(lines) + runtime
+    if type(hours) is not int or not 1 <= hours <= 336:
+        raise ValueError("hours must be an integer from 1 to 336")
+    if not isinstance(input_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", input_sha256
+    ):
+        raise ValueError("TENSOR input SHA-256 is required")
+    lines.insert(8, f"#SBATCH --time={hours}:00:00")
+    lines.extend(
+        [
+            f"printf '%s  %s\\n' {input_sha256} \"$INPUT_FILE\" | sha256sum -c - >/dev/null",
+            "set -o noclobber",
+            f"exec 3> {shlex.quote(job_name + '.log')}",
+            "TENSOR_OUTPUT=1",
+        ]
+    )
+    return "\n".join(lines) + "\n" + runtime
