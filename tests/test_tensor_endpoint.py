@@ -211,3 +211,160 @@ def test_invalid_resource_requests_cannot_prepare_or_submit(prepared, key, value
     with pytest.raises(ValueError):
         tensor.handle(request, root)
     assert not (root / request["bundle"]).exists()
+
+
+def test_exported_resources_are_reused_with_cluster_memory_headroom(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("INKLY_CLUSTER_PROFILE_NAME", "cuttlefish")
+    data = b"%nprocshared=4\n%mem=2GB\n# hf/sto-3g\n\nSynthetic\n\n0 1\nH 0 0 0\n\n"
+    data += b"--Link1--\n%NProc=4\n%Mem=2048MB\n# hf/sto-3g geom=allcheck\n\n"
+    request = {
+        "action": "prepare",
+        "bundle": "b" * 32,
+        "name": "export.gjf",
+        "data": base64.b64encode(data).decode(),
+    }
+    result = tensor.handle(request, tmp_path / "bundles")
+    assert result["resources"]["cpus"] == 4
+    assert result["resources"]["gaussian_memory_mb"] == 2048
+    assert result["resources"]["slurm_memory_mib"] == 2731
+    assert result["resources"]["exported_memory_mb"] == [2048, 2048]
+    assert "GAUSSIAN_MEM_MB=2048" in result["script"]
+    assert (
+        tmp_path / "bundles" / request["bundle"] / "export.gjf"
+    ).read_bytes() == data
+    restored = tensor.handle(
+        {"action": "status", "bundle": request["bundle"]}, tmp_path / "bundles"
+    )
+    assert restored["resources"] == result["resources"]
+    assert restored["script"] == result["script"]
+
+
+@pytest.mark.parametrize(
+    "header,option",
+    [
+        ("%mem=768MB", "--cpus"),
+        ("%nprocshared=2", "--memory-mib"),
+        ("%nprocshared=2\n%mem=100MW", "--memory-mib"),
+        ("%nprocshared=2\n%nproc=4\n%mem=768MB", "--cpus"),
+        (
+            "%nprocshared=2\n%mem=768MB\n# hf\n--Link1--\n%nprocshared=4\n%mem=768MB",
+            "--cpus",
+        ),
+        (
+            "%nprocshared=2\n%mem=768MB\n# hf\n--Link1--\n%nprocshared=2\n%mem=1GB",
+            "--memory-mib",
+        ),
+        ("%nprocshared=2\n%mem=768MB\n# hf\n--Link1--", "--cpus"),
+    ],
+)
+def test_ambiguous_exports_require_explicit_values(
+    tmp_path, monkeypatch, header, option
+):
+    monkeypatch.setenv("INKLY_CLUSTER_PROFILE_NAME", "cuttlefish")
+    data = (header + "\n# hf/sto-3g\n").encode()
+    root = tmp_path / "bundles"
+    request = {
+        "action": "prepare",
+        "bundle": "c" * 32,
+        "name": "export.gjf",
+        "data": base64.b64encode(data).decode(),
+    }
+    with pytest.raises(ValueError, match=option):
+        tensor.handle(request, root)
+    assert not (root / request["bundle"]).exists()
+
+
+def test_explicit_overrides_are_visible_in_preview(prepared):
+    _, _, result = prepared
+    resources = result["resources"]
+    assert resources["cpus_source"] == "explicit override"
+    assert resources["memory_source"] == "explicit Slurm override"
+    assert resources["exported_cpus"] == [32, None]
+    assert resources["exported_memory_mb"] == [64512, None]
+    assert resources["gaussian_memory_mb"] == 768
+
+
+@pytest.mark.parametrize("fraction", ["invalid", 0, 1, "NaN"])
+def test_resource_reuse_rejects_invalid_trusted_memory_policy(fraction):
+    profile = {"software": {"gaussian": {"slurm": {"auto_memory_fraction": fraction}}}}
+    with pytest.raises(ValueError, match="trusted Gaussian memory"):
+        tensor._resource_preview(
+            INPUT, {"name": "sample.gjf", "cpus": 2, "memory_mib": 1024}, profile
+        )
+
+
+def test_session_protocol_handles_multiple_lines_and_flushes(monkeypatch, capsys):
+    import io
+    import sys
+    from types import SimpleNamespace
+
+    requests = [
+        {"action": "status", "bundle": "d" * 32},
+        {"action": "status", "bundle": "e" * 32},
+    ]
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        SimpleNamespace(
+            buffer=io.BytesIO(
+                b"".join(json.dumps(r).encode() + b"\n" for r in requests)
+            )
+        ),
+    )
+    monkeypatch.setattr(tensor, "handle", lambda request: {"bundle": request["bundle"]})
+    assert tensor.main(session=True) == 0
+    assert [
+        json.loads(line)["bundle"] for line in capsys.readouterr().out.splitlines()
+    ] == ["d" * 32, "e" * 32]
+
+
+def test_guided_client_to_real_endpoint_with_mocked_slurm(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from tests.test_tensor_bridge import bridge
+
+    source = tmp_path / "molecule_1.gjf"
+    source.write_bytes(
+        b"%nprocshared=2\n%mem=768MB\n# hf/sto-3g\n\nSynthetic\n\n0 1\nH 0 0 0\n\n"
+    )
+    original = source.read_bytes()
+    peer = """
+import json, os, subprocess, sys
+from pathlib import Path
+from inkly.gaussian import tensor
+os.environ['INKLY_CLUSTER_PROFILE_NAME'] = 'cuttlefish'
+root = Path(sys.argv[1]) / 'bundles'
+original_handle = tensor.handle
+tensor.handle = lambda request: original_handle(request, root)
+def scheduler(args, directory):
+    if args[0] == 'sbatch':
+        count = directory / 'synthetic-submit-count'
+        count.write_text(str(int(count.read_text()) + 1) if count.exists() else '1')
+        (directory / 'molecule_1.log').write_bytes(b'Normal termination of Gaussian\\n')
+        return subprocess.CompletedProcess(args, 0, '12345\\n', '')
+    return subprocess.CompletedProcess(args, 0, '12345|COMPLETED|0:0|\\n', '')
+tensor._scheduler = scheduler
+sys.exit(tensor.main(session=True))
+"""
+    popen = subprocess.Popen
+    starts = []
+
+    def start(args, **kwargs):
+        starts.append(args)
+        return popen([sys.executable, "-u", "-c", peer, str(tmp_path)], **kwargs)
+
+    monkeypatch.setattr(bridge.subprocess, "Popen", start)
+    monkeypatch.setattr(bridge.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    answers = iter(["s", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    assert bridge.main(["run", str(source), "--host", "cluster"]) == 0
+    assert len(starts) == 1
+    assert source.read_bytes() == original
+    assert (
+        tmp_path / "returned/molecule_1.log"
+    ).read_bytes() == b"Normal termination of Gaussian\n"
+    assert [
+        p.read_text() for p in (tmp_path / "bundles").glob("*/synthetic-submit-count")
+    ] == ["1"]

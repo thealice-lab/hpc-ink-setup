@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import hashlib
 import json
 import os
@@ -91,6 +92,80 @@ def _scheduler(args, directory):
     )
 
 
+def _resource_preview(data, request, profile):
+    """Reuse only explicit, consistent Link0 settings from every exported stage."""
+    exported_cpus, exported_memory = [], []
+    for section in re.split(r"(?im)^\s*--link1--\s*$", data.decode("utf-8")):
+        cpus, memory = [], []
+        for line in section.splitlines():
+            if line.lstrip().startswith("#"):
+                break
+            match = re.fullmatch(
+                r"\s*%(nprocshared|nproc|mem)\s*=\s*(\S+)\s*", line, re.I
+            )
+            if not match:
+                continue
+            key, value = match.groups()
+            if key.lower() != "mem":
+                cpus.append(int(value) if re.fullmatch(r"[1-9][0-9]*", value) else None)
+            else:
+                amount = re.fullmatch(r"([1-9][0-9]*)(MB|GB)", value, re.I)
+                memory.append(
+                    int(amount[1]) * (1024 if amount[2].upper() == "GB" else 1)
+                    if amount
+                    else None
+                )
+        exported_cpus.append(cpus[0] if cpus and len(set(cpus)) == 1 else None)
+        exported_memory.append(memory[0] if memory and len(set(memory)) == 1 else None)
+
+    cpus = request.get("cpus")
+    if cpus is None:
+        if None in exported_cpus or len(set(exported_cpus)) != 1:
+            raise ValueError(
+                "TENSOR CPU settings are missing or differ; specify --cpus"
+            )
+        cpus = exported_cpus[0]
+    try:
+        fraction = Decimal(
+            str(profile["software"]["gaussian"]["slurm"]["auto_memory_fraction"])
+        )
+    except (KeyError, TypeError, InvalidOperation):
+        raise ValueError("Invalid trusted Gaussian memory fraction") from None
+    if not fraction.is_finite() or not 0 < fraction <= Decimal("0.75"):
+        raise ValueError("Invalid trusted Gaussian memory fraction")
+    memory_mib = request.get("memory_mib")
+    if memory_mib is None:
+        if None in exported_memory or len(set(exported_memory)) != 1:
+            raise ValueError(
+                "TENSOR memory is missing, unsupported or differs; specify --memory-mib"
+            )
+        # Invert the same conservative policy used by the deterministic generator.
+        memory_mib = int(
+            (Decimal(exported_memory[0]) / fraction).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+    spec = GaussianJobSpec(request["name"], cpus, memory_mib)
+    return spec, {
+        "cpus": spec.cpus,
+        "cpus_source": "explicit override"
+        if request.get("cpus") is not None
+        else "TENSOR export",
+        "slurm_memory_mib": spec.slurm_memory_mib,
+        "gaussian_memory_mb": int(
+            (Decimal(spec.slurm_memory_mib) * fraction).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        ),
+        "memory_source": "explicit Slurm override"
+        if request.get("memory_mib") is not None
+        else "TENSOR export plus cluster headroom",
+        "exported_cpus": exported_cpus,
+        "exported_memory_mb": exported_memory,
+        "hours": request.get("hours", 1),
+    }
+
+
 def _state(directory, receipt):
     job = receipt.get("job_id")
     if not job:
@@ -131,18 +206,19 @@ def handle(request, root=None):
     directory = root / bundle
     if action == "prepare":
         name = request["name"]
-        spec = GaussianJobSpec(name, request["cpus"], request["memory_mib"])
         data = base64.b64decode(request["data"], validate=True)
         if not data or len(data) > MAX_INPUT:
             raise ValueError("Input must be nonempty and at most 5 MiB")
         stages = _validate_input(data)
+        profile = resolve_cluster_profile()
+        spec, resources = _resource_preview(data, request, profile)
         digest = hashlib.sha256(data).hexdigest()
         script = generate_sbatch(
             spec,
-            resolve_cluster_profile(),
+            profile,
             tensor_output=True,
             input_sha256=digest,
-            hours=request["hours"],
+            hours=resources["hours"],
         )
         # Exclusive creation makes interrupted preparation safe to identify.
         directory.mkdir(mode=0o700)
@@ -156,6 +232,7 @@ def handle(request, root=None):
             "script_sha256": hashlib.sha256(script.encode()).hexdigest(),
             "stages": stages,
             "submission": "PREPARED",
+            "resources": resources,
         }
         _save(directory / "receipt.json", receipt)
         return {**receipt, "script": script}
@@ -194,6 +271,8 @@ def handle(request, root=None):
         status = _state(directory, receipt)
         response = {**receipt, **status}
         if action == "status":
+            if receipt["submission"] == "PREPARED":
+                response["script"] = _read(directory / "job.sbatch").decode("utf-8")
             return response
         if status != {"state": "COMPLETED", "exit_code": "0:0"}:
             raise ValueError(
@@ -214,14 +293,13 @@ def handle(request, root=None):
         }
 
 
-def main():
+def _reply(raw):
     try:
-        raw = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
         if len(raw) > 8 * 1024 * 1024:
             raise ValueError("Request exceeds transfer limit")
         request = json.loads(raw)
         response = handle(request)
-        print(json.dumps({"ok": True, **response}))
+        print(json.dumps({"ok": True, **response}), flush=True)
         return 0
     except (
         OSError,
@@ -232,8 +310,23 @@ def main():
     ) as exc:
         # Never echo a payload, research input, scheduler output or traceback.
         message = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
-        print(json.dumps({"ok": False, "error": message}))
+        print(json.dumps({"ok": False, "error": message}), flush=True)
         return 1
+
+
+def main(session=False):
+    limit = 8 * 1024 * 1024 + 1
+    if not session:
+        return _reply(sys.stdin.buffer.read(limit))
+    # A single authenticated OpenSSH process carries the explicit operations.
+    # Closing it does not cancel a submitted job or discard its durable receipt.
+    while True:
+        raw = sys.stdin.buffer.readline(limit)
+        if not raw:
+            return 0
+        result = _reply(raw)
+        if len(raw) >= limit:
+            return result
 
 
 if __name__ == "__main__":
