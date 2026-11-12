@@ -101,6 +101,7 @@ class Session:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.responses = queue.Queue()
         self.error_tail = b""
@@ -213,7 +214,7 @@ def retrieve(response, output):
     return path
 
 
-def _prepare(args):
+def _prepare(args, report=print):
     with args.input.open("rb") as source:
         data = source.read(5 * 1024 * 1024 + 1)
     if not data or len(data) > 5 * 1024 * 1024:
@@ -234,7 +235,7 @@ def _prepare(args):
         json.dump(receipt, out)
         out.flush()
         os.fsync(out.fileno())
-    print(f"Recovery receipt: {path}")
+    report(f"Recovery receipt: {path}")
     return receipt, {
         "action": "prepare",
         "name": args.input.name,

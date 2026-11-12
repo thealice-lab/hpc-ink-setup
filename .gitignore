@@ -32,3 +32,9 @@ benchmarks/gaussian/live_tests/
 
 # Personal Windows bridge settings and calculation recovery receipts
 /scripts/windows/tensor-bridge.local.json
+
+# Local Windows application builds
+/.build-venv/
+/build/
+/dist/
+/*.spec

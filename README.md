@@ -150,7 +150,11 @@ For the Windows TENSOR export → HPC Inkly → TENSOR analysis workflow, follow
 [TENSOR files from a Windows laptop](#tensor-files-from-a-windows-laptop) below
 and [the complete TENSOR handoff guide](docs/TENSOR.md).
 
-On Windows, run `tensor.cmd` for a file picker that accepts one or several
+On Windows, [Inkly Desktop](docs/DESKTOP.md) provides file selection, resource
+preview, confirmed submission and result monitoring in an application window.
+Open `InklyDesktop.exe` or double-click `Inkly Desktop.pyw` when running from source.
+
+For a console workflow, run `tensor.cmd` for a file picker that accepts one or several
 TENSOR exports. Connection preferences are saved locally; preview is the default.
 See the [file-picker walkthrough](docs/TENSOR_PICKER.md).
 

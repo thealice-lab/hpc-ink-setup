@@ -162,9 +162,12 @@ def plan(paths, settings, mode):
 
 
 @contextmanager
-def authentication(settings):
+def authentication(settings, askpass=None):
     """Reuse the established helper; do not add or replace authentication code."""
-    old = {key: os.environ.get(key) for key in ("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE")}
+    old = {
+        key: os.environ.get(key)
+        for key in ("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "INKLY_SSH_TARGET")
+    }
     try:
         if settings.get("auth") == "keyboard-interactive":
             if not os.environ.get("SSH_ASKPASS"):
@@ -173,36 +176,42 @@ def authentication(settings):
                     / "CuttlefishSsh"
                     / "connect_cuttlefish.ps1"
                 )
-                if os.name != "nt" or not helper.is_file():
+                if askpass and Path(askpass).is_file() and not helper.is_file():
+                    os.environ["SSH_ASKPASS"] = str(askpass)
+                elif os.name != "nt" or not helper.is_file():
                     raise ValueError(
                         "Configure your existing site-approved SSH_ASKPASS helper first, or use configured authentication"
                     )
-                result = subprocess.run(
-                    [
-                        "powershell.exe",
-                        "-NoProfile",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        str(helper),
-                        "-BuildOnly",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    check=False,
-                )
-                executable = result.stdout.strip()
-                if (
-                    result.returncode
-                    or not executable
-                    or not Path(executable).is_file()
-                ):
-                    raise ValueError(
-                        "The existing local SSH helper could not be prepared"
+                else:
+                    result = subprocess.run(
+                        [
+                            "powershell.exe",
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            str(helper),
+                            "-BuildOnly",
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
-                os.environ["SSH_ASKPASS"] = executable
+                    executable = result.stdout.strip()
+                    if (
+                        result.returncode
+                        or not executable
+                        or not Path(executable).is_file()
+                    ):
+                        raise ValueError(
+                            "The existing local SSH helper could not be prepared"
+                        )
+                    os.environ["SSH_ASKPASS"] = executable
             os.environ["SSH_ASKPASS_REQUIRE"] = "force"
+            os.environ["INKLY_SSH_TARGET"] = settings.get("host", "your HPC account")
         yield
     finally:
         for key, value in old.items():
@@ -212,7 +221,7 @@ def authentication(settings):
                 os.environ[key] = value
 
 
-def prepare(session, item, settings):
+def prepare(session, item, settings, report=print):
     if item["receipt"] is None:
         args = SimpleNamespace(
             input=item["path"],
@@ -225,10 +234,12 @@ def prepare(session, item, settings):
             memory_mib=None,
             hours=settings["hours"],
         )
-        item["receipt"], request = bridge._prepare(args)
+        item["receipt"], request = bridge._prepare(args, report=report)
     else:
         request = {"action": "status"}
-        print(f"Using saved handoff: {item['path'].name} (its original settings apply)")
+        report(
+            f"Using saved handoff: {item['path'].name} (its original settings apply)"
+        )
     response = session.exchange(request, receipt=item["receipt"])
     if response["name"] != item["path"].name:
         raise ValueError("The receipt belongs to a different input filename")
@@ -289,7 +300,7 @@ def confirm(items):
             return answer == f"submit {len(ready)}"
 
 
-def collect(session, item):
+def collect(session, item, report=print):
     result = session.exchange({"action": "fetch"}, receipt=item["receipt"])
     expected = item["path"].with_suffix(".log").name
     if result["name"] != expected:
@@ -300,9 +311,10 @@ def collect(session, item):
             raise ValueError(
                 f"Existing output differs; preserved without overwrite: {path}"
             )
-        print(f"Already returned; checksum verified: {path}")
+        report(f"Already returned; checksum verified: {path}")
     else:
-        print(f"Verified output saved: {bridge.retrieve(result, item['output'])}")
+        report(f"Verified output saved: {bridge.retrieve(result, item['output'])}")
+    return path
 
 
 def watch(session, items, interval):

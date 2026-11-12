@@ -1,5 +1,9 @@
 # Choose TENSOR exports with a short launcher
 
+Prefer a window with buttons? Open **InklyDesktop.exe** or the source launcher
+`Inkly Desktop.pyw`. See the [desktop application guide](DESKTOP.md). The console
+launcher described below remains available for terminal workflows.
+
 After TENSOR generates your Gaussian inputs, open PowerShell in this repository
 and run:
 
