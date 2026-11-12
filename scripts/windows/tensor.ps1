@@ -114,7 +114,13 @@ try {
             throw 'Use Windows PowerShell 5.1 (powershell.exe) to build the SSH sign-in dialog.'
         }
         $source = Join-Path $PSScriptRoot 'ssh_askpass.cs'
-        $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.Substring(0, 12)
+        # Work even when the parent shell's module path omits Get-FileHash.
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try {
+            $sourceHash = ([BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($source)))).Replace('-', '').Substring(0, 12)
+        } finally {
+            $hasher.Dispose()
+        }
         $dialog = Join-Path $CacheDirectory ("InklySshAskpass-$sourceHash.exe")
         if (-not (Test-Path -LiteralPath $dialog -PathType Leaf)) {
             New-Item -ItemType Directory -Path $CacheDirectory -Force | Out-Null
