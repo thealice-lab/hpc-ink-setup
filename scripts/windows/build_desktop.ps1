@@ -17,4 +17,10 @@ Add-Type -Path (Join-Path $PSScriptRoot 'ssh_askpass.cs') -ReferencedAssemblies 
 $buildWorkspace = Join-Path $build ('pyinstaller-' + [Guid]::NewGuid().ToString('N'))
 & $Python -m PyInstaller --noconfirm --onefile --windowed --noupx --name InklyDesktop --distpath $dist --workpath $buildWorkspace --specpath $buildWorkspace --add-binary "$dialog;." (Join-Path $repo 'scripts\tensor_desktop.py')
 if ($LASTEXITCODE -ne 0) { throw 'Desktop executable build failed' }
-Get-FileHash -LiteralPath (Join-Path $dist 'InklyDesktop.exe') -Algorithm SHA256
+$hasher = [Security.Cryptography.SHA256]::Create()
+try {
+    $digest = ([BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes((Join-Path $dist 'InklyDesktop.exe'))))).Replace('-', '')
+    Write-Output ("SHA256: " + $digest)
+} finally {
+    $hasher.Dispose()
+}
