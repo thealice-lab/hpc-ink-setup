@@ -1,5 +1,10 @@
 # TENSOR handoff through Inkly
 
+For a Windows file picker and saved connection preferences, run `tensor.cmd`.
+It supports one or multiple exports with preview as the default. See the
+[short-launcher walkthrough](TENSOR_PICKER.md). The single-file command-line
+interface below remains available for explicit overrides and advanced recovery.
+
 Keep using TENSOR on Windows to prepare calculations and analyze results. Export
 one self-contained Gaussian `.gjf` or `.com`, then run the helper once. Inkly on
 the HPC prepares the trusted cluster script, asks before submission, monitors

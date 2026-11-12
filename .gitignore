@@ -24,5 +24,8 @@ htmlcov/
 *.time
 fort.*
 
+# Personal calculation handoff receipts (keep scientific files outside the clone)
+*.inkly.json
+
 # Raw Gaussian validation artifacts
 benchmarks/gaussian/live_tests/

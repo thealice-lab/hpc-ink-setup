@@ -149,6 +149,10 @@ ink
 For the Windows TENSOR export → HPC Inkly → TENSOR analysis workflow, see
 [the TENSOR handoff guide](docs/TENSOR.md).
 
+On Windows, run `tensor.cmd` for a file picker that accepts one or several
+TENSOR exports. Connection preferences are saved locally; preview is the default.
+See the [file-picker walkthrough](docs/TENSOR_PICKER.md).
+
 The guided helper reuses consistent exported CPU/memory settings, previews the
 cluster allocation, asks before submission and returns the verified log through
 one OpenSSH connection. TENSOR retains scientific preparation and analysis.

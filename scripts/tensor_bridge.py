@@ -128,8 +128,14 @@ class Session:
         finally:
             self.responses.put(None)
 
-    def exchange(self, request):
-        request = {**request, "bundle": self.receipt["bundle"]}
+    def exchange(self, request, *, receipt=None):
+        receipt = receipt or self.receipt
+        if any(
+            receipt.get(key) != self.receipt.get(key)
+            for key in ("host", "ink_path", "auth")
+        ):
+            raise ValueError("One SSH session cannot mix connection settings")
+        request = {**request, "bundle": receipt["bundle"]}
         # Cover a blocked input transfer/authentication as well as response reads.
         deadline = threading.Timer(180, self.process.kill)
         deadline.daemon = True
@@ -164,7 +170,7 @@ class Session:
             )
         if len(raw) > 96 * 1024 * 1024:
             raise ValueError("Response exceeds transfer limit")
-        return _response(raw, self.receipt)
+        return _response(raw, receipt)
 
     def __enter__(self):
         return self
