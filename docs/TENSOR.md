@@ -5,137 +5,328 @@ It supports one or multiple exports with preview as the default. See the
 [short-launcher walkthrough](TENSOR_PICKER.md). The single-file command-line
 interface below remains available for explicit overrides and advanced recovery.
 
-Keep using TENSOR on Windows to prepare calculations and analyze results. Export
-one self-contained Gaussian `.gjf` or `.com`, then run the helper once. Inkly on
-the HPC prepares the trusted cluster script, asks before submission, monitors
-the recorded job and returns its verified `.log` for TENSOR.
+Use TENSOR on your Windows laptop to prepare a calculation, export one
+self-contained Gaussian `.gjf` or `.com`, and analyze the returned `.log`.
+**Clone this repository on the laptop to get the transfer scripts, and install
+the matching Inkly version on the HPC to receive their requests.**
 
-The standalone `scripts/tensor_bridge.py` needs Python 3.9+ and native OpenSSH
-on Windows; it does not install Inkly on Windows or change TENSOR. Install the
-matching Inkly version on the HPC. TENSOR's native SSH/HPC window is separate:
-its publisher's [archived SSH guide](https://github.com/jaredscottwood/TENSOR-releases/blob/568b0e82b99e8d2018707df3e0b58df30bc2933d/SSH_HPC.md)
-excludes interactive MFA. This helper uses the existing local authentication
-dialog and one SSH connection for the handoff.
+The included `scripts/windows/tensor.ps1` launcher runs the standalone
+`scripts/tensor_bridge.py` transport. The bridge reads your local export, sends
+its contents through authenticated SSH, and asks HPC-side Inkly to write the
+input and generate `job.sbatch`. After confirmation, Inkly submits to Slurm.
+The bridge watches the recorded job and retrieves the successful log onto your
+laptop. You import that local log into TENSOR yourself.
 
-## Setup
+This workflow uses no chat-model call. TENSOR's own SSH/HPC window is separate;
+its interactive MFA limitation is why this companion uses native OpenSSH.
+No Windows installation of Inkly's Linux runtime is needed.
 
-Verify the server host key through the established site procedure first. Strict
-host checking stays enabled; existing OpenSSH aliases work. The default
-keyboard-interactive authentication matches the Cuttlefish MFA helper. Use
-`--auth configured` when your site uses existing OpenSSH key/agent settings.
-For the established personal Cuttlefish dialog helper, prepare its executable
-in PowerShell (the personal helper remains outside Git):
+## Requirements and supported systems
+
+| Laptop | HPC |
+| --- | --- |
+| Windows, Windows PowerShell 5.1 (`powershell.exe`), Git, Python 3.9+ and Windows OpenSSH Client | Your own account, Linux, Slurm and permission to run Gaussian |
+| This source repository, including `scripts/windows/` and `scripts/tensor_bridge.py` | A matching installed Inkly runtime with the TENSOR endpoint |
+| TENSOR obtained separately; network/VPN access required by your site | The supported, verified Gaussian cluster profile and its software/scratch setup |
+
+The current generator supports the verified Cuttlefish profile. Other clusters
+need maintainer/admin validation and generator/profile support before use;
+editing the SSH hostname alone is insufficient. Use your own account and
+site-approved authentication. Never copy another person's private connection
+files, receipts or HPC installation.
+
+## 1. Prepare the laptop
+
+All commands in this section run in **PowerShell on the Windows laptop**.
+Install Git, Python 3.9+ and the Windows OpenSSH Client through your normal
+software-installation process if they are missing. The bridge uses only Python's
+standard library: do not run `setup.sh` or install the Linux requirements locally.
+
+Clone the repository into your chosen source folder:
 
 ```powershell
-$env:SSH_ASKPASS = & "$env:LOCALAPPDATA\CuttlefishSsh\connect_cuttlefish.ps1" -BuildOnly
-$env:SSH_ASKPASS_REQUIRE = 'force'
-$ssh = "$env:WINDIR\System32\OpenSSH\ssh.exe"
+git clone https://github.com/thealice-lab/hpc-ink-setup.git
+Set-Location hpc-ink-setup
+git rev-parse HEAD
+Copy-Item .\scripts\windows\tensor-bridge.example.json .\scripts\windows\tensor-bridge.local.json
+notepad .\scripts\windows\tensor-bridge.local.json
 ```
 
-Keep input, receipts and results outside the source repository. Input is limited
-to 5 MiB. Filenames must start with a letter/digit and contain only letters,
-digits, dots, underscores or hyphens. Linked stages are supported. External
-includes/checkpoints, distributed execution and split/path-based RWF files are
-unsupported. No password, key or MFA response belongs in command arguments.
+Edit the three fields, preserving valid JSON:
 
-## One handoff, followed by analysis in TENSOR
+```json
+{
+  "host": "YOUR_USERNAME@YOUR_HPC_HOST",
+  "ink_path": "~/.inkly/bin/ink",
+  "auth": "keyboard-interactive"
+}
+```
 
-Export the input in TENSOR, then use:
+- `host`: your own `username@hostname` from the site, or an existing alias in
+  your OpenSSH configuration. Ports, jump hosts and other SSH options belong
+  in your local OpenSSH config, not this field.
+- `ink_path`: the installed HPC launcher. The default is `~/.inkly/bin/ink`;
+  change it only when your maintainer provides another matching launcher.
+- `auth`: `keyboard-interactive` for password/MFA prompts using the included
+  Windows dialog, or `configured` to let OpenSSH use existing site-approved
+  key/agent/authentication settings.
+
+Keep credentials out of this file. The local JSON and `*.inkly.json` receipts
+are Git-ignored. These still contain account/connection metadata: keep them
+private and do not share them as examples. Inputs and results belong in a
+research folder outside the clone.
+
+Check the local setup without connecting or submitting:
 
 ```powershell
-py scripts/tensor_bridge.py --ssh $ssh run C:\Research\sample_1.gjf --host YOUR_USER@YOUR_CLUSTER
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action check
 ```
 
-The helper shows the exported settings, selected CPUs, Gaussian runtime memory,
-total Slurm allocation and wall-time limit. The original input stays unchanged.
-The default time limit is **one hour**, not a recommended duration for research;
-set `--hours` as needed (1–336). The prompt is:
+For keyboard-interactive authentication, this compiles the included generic
+`ssh_askpass.cs` into a cached executable under `%LOCALAPPDATA%\Inkly\Ssh`.
+Later actions select that dialog automatically. Password/MFA responses pass to
+OpenSSH and are not saved to disk. Existing authentication environment settings
+are restored when the launcher finishes. No private personal helper is required.
+
+The commands explicitly use Windows PowerShell 5.1. `-ExecutionPolicy Bypass`
+applies to that process only; it does not change the persistent execution policy.
+If institutional policy blocks execution or compilation, use an approved SSH
+authentication method with `auth: configured` or contact your administrator.
+
+If Python is not found, add `-Python "C:\Path\To\python.exe"` to the launcher
+commands. Otherwise the launcher selects `py -3`, falling back to `python.exe`.
+Use `-ConfigPath "C:\Private\tensor-bridge.local.json"` if you keep settings
+elsewhere. Relative script paths below assume you are in the laptop clone.
+
+## 2. Install and verify the HPC side
+
+From laptop PowerShell, connect using the configured account:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action connect
+```
+
+On first contact, compare the SSH host-key fingerprint with the one provided
+through your site's established procedure before accepting it. OpenSSH records
+the verified key in your local `known_hosts`. Later bridge actions require that
+trusted key and do not accept unknown/changed host keys automatically. Complete
+the site's password/MFA prompts in the local dialog as directed by the site.
+
+You are now in an **HPC Linux shell**. Follow [the HPC installation guide](CUTTLEFISH_SETUP.md).
+For a new installation, its core commands are:
+
+```bash
+git clone https://github.com/thealice-lab/hpc-ink-setup.git
+cd hpc-ink-setup
+git rev-parse HEAD
+bash setup.sh
+```
+
+Use the same release/revision on the laptop and HPC. For an existing checkout,
+update it through your normal maintenance procedure and rerun `bash setup.sh`
+to refresh the installed runtime. Pulling new source alone leaves an old
+`~/.inkly/bin/ink` installation unchanged.
+
+Verify the **installed** endpoint and detected profile in the HPC shell:
+
+```bash
+~/.inkly/venv/bin/python - <<'PY'
+import inspect
+from pathlib import Path
+import sys
+
+runtime = Path.home() / ".inkly" / "lib"
+assert (runtime / "inkly" / "gaussian" / "tensor.py").is_file(), "Install the matching Inkly runtime"
+sys.path.insert(0, str(runtime))
+from inkly.gaussian import tensor
+from inkly.cluster_profile import resolve_cluster_profile
+
+assert runtime.resolve() in Path(tensor.__file__).resolve().parents, "Expected the installed runtime"
+assert "session" in inspect.signature(tensor.main).parameters, "Update the installed Inkly runtime"
+profile = resolve_cluster_profile()
+assert profile and profile.get("name") == "Cuttlefish", "A supported verified profile is required"
+print("Installed TENSOR session endpoint and supported profile: ready")
+PY
+```
+
+This readiness check does not submit a job. It does not establish Gaussian
+license/group access, available resources or scientific suitability; verify
+those prerequisites with your site's setup guide. A model service is used by
+Inkly's chat features; the TENSOR file handoff itself does not call it.
+
+Type `exit` to return to **laptop PowerShell**. The remaining commands run there.
+
+## 3. Export from TENSOR and preview the transfer
+
+In TENSOR's job setup, choose the molecule and scientific settings, then export
+the Gaussian input into a research folder, for example `C:\Research\sample_1.gjf`.
+Do not put scientific data in the source checkout. Filenames must start with a
+letter/digit and contain only letters, digits, dots, underscores or hyphens.
+Quoted directory paths may contain spaces.
+
+Upload and prepare the job without submitting it:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action preview -InputFile "C:\Research\sample_1.gjf" -Hours 2
+```
+
+The launcher opens its own SSH connection; no separate HPC terminal is needed.
+Complete sign-in. The preview shows the exported settings, selected CPUs,
+Gaussian memory, total Slurm memory, time limit and generated SBATCH script.
+The original file stays unchanged. `-Hours 2` is an illustrative maximum,
+not a predicted duration; choose a suitable limit. The default is one hour,
+and supported explicit limits are 1-336 hours.
+
+Record the printed recovery receipt. With these example paths the defaults are:
+
+```text
+Input:    C:\Research\sample_1.gjf
+Receipt:  C:\Research\sample_1.gjf.inkly.json
+Result:   C:\Research\returned\sample_1.log  (after successful completion)
+```
+
+Preview sends the input and creates a private HPC bundle, but no Slurm job or
+result. Continue using that receipt rather than starting another preview.
+Use `-Receipt "C:\Research\custom.inkly.json"` or `-Out "C:\Research\results"`
+during preparation to choose other local destinations. Existing receipts and
+results are never overwritten.
+
+## 4. Submit, monitor and automatically return the log
+
+Continue the reviewed preview using its printed receipt:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action resume -Receipt "C:\Research\sample_1.gjf.inkly.json"
+```
+
+After sign-in, a prepared calculation shows the resource preview and asks:
 
 ```text
 Submit this calculation? [y/N/s=show SBATCH]
 ```
 
-Press Enter or `n` to stop after preparation, `s` to inspect the generated
-script, or `y` to submit the reviewed calculation. Submission requires an
-interactive terminal. It never happens merely because preparation succeeded.
+Enter or `n` leaves it prepared. `s` displays the script. `y` submits the
+reviewed calculation. Submission requires an interactive terminal and never
+happens just because upload succeeded.
 
-After submission the same connection watches that job and retrieves its log
-when both Slurm and Gaussian report successful completion. The final message
-gives the verified file path. In TENSOR choose **Analysis & 3D view → Add logs**
-and select that file; TENSOR continues to handle the scientific analysis.
+The command prints the recorded job ID and watches its status. **Leave the
+laptop awake, connected to the required network/VPN, and the command running.**
+After successful completion, the same connection carries the verified log back
+to your laptop and prints:
 
-By default, the local recovery receipt is `sample_1.gjf.inkly.json`, and results
-go under `returned` beside the input. Use `--receipt` or `--out` to choose other
-locations. Existing receipts/results are never overwritten.
+```text
+Verified output saved: C:\Research\returned\sample_1.log
+In TENSOR: Analysis & 3D view -> Add logs -> select this file.
+```
 
-## Reusing exported resources
+The HPC is not making an inbound connection to your laptop. The laptop bridge
+requests and receives the result over the SSH connection it opened.
 
-Automatic reuse requires explicit, matching CPU and memory settings in **every**
+Once familiar with the workflow, a new input can use a single guided action:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action run -InputFile "C:\Research\new_sample.gjf" -Hours 2
+```
+
+`run` combines preparation, preview, confirmation, submission, monitoring and
+return in one authenticated session. Use it for a new calculation with a new
+receipt, not to recover one already prepared/submitted.
+
+## 5. Open the returned file in TENSOR
+
+In TENSOR select **Analysis & 3D view -> Add logs**, then choose the exact local
+file printed by the bridge. TENSOR handles the scientific analysis. Completion
+and transfer checks establish execution/transport success, not the suitability
+of the method or correctness of a scientific conclusion.
+
+## Interruptions, status and manual retrieval
+
+Ctrl+C stops the laptop's waiting, **not the Slurm job**. Closing the terminal,
+sleeping the laptop or losing network access can interrupt monitoring/return.
+Once connectivity is restored, use the same `resume` command above.
+
+For an already submitted bundle, `resume` monitors the recorded job and returns
+its successful output without another submission. For a prepared bundle, it
+shows the preview and asks before submission. Recovery uses the host, launcher
+and authentication mode stored in the receipt, so editing the new-run settings
+does not redirect an existing job. Copy your own receipt and the scripts to a
+replacement laptop only when permitted, then establish SSH trust there as usual.
+
+Check status without offering submission or waiting:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action status -Receipt "C:\Research\sample_1.gjf.inkly.json"
+```
+
+Fetch an already successful result directly, choosing a local output directory:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action fetch -Receipt "C:\Research\sample_1.gjf.inkly.json" -Out "C:\Research\recovered-results"
+```
+
+Add `-Out "C:\Research\recovered-results"` to a launcher `-Action resume`
+command to change the destination for that invocation. If the log already exists, choose another directory rather
+than overwrite it. Separate status/fetch actions authenticate separately.
+
+Unknown, failed or ambiguous states stop with a message; they never trigger a
+retry. `SUBMISSION_UNKNOWN` means a submission may have reached Slurm: inspect
+the queue/accounting with your site support before preparing anything new.
+Failed jobs remain on the HPC for inspection; this bridge does not cancel or
+restart them. An interrupted preparation can leave an unused private bundle;
+no automatic remote deletion or retention policy is added.
+
+## Resources and supported inputs
+
+Automatic reuse requires explicit, matching CPU and memory settings in every
 Link1 stage. CPU settings may be `%nprocshared` or `%nproc`; memory must be a
-positive whole number of `MB` or `GB` (1 GB = 1024 MB). Missing directives,
-conflicting values and other units require an explicit override; no Gaussian
-default or inheritance between stages is assumed.
+positive whole number of `MB` or `GB` (the parser uses 1 GB = 1024 MB). Missing,
+conflicting or unsupported settings require explicit overrides.
 
-Inkly derives the total Slurm allocation from exported Gaussian memory using
-the trusted cluster's conservative memory fraction. With the current 75%
-policy, `%mem=2GB` becomes **2048 MB Gaussian memory and 2731 MiB total Slurm
-memory**. The preview exposes that adjustment before confirmation.
-
-If reuse is unavailable, or you deliberately want different resources:
+Inkly derives total Slurm memory from exported Gaussian memory using the trusted
+profile's conservative fraction. Under the current 75% policy, `%mem=2GB`
+becomes 2048 MB Gaussian memory and 2731 MiB total Slurm memory. The preview
+shows the headroom before confirmation. To explicitly override resources:
 
 ```powershell
-py scripts/tensor_bridge.py --ssh $ssh run C:\Research\sample_1.gjf --host YOUR_USER@YOUR_CLUSTER --cpus 2 --memory-mib 1024 --hours 1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action preview -InputFile "C:\Research\sample_2.gjf" -Cpus 2 -MemoryMiB 1024 -Hours 1
 ```
 
-These are small test values. `--memory-mib` means **total Slurm memory**; the
-example gives Gaussian 768 MB under the 75% policy. Overrides and exported
-values are both shown. Runtime resource directives in every stage use the
-reviewed values. Scientific routes, coordinates and title/scaling metadata are
-retained; only the temporary runtime copy changes. The original bytes remain
-protected by a checksum.
+These are small test values, not research recommendations. `-MemoryMiB` means
+**total Slurm memory**; Gaussian receives 768 MB with this policy. Overrides
+and exports are both shown. Scientific routes, coordinates and title/scaling
+metadata are retained; resource changes affect a temporary runtime input.
 
-For inspection without any submission prompt:
+Inputs must be self-contained and at most 5 MiB. Linked stages are supported.
+External includes/checkpoints, distributed execution and split/path-based RWF
+files are unsupported. HPC bundles live under `~/.inkly/tensor/ID` with private
+directories/files. Checkpoints remain there. Gaussian RWF uses job scratch and
+is cleaned on exit; scheduler diagnostics are separate from the `.log`.
+
+Fetch requires Slurm `COMPLETED / 0:0`, sufficient normal Gaussian terminations
+for the linked stages, no error termination and a matching SHA-256 checksum.
+Logs are limited to 64 MiB and saved atomically without overwriting results.
+
+## Troubleshooting and lower-level CLI
+
+| Symptom | What to check |
+| --- | --- |
+| Local settings missing/placeholders remain | Copy the example JSON, fill in your own host and select the correct launcher/authentication mode. |
+| OpenSSH/Python missing | Install the Windows OpenSSH Client and Python 3.9+; use `-Python` for a specific interpreter. |
+| Host cannot be resolved or SSH times out | Restore site network/VPN/DNS access; keep the receipt and check status before retrying. |
+| Host key is unknown/changed | Verify the fingerprint through the site; use `connect` for first trust. Never disable host checking to proceed. |
+| Authentication denied/dialog build blocked | Check your account/MFA with the site; use site-approved configured authentication if required by policy. |
+| Invalid Inkly response/missing endpoint | Verify `ink_path`, update/reinstall matching HPC source and repeat the installed endpoint check. |
+| Unsupported/missing cluster profile | Ask the maintainer to validate profile/generator support; do not select another cluster's profile to bypass the check. |
+| Output not available/failed/timeout | Read the recorded status and HPC diagnostics; fetch accepts only successful jobs. |
+| Receipt/result already exists | Resume the existing job; use a different result directory for another retrieval. A deliberate new calculation needs its own receipt. |
+
+The Python CLI remains available for advanced callers:
 
 ```powershell
-py scripts/tensor_bridge.py --ssh $ssh run C:\Research\sample_1.gjf --host YOUR_USER@YOUR_CLUSTER --preview
+python .\scripts\tensor_bridge.py --help
 ```
 
-## Interruptions and recovery
-
-Ctrl+C stops the helper's waiting, **not the Slurm job**. Keep the receipt:
-
-```powershell
-py scripts/tensor_bridge.py --ssh $ssh resume C:\Research\sample_1.gjf.inkly.json
-```
-
-`resume` checks the existing bundle. A merely prepared bundle shows its preview
-and asks before submission. An already submitted bundle is monitored and
-retrieved without another submission. Unknown, failed or ambiguous states stop
-with a message; they do not trigger a retry. `SUBMISSION_UNKNOWN` means an
-attempt may have reached Slurm: inspect the queue before preparing anything new.
-
-If settings need changing, prepare a new receipt explicitly. After an existing
-result was already retrieved, use `resume --out` with a new directory rather
-than overwrite it. If SSH fails, check the network/VPN, login, host trust and
-matching HPC version. An interrupted preparation can leave an unused private
-bundle; no remote deletion or retention policy is added.
-
-## Advanced individual operations and scope
-
-The separate `prepare`, `submit RECEIPT --confirm`, `status RECEIPT` and
-`fetch RECEIPT --out DIRECTORY` commands remain available for manual operation
-and older receipts. `prepare` also infers resources when they are unambiguous.
-These individual commands each authenticate separately.
-
-HPC bundles live under `~/.inkly/tensor/ID`, with owner-only directories/files.
-Checkpoints remain in the private bundle; Gaussian RWF uses job scratch and is
-cleaned on exit. Scheduler diagnostics are separate from the matching `.log`.
-Fetch requires Slurm `COMPLETED / 0:0`, normal termination for each linked stage,
-no error termination and a matching SHA-256. Logs are limited to 64 MiB and
-published atomically without overwriting results. Failed calculations stay on
-the HPC for inspection.
-
-This is a bounded file handoff, with explicit confirmation. Conversational job
-generation, general job management/cancellation and automatic documentation
-database provisioning remain separate work. Independent shared-logging access
-validation is also outstanding. None is implied by completing this workflow.
+Its `run`, `resume`, `prepare`, `submit RECEIPT --confirm`, `status` and `fetch`
+operations use the same protocol. Direct callers must arrange their own
+OpenSSH authentication environment. The Windows launcher packages that setup
+and preserves receipt-based recovery; no TENSOR interface modification is added.

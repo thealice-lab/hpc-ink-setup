@@ -29,3 +29,6 @@ fort.*
 
 # Raw Gaussian validation artifacts
 benchmarks/gaussian/live_tests/
+
+# Personal Windows bridge settings and calculation recovery receipts
+/scripts/windows/tensor-bridge.local.json
