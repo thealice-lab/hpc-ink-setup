@@ -223,14 +223,19 @@ def _try_lock(root: Path):
     path = root / ".build.lock"
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o660)
-        os.chmod(path, 0o660)
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         fd = os.open(path, flags)
     acquired = False
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode) or path.is_symlink():
             raise CorpusError("Build lock is not a regular file.")
+        # Readers must never be able to take or interfere with a build lock,
+        # including when a lock from an older release already exists.
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:
+            os.chmod(path, 0o600)
         try:
             if os.name == "nt":
                 import msvcrt
@@ -269,6 +274,9 @@ def build_snapshot(root: Path, spec: dict, build, lock_fd: int) -> Path:
     try:
         stage = work / "snapshot"
         stage.mkdir(mode=0o750)
+        # mkdir mode is filtered through umask (often 077 on HPC).
+        # The stage stays private behind work/ until it is published.
+        os.chmod(stage, 0o2750)
         database = stage / "gaussian.db"
         database.touch(mode=0o600)
         # Raw scraper diagnostics stay private and are removed after normal exit.
