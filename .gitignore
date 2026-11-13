@@ -24,9 +24,17 @@ htmlcov/
 *.time
 fort.*
 
+# Personal calculation handoff receipts (keep scientific files outside the clone)
+*.inkly.json
+
 # Raw Gaussian validation artifacts
 benchmarks/gaussian/live_tests/
 
 # Personal Windows bridge settings and calculation recovery receipts
 /scripts/windows/tensor-bridge.local.json
-*.inkly.json
+
+# Local Windows application builds
+/.build-venv/
+/build/
+/dist/
+/*.spec

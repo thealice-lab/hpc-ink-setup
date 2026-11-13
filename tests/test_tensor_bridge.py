@@ -131,6 +131,31 @@ def test_tensor_command_bypasses_model_and_conversation(monkeypatch):
     assert ink_core.main() == 42
 
 
+def test_missing_remote_bundle_has_a_specific_recovery_error():
+    receipt = {
+        "host": "cluster",
+        "ink_path": "/bin/ink",
+        "bundle": "a" * 32,
+    }
+    raw = json.dumps(
+        {"ok": False, "error": "Unknown bundle; prepare a new input first"}
+    ).encode()
+    with pytest.raises(bridge.MissingBundleError, match="Unknown bundle"):
+        bridge._response(raw, receipt)
+
+
+def test_other_remote_errors_are_not_classified_as_missing_bundles():
+    receipt = {
+        "host": "cluster",
+        "ink_path": "/bin/ink",
+        "bundle": "a" * 32,
+    }
+    raw = json.dumps({"ok": False, "error": "SSH authentication denied"}).encode()
+    with pytest.raises(ValueError, match="authentication denied") as error:
+        bridge._response(raw, receipt)
+    assert not isinstance(error.value, bridge.MissingBundleError)
+
+
 @pytest.mark.parametrize(
     "stdout,code", [(b"[]", 0), (b"not JSON", 255), (b'{"ok":true}', 255)]
 )

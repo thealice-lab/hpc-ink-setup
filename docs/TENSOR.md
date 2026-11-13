@@ -1,5 +1,14 @@
 # TENSOR handoff through Inkly
 
+For a desktop application with file selection, resource preview, confirmation
+and progress in a window, see [Inkly Desktop](DESKTOP.md). The packaged Windows
+`.exe` includes Python; the command-line setup below is for source/CLI users.
+
+For a Windows file picker and saved connection preferences, run `tensor.cmd`.
+It supports one or multiple exports with preview as the default. See the
+[short-launcher walkthrough](TENSOR_PICKER.md). The single-file command-line
+interface below remains available for explicit overrides and advanced recovery.
+
 Use TENSOR on your Windows laptop to prepare a calculation, export one
 self-contained Gaussian `.gjf` or `.com`, and analyze the returned `.log`.
 **Clone this repository on the laptop to get the transfer scripts, and install

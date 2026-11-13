@@ -20,6 +20,10 @@ import time
 import uuid
 
 
+class MissingBundleError(ValueError):
+    """The HPC no longer has the bundle referenced by a saved receipt."""
+
+
 def _ssh_args(receipt, ssh, session=False):
     host = receipt["host"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", host):
@@ -64,7 +68,10 @@ def _response(raw, receipt):
     if not isinstance(response, dict):
         raise ValueError("Expected an Inkly response object")
     if not response.get("ok"):
-        raise ValueError(response.get("error", "Remote operation failed"))
+        error = response.get("error", "Remote operation failed")
+        if error == "Unknown bundle; prepare a new input first":
+            raise MissingBundleError(error)
+        raise ValueError(error)
     if response.get("bundle") != receipt["bundle"]:
         raise ValueError("Response bundle does not match the receipt")
     return response
@@ -101,6 +108,7 @@ class Session:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.responses = queue.Queue()
         self.error_tail = b""
@@ -128,8 +136,14 @@ class Session:
         finally:
             self.responses.put(None)
 
-    def exchange(self, request):
-        request = {**request, "bundle": self.receipt["bundle"]}
+    def exchange(self, request, *, receipt=None):
+        receipt = receipt or self.receipt
+        if any(
+            receipt.get(key) != self.receipt.get(key)
+            for key in ("host", "ink_path", "auth")
+        ):
+            raise ValueError("One SSH session cannot mix connection settings")
+        request = {**request, "bundle": receipt["bundle"]}
         # Cover a blocked input transfer/authentication as well as response reads.
         deadline = threading.Timer(180, self.process.kill)
         deadline.daemon = True
@@ -164,7 +178,7 @@ class Session:
             )
         if len(raw) > 96 * 1024 * 1024:
             raise ValueError("Response exceeds transfer limit")
-        return _response(raw, self.receipt)
+        return _response(raw, receipt)
 
     def __enter__(self):
         return self
@@ -207,7 +221,7 @@ def retrieve(response, output):
     return path
 
 
-def _prepare(args):
+def _prepare(args, report=print):
     with args.input.open("rb") as source:
         data = source.read(5 * 1024 * 1024 + 1)
     if not data or len(data) > 5 * 1024 * 1024:
@@ -228,7 +242,7 @@ def _prepare(args):
         json.dump(receipt, out)
         out.flush()
         os.fsync(out.fileno())
-    print(f"Recovery receipt: {path}")
+    report(f"Recovery receipt: {path}")
     return receipt, {
         "action": "prepare",
         "name": args.input.name,
