@@ -33,7 +33,73 @@ EVENT_FIELDS = {
         },
     },
 }
+DESKTOP_STATES = {
+    "PREPARED",
+    "SUBMITTED",
+    "SUBMISSION_UNKNOWN",
+    "PENDING",
+    "RUNNING",
+    "COMPLETING",
+    "COMPLETED",
+    "CANCELLED",
+    "FAILED",
+    "TIMEOUT",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "SUSPENDED",
+    "RETURNED",
+    "UNKNOWN",
+}
+DESKTOP_FIELDS = {
+    "desktop_session_start": {},
+    "desktop_session_end": {},
+    "desktop_connection": {"status": {"attempt", "connected", "failed", "closed"}},
+    "desktop_preview": {"count": int},
+    "desktop_prepared": {
+        "cpus": int,
+        "memory_mib": int,
+        "hours": int,
+        "stages": int,
+    },
+    "desktop_approval": {"count": int},
+    "desktop_submission": {"status": {"attempt", "confirmed"}, "job_id": int},
+    "desktop_job_state": {"state": DESKTOP_STATES, "job_id": int},
+    "desktop_retrieval": {"job_id": int},
+    "desktop_recovery": {"status": {"required", "approved", "prepared"}, "count": int},
+    "desktop_stop": {},
+    "desktop_error": {
+        "action": {"preview", "submit", "monitor", "close"},
+        "code": {"interrupted", "permission", "io", "validation", "unexpected"},
+    },
+}
+for _fields in DESKTOP_FIELDS.values():
+    _fields.update(
+        client_session=re.compile(r"[0-9a-f]{32}"),
+        sequence=int,
+        occurred_at=re.compile(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}\+00:00"
+        ),
+    )
+EVENT_FIELDS.update(DESKTOP_FIELDS)
 COMPLETED_LOG = re.compile(r"inkly-[0-9a-f]{32}-[0-9]{6}\.jsonl")
+
+
+def clean_payload(event_type, payload):
+    """Shared allowlist for local records and untrusted Desktop transport data."""
+    clean = {}
+    payload = payload if isinstance(payload, dict) else {}
+    for name, allowed in EVENT_FIELDS.get(event_type, {}).items():
+        value = payload.get(name)
+        if allowed is int:
+            if type(value) is int and value >= 0:
+                clean[name] = min(value, 2**31 - 1)
+        elif isinstance(allowed, re.Pattern):
+            if isinstance(value, str) and len(value) <= 40 and allowed.fullmatch(value):
+                clean[name] = value
+        elif isinstance(value, str) and value in allowed:
+            clean[name] = value
+    return clean
 
 
 def _warn(message):
@@ -249,7 +315,7 @@ class DiagnosticSession:
             30
             if event_type == "guardrail_block"
             else 40
-            if event_type == "error"
+            if event_type in {"error", "desktop_error"}
             else 20
         )
         threshold = {"debug": 10, "info": 20, "warning": 30, "error": 40}.get(
@@ -257,15 +323,7 @@ class DiagnosticSession:
         )
         if severity < threshold:
             return
-        clean = {}
-        payload = payload if isinstance(payload, dict) else {}
-        for name, allowed in EVENT_FIELDS[event_type].items():
-            value = payload.get(name)
-            if allowed is int:
-                if type(value) is int and value >= 0:
-                    clean[name] = min(value, 2**31 - 1)
-            elif isinstance(value, str) and value in allowed:
-                clean[name] = value
+        clean = clean_payload(event_type, payload)
         event = {
             "schema_version": 1,
             "event_type": event_type,

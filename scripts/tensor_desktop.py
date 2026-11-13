@@ -14,6 +14,10 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, font, messagebox, ttk
 
+# Source launches and the packaged app use the same stdlib-only diagnostic code.
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import tensor_picker as picker
 from tensor_desktop_backend import DesktopController
 
@@ -653,8 +657,10 @@ class DesktopApp:
         ):
             return
         self.closed = True
-        self.controller.stop()
+        if self.busy:
+            self.controller.stop()
         self.commands.put(("close", ()))
+        self.worker.join(timeout=2)
         self.root.after_cancel(self.timer)
         self.root.destroy()
 

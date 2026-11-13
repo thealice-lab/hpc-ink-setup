@@ -111,3 +111,46 @@ also produces the generic dialog under `build/` for source development.
 
 Packaging follows the official [PyInstaller Windows application guidance](https://pyinstaller.org/en/stable/usage.html)
 and [windowed subprocess requirements](https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html).
+
+## Desktop diagnostic events (development build)
+
+The Desktop application records **allowlisted metadata**, not Gaussian inputs,
+calculation outputs, authentication dialogs, SSH credentials, or raw exceptions.
+Local Windows diagnostic files are written beneath
+`%LOCALAPPDATA%\Inkly\diagnostics` (or under the user's private `~/.inkly`
+fallback if that Windows variable is absent). They use the existing Inkly
+versioned JSONL event schema, with bounded rotation (1 MiB per file, 5 completed
+files per session). User-supplied paths and error messages are excluded.
+
+Set `INKLY_DESKTOP_DIAGNOSTICS=0` **before launching the application** to
+disable Desktop local and remote event generation. This is independent of the
+cluster's `logging.enabled` setting. The HPC copy of Inkly still obeys its own
+logging configuration and shared directory permissions.
+
+During an authenticated Desktop SSH session, bounded metadata batches are sent
+through the **existing** connection to the remote Inkly handoff endpoint, which
+revalidates the event allowlist before writing through the existing
+`DiagnosticSession` sinks. It does not open a separate SSH connection or create
+a Slurm operation. Remote writes to the lab scratch location require the
+configured lab group and an already provisioned authorized directory. A
+remote-storage failure leaves the HPC user's private diagnostic sink available
+if configured. Windows local records are kept even when SSH is unavailable.
+
+Transport is deliberately **at most once**: events already taken for an SSH
+request are never automatically resent after an uncertain interruption. This
+avoids affecting submissions or accidentally duplicating an action. Local and
+remote log counts may therefore differ. Slow, blocked or failed logging must
+not prevent the normal safe job workflow. No event is proof that a Slurm
+submission succeeded; rely on the existing receipt and verified scheduler job
+state for that.
+
+The Windows executable and the HPC `inkly` package must be upgraded together
+for remote event delivery. Until the new HPC endpoint is installed, treat
+remote delivery as unverified. The Desktop logs can be used locally without
+any Cuttlefish deployment.
+
+**Remaining release validation:** rebuild the Windows executable, run the
+packaged GUI with actual OpenSSH/MFA, verify events on Cuttlefish under the
+real lab ACL, and check a different lab member's permitted access and an
+outsider's denial. Do not alter shared permissions or submit a live job just
+to test logging.

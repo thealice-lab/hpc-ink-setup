@@ -103,6 +103,7 @@ class Session:
 
     def __init__(self, receipt, ssh):
         self.receipt = receipt
+        self.diagnostics = None
         self.process = subprocess.Popen(
             _ssh_args(receipt, ssh, session=True),
             stdin=subprocess.PIPE,
@@ -144,6 +145,9 @@ class Session:
         ):
             raise ValueError("One SSH session cannot mix connection settings")
         request = {**request, "bundle": receipt["bundle"]}
+        metadata = self._diagnostic_batch()
+        if metadata:
+            request["desktop_diagnostics"] = metadata
         # Cover a blocked input transfer/authentication as well as response reads.
         deadline = threading.Timer(180, self.process.kill)
         deadline.daemon = True
@@ -180,10 +184,39 @@ class Session:
             raise ValueError("Response exceeds transfer limit")
         return _response(raw, receipt)
 
+    def _diagnostic_batch(self):
+        try:
+            return self.diagnostics.take() if self.diagnostics is not None else []
+        except Exception:
+            return []
+
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
+        metadata = self._diagnostic_batch()
+        if metadata:
+            # Final metadata uses the already authenticated stream. Its response
+            # is intentionally ignored because the stream closes immediately.
+            # A stuck log transfer may terminate only this closing connection.
+            deadline = threading.Timer(1, self.process.kill)
+            deadline.daemon = True
+            deadline.start()
+            try:
+                self.process.stdin.write(
+                    json.dumps(
+                        {
+                            "action": "desktop_diagnostics",
+                            "desktop_diagnostics": metadata,
+                        }
+                    ).encode()
+                    + b"\n"
+                )
+                self.process.stdin.flush()
+            except (OSError, ValueError):
+                pass
+            finally:
+                deadline.cancel()
         try:
             self.process.stdin.close()
         except OSError:

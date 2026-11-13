@@ -15,7 +15,7 @@ if (Test-Path -LiteralPath $dialog) {
 }
 Add-Type -Path (Join-Path $PSScriptRoot 'ssh_askpass.cs') -ReferencedAssemblies System.Windows.Forms.dll,System.Drawing.dll -OutputAssembly $dialog -OutputType WindowsApplication
 $buildWorkspace = Join-Path $build ('pyinstaller-' + [Guid]::NewGuid().ToString('N'))
-& $Python -m PyInstaller --noconfirm --onefile --windowed --noupx --name InklyDesktop --distpath $dist --workpath $buildWorkspace --specpath $buildWorkspace --add-binary "$dialog;." (Join-Path $repo 'scripts\tensor_desktop.py')
+& $Python -m PyInstaller --noconfirm --onefile --windowed --noupx --name InklyDesktop --paths $repo --distpath $dist --workpath $buildWorkspace --specpath $buildWorkspace --add-binary "$dialog;." (Join-Path $repo 'scripts\tensor_desktop.py')
 if ($LASTEXITCODE -ne 0) { throw 'Desktop executable build failed' }
 $hasher = [Security.Cryptography.SHA256]::Create()
 try {
