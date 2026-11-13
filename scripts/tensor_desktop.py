@@ -50,6 +50,7 @@ class DesktopApp:
         self.files = []
         self.rows = {}
         self.review = None
+        self.recovery_request = None
         self.busy = False
         self.closed = False
         self.events = queue.Queue()
@@ -308,9 +309,20 @@ class DesktopApp:
             elif kind == "review":
                 self.review = data
                 if data:
-                    self.overview.configure(
-                        text=f"{data['count']} prepared job(s). If all start together: {data['cpus']} CPUs and {data['memory_mib']:,} MiB Slurm memory. Slurm decides start times."
+                    overview = (
+                        f"{data['count']} prepared job(s). If all start together: "
+                        f"{data['cpus']} CPUs and {data['memory_mib']:,} MiB "
+                        "Slurm memory. Slurm decides start times."
                     )
+                    if data.get("recovered"):
+                        overview += (
+                            "\nRecovered handoff(s): "
+                            + ", ".join(data["recovered"])
+                            + ". Check for any earlier running calculation before submitting a replacement."
+                        )
+                    self.overview.configure(text=overview)
+            elif kind == "recovery_required":
+                self.recovery_request = data
             elif kind == "target":
                 self.log(
                     f"Using {data['host']} with {data['ink_path']}. Saved handoffs retain their original connection and settings."
@@ -334,6 +346,42 @@ class DesktopApp:
                         text="Operation finished. See Activity for results or recovery instructions."
                     )
             self.buttons()
+        if self.recovery_request and not self.busy and not self.closed:
+            request, self.recovery_request = self.recovery_request, None
+            files = "\n".join(f"  • {name}" for name in request["files"])
+            prompt = (
+                "Inkly found saved recovery receipts, but the matching prepared "
+                "bundles are missing on the HPC:\n\n"
+                + files
+                + "\n\nYou can re-prepare these inputs in their original "
+                "locations. Inkly will archive each old receipt and create a new "
+                "one. Your Gaussian input files will not be moved or changed. "
+                "This step only creates a preview; it does not submit a Slurm job."
+                + "\n\nIMPORTANT: If you previously submitted any of these "
+                "calculations, check your Slurm jobs before submitting a replacement. "
+                "A missing bundle does not prove that an earlier job has stopped."
+                + "\n\nRe-prepare these inputs now?"
+            )
+            if messagebox.askyesno(
+                "Recover missing HPC handoff",
+                prompt,
+                parent=self.root,
+                default="no",
+            ):
+                self.start(
+                    "preview",
+                    request["paths"],
+                    request["settings"],
+                    request["bundles"],
+                )
+            else:
+                self.log(
+                    "Recovery declined. The original inputs and recovery receipts were preserved."
+                )
+                self.status.configure(
+                    text="Recovery declined. Saved inputs and receipts are unchanged."
+                )
+                self.buttons()
         if not self.closed:
             self.timer = self.root.after(80, self.drain)
 
@@ -522,7 +570,7 @@ class DesktopApp:
         except (ValueError, KeyError, TypeError):
             self.configure()
             return
-        self.review = None
+        self.invalidate()
         self.start("preview", list(self.files), dict(self.settings))
 
     def submit(self):
@@ -536,6 +584,15 @@ class DesktopApp:
         if review["count"] > 8:
             details += f"\n…and {review['count'] - 8} more files shown in the table."
         text = f"Submit {review['count']} independent calculations to the HPC?\n\n{details}\n\nIf all run together: {review['cpus']} CPUs and {review['memory_mib']:,} MiB Slurm memory.\nSlurm decides when jobs start. Closing the app does not cancel them."
+        if review.get("recovered"):
+            text += (
+                "\n\nRECOVERED HANDOFF WARNING: "
+                + ", ".join(review["recovered"])
+                + ". Before submitting a replacement, verify that any earlier "
+                "calculation associated with the archived receipt is no longer "
+                "running. A missing bundle does not prove that the old job ended."
+                + "\n\nHave you checked and confirmed that it is safe to submit?"
+            )
         if messagebox.askyesno(
             "Confirm HPC submission", text, parent=self.root, default="no"
         ):

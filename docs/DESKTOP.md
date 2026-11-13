@@ -49,9 +49,20 @@ downloads successful results; it never submits a prepared job.
 Previously submitted jobs are not submitted again. Already returned logs are
 verified and left unchanged. Unknown/failed states, changed inputs, changed
 resource previews and output collisions stop the workflow for inspection.
-After an interrupted submission, preview the same files before doing anything
-else. Do not delete receipts to retry. Existing receipts retain their original
-host, endpoint, resource settings, time limit and result directory.
+
+If a saved receipt refers to a bundle that is missing on the HPC, Desktop offers
+an explicit **Re-prepare** confirmation. Accepting archives the old receipt
+beside the input, creates a fresh bundle ID and receipt, and previews the
+original input in place. Declining leaves the input and receipt unchanged. The
+recovery step never submits a Slurm job. The new preview uses the current
+Desktop time-limit setting because the old HPC preparation metadata is missing.
+
+A missing bundle does not prove that an earlier Slurm job has stopped. If the
+old calculation may have been submitted, inspect the user's Slurm jobs before
+approving a replacement submission. Desktop repeats this warning in the
+submission confirmation for recovered handoffs. Never delete archived receipts
+or the current receipt to retry. Existing receipts retain their original host,
+endpoint and result directory until an explicit missing-bundle recovery.
 
 The GUI uses one background worker and keeps an SSH session between preview,
 confirmation and monitoring. The window stays responsive. Reconnecting after

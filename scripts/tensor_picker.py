@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from types import SimpleNamespace
 
 import tensor_bridge as bridge
@@ -221,26 +222,124 @@ def authentication(settings, askpass=None):
                 os.environ[key] = value
 
 
-def prepare(session, item, settings, report=print):
+def _new_handoff(session, item, settings, report=print, receipt_path=None):
+    connection = item["receipt"] or settings
+    args = SimpleNamespace(
+        input=item["path"],
+        receipt=receipt_path or item["receipt_path"],
+        out=item["output"],
+        host=connection["host"],
+        ink_path=connection["ink_path"],
+        auth=connection["auth"],
+        cpus=None,
+        memory_mib=None,
+        hours=settings["hours"],
+    )
+    receipt, request = bridge._prepare(args, report=report)
+    if receipt_path is None:
+        item["receipt"] = receipt
+    return session.exchange(request, receipt=receipt), receipt
+
+
+def _archive_receipt(item):
+    """Copy the exact old receipt aside before atomically replacing it."""
+    path = item["receipt_path"]
+    try:
+        original = path.read_bytes()
+        saved = json.loads(original)
+    except (OSError, ValueError, UnicodeError):
+        raise ValueError(
+            f"Cannot safely archive the saved recovery receipt: {path}"
+        ) from None
+    if saved != item["receipt"]:
+        raise ValueError(
+            f"The saved recovery receipt changed on disk; it was not replaced: {path}"
+        )
+
+    for _ in range(5):
+        archive = path.with_name(f"{path.name}.orphaned-{uuid.uuid4().hex}.bak")
+        try:
+            with archive.open("xb") as stream:
+                stream.write(original)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(archive, 0o600)
+            return archive, original
+        except FileExistsError:
+            continue
+        except OSError:
+            archive.unlink(missing_ok=True)
+            raise
+    raise OSError("Could not create a unique archive for the old recovery receipt")
+
+
+def _recover_missing_bundle(session, item, settings, report):
+    old_receipt = item["receipt"]
+    archive, original = _archive_receipt(item)
+    temporary = item["receipt_path"].with_name(
+        f".{item['receipt_path'].name}.recovery-{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        # Persist a fresh bundle ID to a temporary receipt first. The original
+        # receipt remains in place until the replacement is ready to publish.
+        _, request = bridge._prepare(
+            SimpleNamespace(
+                input=item["path"],
+                receipt=temporary,
+                out=item["output"],
+                host=old_receipt["host"],
+                ink_path=old_receipt["ink_path"],
+                auth=old_receipt["auth"],
+                cpus=None,
+                memory_mib=None,
+                hours=settings["hours"],
+            ),
+            report=lambda _message: None,
+        )
+        if item["receipt_path"].read_bytes() != original:
+            raise ValueError(
+                "The saved recovery receipt changed during recovery; no replacement was made"
+            )
+        os.replace(temporary, item["receipt_path"])
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        # If publication did not happen, keep the canonical old receipt and
+        # discard only the redundant archive copy.
+        try:
+            if item["receipt_path"].read_bytes() == original:
+                archive.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    new_receipt = json.loads(item["receipt_path"].read_text(encoding="utf-8"))
+    item["receipt"] = new_receipt
+    item["recovered"] = True
+    item["recovered_from"] = archive
+    report(f"Archived the missing-bundle receipt: {archive.name}")
+    report(f"Created a new recovery receipt: {item['receipt_path'].name}")
+    response = session.exchange(request, receipt=new_receipt)
+    report(
+        f"Re-prepared {item['path'].name} for preview only. No Slurm job was submitted."
+    )
+    return response
+
+
+def prepare(session, item, settings, report=print, recover_bundles=None):
     if item["receipt"] is None:
-        args = SimpleNamespace(
-            input=item["path"],
-            receipt=item["receipt_path"],
-            out=item["output"],
-            host=settings["host"],
-            ink_path=settings["ink_path"],
-            auth=settings["auth"],
-            cpus=None,
-            memory_mib=None,
-            hours=settings["hours"],
-        )
-        item["receipt"], request = bridge._prepare(args, report=report)
+        response, _ = _new_handoff(session, item, settings, report=report)
     else:
-        request = {"action": "status"}
         report(
-            f"Using saved handoff: {item['path'].name} (its original settings apply)"
+            f"Using saved handoff: {item['path'].name} (its original connection applies)"
         )
-    response = session.exchange(request, receipt=item["receipt"])
+        try:
+            response = session.exchange({"action": "status"}, receipt=item["receipt"])
+        except bridge.MissingBundleError:
+            approved = set(recover_bundles or ())
+            if item["receipt"]["bundle"] not in approved:
+                raise
+            response = _recover_missing_bundle(session, item, settings, report)
+
     if response["name"] != item["path"].name:
         raise ValueError("The receipt belongs to a different input filename")
     # A reused receipt must still describe the selected export, not an older edit.

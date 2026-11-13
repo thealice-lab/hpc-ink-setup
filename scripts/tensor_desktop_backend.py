@@ -85,7 +85,7 @@ class DesktopController:
             },
         )
 
-    def preview(self, paths, settings):
+    def preview(self, paths, settings, recover_bundles=None):
         self.check_stop()
         self.review_id = None
         settings = picker.validate_settings(dict(settings))
@@ -98,15 +98,34 @@ class DesktopController:
         self.emit(
             "target", {key: connection.get(key) for key in ("host", "ink_path", "auth")}
         )
+        approved_bundles = set(recover_bundles or ())
+        missing = []
         for item in self.items:
             self.check_stop()
-            picker.prepare(
-                self.session,
-                item,
-                settings,
-                report=lambda value: self.emit("message", value),
-            )
+            try:
+                picker.prepare(
+                    self.session,
+                    item,
+                    settings,
+                    report=lambda value: self.emit("message", value),
+                    recover_bundles=approved_bundles,
+                )
+            except bridge.MissingBundleError:
+                missing.append(item)
+                continue
             self.row(item)
+        if missing:
+            self.items = [item for item in self.items if item not in missing]
+            self.emit(
+                "recovery_required",
+                {
+                    "paths": paths,
+                    "settings": settings,
+                    "bundles": [item["receipt"]["bundle"] for item in missing],
+                    "files": [item["path"].name for item in missing],
+                },
+            )
+            return
         self.review_id = uuid.uuid4().hex
         self.emit("review", self.review())
         self.emit(
@@ -129,6 +148,7 @@ class DesktopController:
                 {"name": item["path"].name, **item["response"]["resources"]}
                 for item in ready
             ],
+            "recovered": [item["path"].name for item in ready if item.get("recovered")],
         }
 
     def refresh_before_submit(self):

@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -34,6 +35,7 @@ def workflow(tmp_path, monkeypatch):
             b"%nprocshared=2\n%mem=768MB\n# hf/sto-3g\n\nSynthetic\n\n0 1\nH 0 0 0\n\n"
         )
     records, calls, events, connections = {}, [], [], []
+    missing_bundles = set()
 
     class Session:
         def __init__(self, connection, ssh):
@@ -51,6 +53,10 @@ def workflow(tmp_path, monkeypatch):
         def exchange(self, request, *, receipt):
             action, bundle = request["action"], receipt["bundle"]
             calls.append((bundle, action))
+            if action == "status" and bundle in missing_bundles:
+                raise backend.bridge.MissingBundleError(
+                    "Unknown bundle; prepare a new input first"
+                )
             if action == "prepare":
                 data = base64.b64decode(request["data"])
                 records[bundle] = {
@@ -95,12 +101,152 @@ def workflow(tmp_path, monkeypatch):
         calls=calls,
         events=events,
         connections=connections,
+        missing_bundles=missing_bundles,
     )
     controller.close()
 
 
 def actions(workflow):
     return [action for _, action in workflow.calls]
+
+
+def test_missing_bundle_requests_explicit_recovery_without_changing_receipt(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    receipt_path = w.paths[0].with_suffix(".gjf.inkly.json")
+    original_receipt = receipt_path.read_bytes()
+    original_input = w.paths[0].read_bytes()
+    old_bundle = json.loads(original_receipt)["bundle"]
+
+    w.records.pop(old_bundle)
+    w.missing_bundles.add(old_bundle)
+    w.calls.clear()
+    w.events.clear()
+
+    w.controller.preview(w.paths[:1], SETTINGS)
+
+    assert actions(w) == ["status"]
+    assert receipt_path.read_bytes() == original_receipt
+    assert w.paths[0].read_bytes() == original_input
+    assert "submit" not in actions(w)
+    recovery = [data for kind, data in w.events if kind == "recovery_required"]
+    assert len(recovery) == 1
+    assert recovery[0]["files"] == [w.paths[0].name]
+    assert recovery[0]["bundles"] == [old_bundle]
+
+
+def test_approved_recovery_archives_old_receipt_and_reprepares_original_in_place(
+    workflow,
+):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    receipt_path = w.paths[0].with_suffix(".gjf.inkly.json")
+    original_receipt = receipt_path.read_bytes()
+    original_input = w.paths[0].read_bytes()
+    old_bundle = json.loads(original_receipt)["bundle"]
+
+    w.records.pop(old_bundle)
+    w.missing_bundles.add(old_bundle)
+    w.calls.clear()
+    w.events.clear()
+
+    # This bundle ID represents the user's explicit approval in the desktop dialog.
+    w.controller.preview(w.paths[:1], SETTINGS, [old_bundle])
+
+    new_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    archives = list(w.paths[0].parent.glob("*.inkly.json.orphaned-*.bak"))
+    assert new_receipt["bundle"] != old_bundle
+    assert len(archives) == 1
+    assert archives[0].read_bytes() == original_receipt
+    assert w.paths[0].read_bytes() == original_input
+    assert actions(w) == ["status", "prepare"]
+    assert "submit" not in actions(w)
+    assert w.controller.review()["count"] == 1
+    assert w.controller.review()["recovered"] == [w.paths[0].name]
+    assert any(
+        kind == "message" and "No Slurm job was submitted" in data
+        for kind, data in w.events
+    )
+
+
+def test_failed_remote_recovery_keeps_new_receipt_and_archived_old_receipt(
+    workflow,
+):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    receipt_path = w.paths[0].with_suffix(".gjf.inkly.json")
+    original_receipt = receipt_path.read_bytes()
+    old_bundle = json.loads(original_receipt)["bundle"]
+    w.records.pop(old_bundle)
+    w.missing_bundles.add(old_bundle)
+
+    original_exchange = w.controller.session.exchange
+
+    def fail_new_prepare(request, *, receipt=None):
+        if request["action"] == "prepare":
+            raise ValueError("Synthetic connection interruption")
+        return original_exchange(request, receipt=receipt)
+
+    w.controller.session.exchange = fail_new_prepare
+    w.controller.execute("preview", w.paths[:1], SETTINGS, [old_bundle])
+
+    new_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    archives = list(w.paths[0].parent.glob("*.inkly.json.orphaned-*.bak"))
+    assert new_receipt["bundle"] != old_bundle
+    assert len(archives) == 1
+    assert archives[0].read_bytes() == original_receipt
+    assert any(
+        kind == "error" and "Synthetic connection interruption" in data
+        for kind, data in w.events
+    )
+    assert "submit" not in actions(w)
+
+
+def test_recovery_of_one_file_in_a_batch_leaves_other_receipts_intact(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    receipt_paths = [path.with_suffix(".gjf.inkly.json") for path in w.paths]
+    old_receipts = [path.read_bytes() for path in receipt_paths]
+    old_bundles = [json.loads(raw)["bundle"] for raw in old_receipts]
+    original_inputs = [path.read_bytes() for path in w.paths]
+
+    w.records.pop(old_bundles[0])
+    w.missing_bundles.add(old_bundles[0])
+    w.calls.clear()
+    w.events.clear()
+
+    w.controller.preview(w.paths, SETTINGS)
+    recovery = [data for kind, data in w.events if kind == "recovery_required"]
+    assert recovery[0]["files"] == [w.paths[0].name]
+    assert receipt_paths[0].read_bytes() == old_receipts[0]
+    assert receipt_paths[1].read_bytes() == old_receipts[1]
+
+    w.controller.preview(w.paths, SETTINGS, [old_bundles[0]])
+    new_receipts = [json.loads(path.read_text()) for path in receipt_paths]
+    assert new_receipts[0]["bundle"] != old_bundles[0]
+    assert new_receipts[1]["bundle"] == old_bundles[1]
+    assert [path.read_bytes() for path in w.paths] == original_inputs
+    assert w.controller.review()["count"] == 2
+    assert w.controller.review()["recovered"] == [w.paths[0].name]
+    assert "submit" not in actions(w)
+
+
+def test_unrelated_ssh_error_does_not_trigger_missing_bundle_recovery(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.events.clear()
+    original = w.controller.session.exchange
+
+    def interrupted(request, *, receipt=None):
+        if request["action"] == "status":
+            raise ValueError("SSH interrupted or timed out")
+        return original(request, receipt=receipt)
+
+    w.controller.session.exchange = interrupted
+    w.controller.execute("preview", w.paths[:1], SETTINGS)
+
+    assert not any(kind == "recovery_required" for kind, _ in w.events)
+    assert any(kind == "error" and "SSH interrupted" in data for kind, data in w.events)
 
 
 def test_preview_cannot_submit_and_monitor_does_not_submit_prepared(workflow):
@@ -249,6 +395,52 @@ def test_bundled_dialog_fallback_restores_auth_environment(tmp_path, monkeypatch
     assert "SSH_ASKPASS" not in os.environ
     assert "SSH_ASKPASS_REQUIRE" not in os.environ
     assert os.environ["INKLY_SSH_TARGET"] == "old-target"
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+@pytest.mark.parametrize("accept", [False, True])
+def test_native_window_requires_confirmation_before_recovery(
+    workflow, tmp_path, monkeypatch, accept
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    try:
+        app.add_paths(w.paths[:1])
+        w.controller.preview(w.paths[:1], SETTINGS)
+        old_receipt = w.paths[0].with_suffix(".gjf.inkly.json")
+        old_bundle = json.loads(old_receipt.read_text())["bundle"]
+        w.records.pop(old_bundle)
+        w.missing_bundles.add(old_bundle)
+        w.events.clear()
+        w.controller.preview(w.paths[:1], SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+
+        scheduled = []
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+        monkeypatch.setattr(gui.messagebox, "askyesno", lambda *args, **kwargs: accept)
+        app.drain()
+
+        if accept:
+            assert scheduled == [("preview", w.paths[:1], SETTINGS, [old_bundle])]
+        else:
+            assert not scheduled
+            assert old_receipt.exists()
+            assert "Recovery declined" in app.activity.get("1.0", "end")
+    finally:
+        app.close()
 
 
 @pytest.mark.skipif(
