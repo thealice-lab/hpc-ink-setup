@@ -9,10 +9,11 @@ import uuid
 
 import tensor_bridge as bridge
 import tensor_picker as picker
+from inkly.core.desktop_diagnostics import DesktopJournal
 
 
 class DesktopController:
-    def __init__(self, emit, askpass=None, interval=30):
+    def __init__(self, emit, askpass=None, interval=30, journal=None):
         self.emit = emit
         self.askpass = askpass
         self.interval = interval
@@ -22,15 +23,25 @@ class DesktopController:
         self.target = None
         self.items = []
         self.review_id = None
+        self.journal = journal if journal is not None else DesktopJournal()
+        self.connection_verified = False
+
+    def audit(self, event_type, payload=None):
+        try:
+            self.journal.emit(event_type, payload)
+        except Exception:
+            pass  # Diagnostics can never fail a scientific workflow operation.
 
     def close(self):
         stack, self.stack = self.stack, None
         self.session = None
         self.target = None
         if stack:
+            self.audit("desktop_connection", {"status": "closed"})
             stack.close()
 
     def stop(self):
+        self.audit("desktop_stop")
         self.cancelled.set()
         # Closing SSH never issues scancel. Persisted receipts recover uncertain calls.
         process = getattr(self.session, "process", None)
@@ -51,6 +62,8 @@ class DesktopController:
         if self.session and target == self.target:
             return
         self.close()
+        self.audit("desktop_connection", {"status": "attempt"})
+        self.connection_verified = False
         ssh = shutil.which("ssh")
         if not ssh:
             raise ValueError(
@@ -64,13 +77,24 @@ class DesktopController:
         try:
             self.stack.enter_context(picker.authentication(connection, self.askpass))
             self.session = self.stack.enter_context(bridge.Session(connection, ssh))
+            self.session.diagnostics = self.journal
             self.target = target
         except Exception:
+            self.audit("desktop_connection", {"status": "failed"})
             self.close()
             raise
 
     def row(self, item, state=None, output=None):
         response = item["response"]
+        if not self.connection_verified:
+            self.audit("desktop_connection", {"status": "connected"})
+            self.connection_verified = True
+        current = state or response.get("state", response["submission"])
+        if current != item.get("_logged_state"):
+            self.audit(
+                "desktop_job_state", {"state": current, **self.job_metadata(response)}
+            )
+            item["_logged_state"] = current
         self.emit(
             "row",
             {
@@ -85,6 +109,18 @@ class DesktopController:
             },
         )
 
+    @staticmethod
+    def job_metadata(response):
+        job_id = response.get("job_id")
+        if (
+            isinstance(job_id, str)
+            and job_id.isascii()
+            and job_id.isdigit()
+            and len(job_id) <= 10
+        ):
+            return {"job_id": int(job_id)}
+        return {}
+
     def preview(self, paths, settings, recover_bundles=None):
         self.check_stop()
         self.review_id = None
@@ -92,6 +128,7 @@ class DesktopController:
         paths = picker.selections(paths)
         if not paths:
             raise ValueError("Add at least one Gaussian input file first.")
+        self.audit("desktop_preview", {"count": len(paths)})
         self.items = picker.plan(paths, settings, "preview")
         connection = self.items[0]["receipt"] or settings
         self.connect(connection)
@@ -99,6 +136,11 @@ class DesktopController:
             "target", {key: connection.get(key) for key in ("host", "ink_path", "auth")}
         )
         approved_bundles = set(recover_bundles or ())
+        if approved_bundles:
+            self.audit(
+                "desktop_recovery",
+                {"status": "approved", "count": len(approved_bundles)},
+            )
         missing = []
         for item in self.items:
             self.check_stop()
@@ -113,8 +155,23 @@ class DesktopController:
             except bridge.MissingBundleError:
                 missing.append(item)
                 continue
+            resources = item["response"]["resources"]
+            self.audit(
+                "desktop_prepared",
+                {
+                    "cpus": resources["cpus"],
+                    "memory_mib": resources["slurm_memory_mib"],
+                    "hours": resources["hours"],
+                    "stages": item["response"]["stages"],
+                },
+            )
+            if item.get("recovered"):
+                self.audit("desktop_recovery", {"status": "prepared", "count": 1})
             self.row(item)
         if missing:
+            self.audit(
+                "desktop_recovery", {"status": "required", "count": len(missing)}
+            )
             self.items = [item for item in self.items if item not in missing]
             self.emit(
                 "recovery_required",
@@ -190,15 +247,28 @@ class DesktopController:
         if not confirmed or not self.review_id or review_id != self.review_id:
             raise ValueError("Submission needs confirmation of the current preview.")
         self.review_id = None  # Approval is consumed even if an SSH response is lost.
+        self.audit(
+            "desktop_approval",
+            {
+                "count": sum(
+                    item["response"]["submission"] == "PREPARED" for item in self.items
+                )
+            },
+        )
         self.emit("review", None)
         self.refresh_before_submit()
         for item in self.items:
             self.check_stop()
             if item["response"]["submission"] == "PREPARED":
+                self.audit("desktop_submission", {"status": "attempt"})
                 response = self.session.exchange(
                     {"action": "submit", "confirm": True}, receipt=item["receipt"]
                 )
                 item["response"].update(response)
+                self.audit(
+                    "desktop_submission",
+                    {"status": "confirmed", **self.job_metadata(response)},
+                )
                 self.row(item, state="SUBMITTED")
                 self.emit(
                     "message",
@@ -227,6 +297,7 @@ class DesktopController:
                         item,
                         report=lambda value: self.emit("message", value),
                     )
+                    self.audit("desktop_retrieval", self.job_metadata(item["response"]))
                     self.row(item, state="RETURNED", output=path)
                     pending.remove(item)
                 elif state not in picker.ACTIVE:
@@ -249,10 +320,30 @@ class DesktopController:
             elif action == "monitor":
                 self.monitor()
             elif action == "close":
+                # Record SSH closure while the journal can still accept events;
+                # final metadata is handed off by the existing session close.
+                if self.stack is not None:
+                    self.audit("desktop_connection", {"status": "closed"})
+                try:
+                    self.journal.close()
+                except Exception:
+                    pass
                 self.close()
             else:
                 raise ValueError("Unknown application action")
         except Exception as error:
+            code = (
+                "interrupted"
+                if isinstance(error, InterruptedError)
+                else "permission"
+                if isinstance(error, PermissionError)
+                else "io"
+                if isinstance(error, OSError)
+                else "validation"
+                if isinstance(error, ValueError)
+                else "unexpected"
+            )
+            self.audit("desktop_error", {"action": action, "code": code})
             self.review_id = None
             self.emit("review", None)
             self.close()

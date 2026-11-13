@@ -27,6 +27,11 @@ SETTINGS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def isolated_diagnostics(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-app-data"))
+
+
 @pytest.fixture
 def workflow(tmp_path, monkeypatch):
     paths = [tmp_path / f"sample_{number}.gjf" for number in (1, 2)]
@@ -104,10 +109,79 @@ def workflow(tmp_path, monkeypatch):
         missing_bundles=missing_bundles,
     )
     controller.close()
+    controller.journal.close()
 
 
 def actions(workflow):
     return [action for _, action in workflow.calls]
+
+
+def test_logging_records_safe_workflow_and_one_submission_per_file(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.controller.submit(w.controller.review_id, True)
+    w.controller.execute("close")
+    events = w.controller.journal.take()
+    types = {e["event_type"] for e in events}
+    assert types >= {
+        "desktop_session_start",
+        "desktop_session_end",
+        "desktop_connection",
+        "desktop_preview",
+        "desktop_prepared",
+        "desktop_approval",
+        "desktop_submission",
+        "desktop_job_state",
+        "desktop_retrieval",
+    }
+    assert actions(w).count("submit") == 1
+    connection_states = [
+        e["payload"].get("status")
+        for e in events
+        if e["event_type"] == "desktop_connection"
+    ]
+    assert connection_states[-1] == "closed"
+    text = json.dumps(events)
+    assert str(w.paths[0]) not in text
+    assert "sample_1" not in text
+    assert "synthetic normal output" not in text
+    submissions = [
+        e["payload"] for e in events if e["event_type"] == "desktop_submission"
+    ]
+    assert [e["status"] for e in submissions] == ["attempt", "confirmed"]
+    assert submissions[1]["job_id"] == 123
+
+
+def test_logging_exception_cannot_change_confirmation_or_retry_submission(
+    workflow, monkeypatch
+):
+    w = workflow
+
+    def fail(*args):
+        raise OSError("PRIVATE_SENTINEL")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(w.controller.journal, "emit", fail)
+        w.controller.preview(w.paths[:1], SETTINGS)
+        with pytest.raises(ValueError, match="confirmation"):
+            w.controller.submit(w.controller.review_id, False)
+        assert "submit" not in actions(w)
+        review = w.controller.review_id
+        w.controller.submit(review, True)
+        with pytest.raises(ValueError, match="confirmation"):
+            w.controller.submit(review, True)
+        assert actions(w).count("submit") == 1
+
+
+def test_logging_records_failed_preview_without_error_text(workflow):
+    w = workflow
+    w.controller.execute("preview", [], SETTINGS)
+    values = w.controller.journal.take()
+    errors = [e["payload"] for e in values if e["event_type"] == "desktop_error"]
+    assert len(errors) == 1
+    assert errors[0]["action"] == "preview"
+    assert errors[0]["code"] == "validation"
+    assert "Add at least" not in json.dumps(values)
 
 
 def test_missing_bundle_requests_explicit_recovery_without_changing_receipt(workflow):

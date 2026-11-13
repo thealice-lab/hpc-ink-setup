@@ -293,12 +293,22 @@ def handle(request, root=None):
         }
 
 
-def _reply(raw):
+def _reply(raw, diagnostics=None):
     try:
         if len(raw) > 8 * 1024 * 1024:
             raise ValueError("Request exceeds transfer limit")
         request = json.loads(raw)
-        response = handle(request)
+        if isinstance(request, dict) and diagnostics is not None:
+            try:
+                diagnostics.accept(request.get("desktop_diagnostics"))
+            except Exception:
+                pass  # Metadata never changes an operation or causes its retry.
+        response = (
+            {}
+            if isinstance(request, dict)
+            and request.get("action") == "desktop_diagnostics"
+            else handle(request)
+        )
         print(json.dumps({"ok": True, **response}), flush=True)
         return 0
     except (
@@ -315,18 +325,24 @@ def _reply(raw):
 
 
 def main(session=False):
+    from inkly.core.desktop_diagnostics import RemoteDesktopDiagnostics
+
+    diagnostics = RemoteDesktopDiagnostics()
     limit = 8 * 1024 * 1024 + 1
-    if not session:
-        return _reply(sys.stdin.buffer.read(limit))
-    # A single authenticated OpenSSH process carries the explicit operations.
-    # Closing it does not cancel a submitted job or discard its durable receipt.
-    while True:
-        raw = sys.stdin.buffer.readline(limit)
-        if not raw:
-            return 0
-        result = _reply(raw)
-        if len(raw) >= limit:
-            return result
+    try:
+        if not session:
+            return _reply(sys.stdin.buffer.read(limit), diagnostics)
+        # A single authenticated OpenSSH process carries the explicit operations.
+        # Closing it does not cancel a submitted job or discard its durable receipt.
+        while True:
+            raw = sys.stdin.buffer.readline(limit)
+            if not raw:
+                return 0
+            result = _reply(raw, diagnostics)
+            if len(raw) >= limit:
+                return result
+    finally:
+        diagnostics.close()
 
 
 if __name__ == "__main__":
