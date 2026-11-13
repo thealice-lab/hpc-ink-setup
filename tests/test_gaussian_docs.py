@@ -85,6 +85,10 @@ def test_published_snapshot_readable_with_private_umask(environment):
         os.umask(previous)
 
     assert snapshot.stat().st_gid == root.stat().st_gid
+    assert snapshot.stat().st_mode & 0o2000
+    for name in ("gaussian.db", "manifest.json"):
+        assert (snapshot / name).stat().st_gid == root.stat().st_gid
+    assert (root / "current.json").stat().st_gid == root.stat().st_gid
     assert snapshot.stat().st_mode & 0o777 == 0o750
     assert (snapshot / "gaussian.db").stat().st_mode & 0o777 == 0o440
     assert (snapshot / "manifest.json").stat().st_mode & 0o777 == 0o440

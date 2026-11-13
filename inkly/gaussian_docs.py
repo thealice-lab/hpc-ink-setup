@@ -276,7 +276,7 @@ def build_snapshot(root: Path, spec: dict, build, lock_fd: int) -> Path:
         stage.mkdir(mode=0o750)
         # mkdir mode is filtered through umask (often 077 on HPC).
         # The stage stays private behind work/ until it is published.
-        os.chmod(stage, 0o750)
+        os.chmod(stage, 0o2750)
         database = stage / "gaussian.db"
         database.touch(mode=0o600)
         # Raw scraper diagnostics stay private and are removed after normal exit.
