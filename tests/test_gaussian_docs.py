@@ -74,6 +74,35 @@ def test_complete_snapshot_copy_and_repeated_install(environment, tmp_path):
         assert (snapshot / "gaussian.db").stat().st_mode & 0o777 == 0o440
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Unix permission bits required")
+def test_published_snapshot_readable_with_private_umask(environment):
+    root, _, spec = environment
+    root.chmod(0o2750)
+    previous = os.umask(0o077)
+    try:
+        snapshot = corpus.ensure_snapshot(root, spec, build=write_database, timeout=0)
+    finally:
+        os.umask(previous)
+
+    assert snapshot.stat().st_gid == root.stat().st_gid
+    assert snapshot.stat().st_mode & 0o777 == 0o750
+    assert (snapshot / "gaussian.db").stat().st_mode & 0o777 == 0o440
+    assert (snapshot / "manifest.json").stat().st_mode & 0o777 == 0o440
+    assert (root / "current.json").stat().st_mode & 0o777 == 0o640
+    assert (root / ".build.lock").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix permission bits required")
+def test_legacy_build_lock_is_made_private(environment):
+    root, _, _ = environment
+    lock = root / ".build.lock"
+    lock.touch()
+    lock.chmod(0o660)
+    with corpus._try_lock(root) as fd:
+        assert fd is not None
+        assert lock.stat().st_mode & 0o777 == 0o600
+
+
 def test_missing_root_is_not_created(tmp_path, environment):
     with pytest.raises(corpus.CorpusError, match="provisioned"):
         corpus.ensure_snapshot(tmp_path / "missing", environment[2], timeout=0)
