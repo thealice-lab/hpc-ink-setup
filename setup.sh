@@ -46,6 +46,28 @@ echo "Verifying Gaussian documentation search import"
 "$VENV_PYTHON" -c \
     "from gaussian_scraper.search import search_docs; print('Gaussian scraper import: OK')"
 
+# Corpus transfer is separate from installing the scraper. Never assume a
+# scratch directory or run a scraper build from the login node.
+if [[ -n "${INKLY_GAUSSIAN_SHARED_ROOT:-}" ]]; then
+    echo "Checking the approved shared Gaussian documentation snapshot"
+    corpus_args=(
+        ensure
+        --shared-root "$INKLY_GAUSSIAN_SHARED_ROOT"
+        --scraper-dir "$SCRAPER_DIR"
+        --destination "$INKLY_HOME/gaussian.db"
+    )
+    if [[ -n "${INKLY_GAUSSIAN_EXCEPTIONS:-}" ]]; then
+        corpus_args+=(--exceptions "$INKLY_GAUSSIAN_EXCEPTIONS")
+    fi
+    # Use the source package. The installed launcher remains independent.
+    (cd "$REPO_ROOT" && "$VENV_PYTHON" -m inkly.gaussian_docs "${corpus_args[@]}")
+else
+    echo "NOTICE: Gaussian documentation is not provisioned by this installer."
+    echo "Set INKLY_GAUSSIAN_SHARED_ROOT to the approved shared corpus root,"
+    echo "then rerun setup after the snapshot is published and validated."
+    echo "An importable scraper alone is not proof that a searchable corpus exists."
+fi
+
 echo
 echo "Inkly setup complete."
 echo "Launcher: $INKLY_HOME/bin/ink"
