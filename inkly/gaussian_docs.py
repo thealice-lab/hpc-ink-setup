@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 from uuid import uuid4
+import warnings
 
 try:
     import tomllib
@@ -268,6 +269,29 @@ def _atomic_json(path: Path, value: dict, mode: int) -> None:
             os.unlink(temporary)
 
 
+def _cleanup_build_workspace(work: Path) -> None:
+    """Staging removal must not replace a build error or a successful publication."""
+    try:
+        shutil.rmtree(work)
+    except OSError as exc:
+        # NFS can retain open files as .nfs* entries. Leave remnants private for
+        # maintainer review; do not retry, change permissions or touch the lock.
+        # Report only the generated basename/errno, not paths or raw error text.
+        try:
+            warnings.warn(
+                f"Gaussian build cleanup incomplete for {work.name!r} "
+                f"(errno={exc.errno}); private staging may remain under the "
+                "shared corpus root. Ask the maintainer to review it after the "
+                "build exits.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        except (RuntimeWarning, OSError, ValueError):
+            # Warning-as-error filters or a failed diagnostic stream must not
+            # mask the original build outcome either.
+            pass
+
+
 def build_snapshot(root: Path, spec: dict, build, lock_fd: int) -> Path:
     """Build with the existing scraper callback while holding the elected lock."""
     work = Path(tempfile.mkdtemp(prefix=".building-", dir=root))
@@ -305,9 +329,7 @@ def build_snapshot(root: Path, spec: dict, build, lock_fd: int) -> Path:
         _atomic_json(root / "current.json", {"snapshot": published.name}, 0o640)
         return published
     finally:
-        # Don't leave large failed/aborted *normal* build trees on shared scratch.
-        # A process killed without cleanup still leaves a private 0700 directory.
-        shutil.rmtree(work)
+        _cleanup_build_workspace(work)
 
 
 def ensure_snapshot(
