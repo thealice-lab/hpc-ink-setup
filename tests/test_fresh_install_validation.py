@@ -101,3 +101,28 @@ def test_real_installer_repeats_without_replacing_state_or_touching_shell(tmp_pa
     )
     assert usage.returncode == 1
     assert usage.stderr.strip() == "Usage: ink <prompt>"
+
+
+def test_only_explicit_corpus_inputs_survive_isolation(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKLY_GAUSSIAN_SHARED_ROOT", "unreviewed-inherited-root")
+    monkeypatch.setenv("INKLY_GAUSSIAN_EXCEPTIONS", "unreviewed-inherited-policy")
+    root, policy = tmp_path / "approved root", tmp_path / "reviewed.json"
+    child = isolated_environment(
+        tmp_path / "fresh home",
+        Path(sys.executable),
+        shared_root=root,
+        exceptions=policy,
+    )
+    assert child["INKLY_GAUSSIAN_SHARED_ROOT"] == str(root.resolve())
+    assert child["INKLY_GAUSSIAN_EXCEPTIONS"] == str(policy.resolve())
+    assert not any("unreviewed-inherited" in value for value in child.values())
+    assert "SCRAPER_DIR" not in child
+    assert "SSH_AUTH_SOCK" not in child
+    assert "--allow-build" not in child.values()
+
+
+def test_reviewed_omissions_cannot_be_requested_without_snapshot_root(tmp_path):
+    with pytest.raises(ValueError, match="explicit shared root"):
+        isolated_environment(
+            tmp_path, Path(sys.executable), exceptions=tmp_path / "policy"
+        )

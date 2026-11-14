@@ -21,9 +21,17 @@ import tempfile
 REPOSITORY = "https://github.com/thealice-lab/hpc-ink-setup.git"
 
 
-def isolated_environment(home: Path, python: Path) -> dict[str, str]:
+def isolated_environment(
+    home: Path,
+    python: Path,
+    *,
+    shared_root: Path | None = None,
+    exceptions: Path | None = None,
+) -> dict[str, str]:
     """Allow only system executables; discard caches, credentials and overrides."""
-    return {
+    if exceptions is not None and shared_root is None:
+        raise ValueError("A reviewed exceptions file requires an explicit shared root")
+    child = {
         "HOME": str(home),
         "PATH": os.defpath,
         "LANG": "C.UTF-8",
@@ -34,6 +42,13 @@ def isolated_environment(home: Path, python: Path) -> dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
+    # Opt in only through explicit CLI inputs, never inherited operator settings.
+    # setup.sh validates/copies from this root; it cannot build a corpus.
+    if shared_root is not None:
+        child["INKLY_GAUSSIAN_SHARED_ROOT"] = str(shared_root.resolve())
+    if exceptions is not None:
+        child["INKLY_GAUSSIAN_EXCEPTIONS"] = str(exceptions.resolve())
+    return child
 
 
 def isolated_config(template: str) -> str:
@@ -107,11 +122,21 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument(
+        "--shared-root",
+        type=Path,
+        help="explicit approved existing snapshot root (read/copy only; never builds)",
+    )
+    parser.add_argument(
+        "--exceptions", type=Path, help="reviewed omissions for the exact config hash"
+    )
+    parser.add_argument(
         "--check-model",
         action="store_true",
         help="send one synthetic prompt using the template model",
     )
     args = parser.parse_args(argv)
+    if args.exceptions is not None and args.shared_root is None:
+        parser.error("--exceptions requires --shared-root")
     if os.name != "posix":
         parser.error("Run this validator on Linux, preferably Cuttlefish.")
     python = args.python.absolute()
@@ -130,11 +155,14 @@ def main(argv=None) -> int:
     home = root / "home"
     home.mkdir(mode=0o700)
     repository = root / "repo"
-    env = isolated_environment(home, python)
+    env = isolated_environment(
+        home, python, shared_root=args.shared_root, exceptions=args.exceptions
+    )
     report = {
         "validation": "isolated-same-account",
         "cross_account_verified": False,
         "model_checked": False,
+        "shared_corpus_requested": args.shared_root is not None,
     }
     print(f"Isolated test directory: {root}", flush=True)
 

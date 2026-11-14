@@ -181,6 +181,24 @@ establish another user's group membership, storage access, model entitlement,
 or Windows onboarding. Those checks remain required on real authorized
 researcher accounts. Retain the test directory until its report is reviewed.
 
+To test a private corpus copy, explicitly select the maintainer-approved
+existing snapshot and its reviewed omissions (omit `--exceptions` if none):
+
+```bash
+python3 scripts/validate_fresh_install.py --ref dev --parent "$HOME" \
+  --shared-root /APPROVED/CORPUS/ROOT --exceptions /PATH/TO/REVIEWED/exceptions.json
+```
+
+The validator removes inherited corpus settings and accepts only these
+explicit inputs. It never builds or submits jobs. The installed scraper must
+match the snapshot's reviewed Git revision/config; mismatch is a validation
+failure, not a reason to switch an operational checkout. Without a shared root,
+the validator deliberately reports missing documentation and fails acceptance.
+`shared_corpus_requested` records whether this option was supplied.
+
+See [the independent researcher acceptance checklist](INDEPENDENT_RESEARCHER_ACCEPTANCE.md)
+for remaining real second-account and Unix/NFS access checks.
+
 ## Troubleshooting
 
 ### ink: command not found
