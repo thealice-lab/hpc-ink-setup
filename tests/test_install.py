@@ -126,3 +126,46 @@ def test_source_launcher_uses_dependencies_without_shadowing_source(
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == f"source-runtime {expected_python}"
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="Direct executable launch is HPC Linux behavior"
+)
+def test_bare_ink_and_dot_slash_ink_resolve_their_own_runtime(tmp_path, monkeypatch):
+    from scripts.validate_fresh_install import isolated_environment
+
+    home = tmp_path / "independent researcher"
+    home.mkdir()
+    bin_dir = home / ".inkly/bin"
+    monkeypatch.setattr(install, "STATE_CFG", SimpleNamespace(bin_dir=bin_dir))
+    bin_dir.mkdir(parents=True)
+    install.install_ink()
+    _write_fake_runtime(home / ".inkly/lib", "private-installed-runtime")
+
+    checkout = tmp_path / "independent checkout"
+    checkout.mkdir()
+    launcher = checkout / "ink"
+    launcher.write_text(
+        f"#!{sys.executable}\n"
+        + (Path(__file__).resolve().parents[1] / "ink").read_text().split("\n", 1)[1],
+        encoding="utf-8",
+    )
+    launcher.chmod(0o700)
+    _write_fake_runtime(checkout, "independent-source-runtime")
+    child = isolated_environment(home, Path(sys.executable))
+    child["PATH"] = str(bin_dir) + os.pathsep + os.defpath
+    for command, cwd, expected in (
+        (["ink"], tmp_path, "private-installed-runtime"),
+        (["./ink"], checkout, "independent-source-runtime"),
+    ):
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=child,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected
