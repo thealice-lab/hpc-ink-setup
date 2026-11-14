@@ -8,6 +8,7 @@ from inkly.core.conversation import ConversationManager
 from inkly.core.diagnostics import DiagnosticSession
 from inkly.llm.backend import LLMBackend
 from inkly.plugins.manager import PluginManager
+from inkly.plugins.docs_gaussian import external_source_references
 from inkly.retrieval.retriever import PluginRetriever
 
 
@@ -49,6 +50,8 @@ class InklyRuntime:
     Never rewrite external commands, modules, paths, licenses, hardware, queues, or policies as local facts.
     If local context does not confirm the answer, say the cluster-specific information is unavailable.
     Present external material only as an explicitly attributed example that requires local verification.
+    When using Gaussian documentation, cite its source label and available URL verbatim.
+    If a source URL is unavailable, retain its label and say the link is unavailable; never invent one.
 
     Context marked scope=verified-local-cluster is trusted local cluster evidence.
     Use that evidence for cluster-specific facts while preserving its evidence labels.
@@ -256,6 +259,13 @@ class InklyRuntime:
         if self.TRUSTED_LOCAL_SCOPE_MARKER in local_output:
             return None
 
+        references = external_source_references(gaussian_output)
+        if references:
+            return (
+                self.CLUSTER_SCOPE_WITHHELD_RESPONSE
+                + "\n\nRetrieved external references (not verified for Cuttlefish):\n"
+                + "\n".join(references)
+            )
         return self.CLUSTER_SCOPE_WITHHELD_RESPONSE
 
     def assemble_prompt(
