@@ -19,7 +19,14 @@ function Assert-InklyExeHash([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "InklyDesktop.exe was not found at: $Path"
     }
-    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    # Get-FileHash may not be discoverable when 5.1 inherits a PowerShell 7
+    # module path (including Windows CI). Use the bundled .NET implementation.
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        try { $actual = ([BitConverter]::ToString($hasher.ComputeHash($stream))).Replace('-', '') }
+        finally { $stream.Dispose() }
+    } finally { $hasher.Dispose() }
     if ($actual -ne $expectedSha) {
         throw "SHA-256 mismatch. Refusing to run or replace this file: $Path. Download the artifact from $runUrl and pass -ArtifactZip with its exact ZIP path."
     }

@@ -100,6 +100,22 @@ if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -n
     assert result.returncode == 0, result.stderr
 
 
+def test_hash_verification_without_get_file_hash_module(tmp_path, sandbox):
+    binary = tmp_path / "verified fixture.exe"
+    binary.write_bytes(SYNTHETIC)
+    result = run_ps(
+        tmp_path,
+        sandbox,
+        f"""
+function Get-FileHash {{ throw 'Get-FileHash is unavailable in this session' }}
+$expectedSha = '{DIGEST}'
+Assert-InklyExeHash {ps_quote(binary)}
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SHA-256 verified" in result.stdout
+
+
 @pytest.mark.parametrize("cached", [False, True])
 def test_wrong_hash_never_runs_or_overwrites_existing_files(tmp_path, sandbox, cached):
     exe = target(sandbox)
