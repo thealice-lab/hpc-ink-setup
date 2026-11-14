@@ -251,8 +251,17 @@ reader timed out.
    content, sets group-readable immutable snapshot files, atomically renames the
    snapshot, and atomically replaces `current.json` **last**. It confirms the
    lock inode still matches before publication, refusing a lock detached by a
-   purge. Readers never read staging. A normal failed build cleans its staging;
-   a killed process can leave private staging for authorized maintainer review.
+   purge. Readers never read staging. Staging cleanup is best-effort: an NFS
+   busy/nonempty directory or another filesystem cleanup error produces a
+   warning with only the generated `.building-*` basename and errno. The
+   original build exception still propagates; a validated publication remains
+   successful even if cleanup fails. Warning-as-error settings cannot change
+   that outcome. Failed cleanup or a killed process can leave private staging
+   for authorized maintainer review after the build exits. Cleanup does not
+   retry, change permissions, remove the lock or publish an invalid snapshot.
+   Build callbacks must explicitly close SQLite connections and other handles
+   on every exit path (`with sqlite3.connect(...)` alone does not close a
+   connection); open handles can prevent NFS from removing temporary files.
    Do not delete live staging or "repair" a pointer by hand.
 6. A failed build leaves the previous publication in place. A crash after the
    snapshot rename but before the pointer update can leave an unreferenced

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from contextlib import closing
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import sqlite3
 import time
+import warnings
 
 import pytest
 
@@ -386,6 +388,140 @@ def test_failed_build_removes_private_scratch_workspace(environment):
     with pytest.raises(RuntimeError, match="synthetic failure"):
         corpus.ensure_snapshot(root, spec, build=abort)
     assert not list(root.glob(".building-*"))
+    assert not (root / "current.json").exists()
+
+
+@pytest.fixture
+def failed_cleanup(monkeypatch):
+    attempts = []
+
+    def fail(work):
+        attempts.append(work)
+        raise OSError(errno.ENOTEMPTY, "PRIVATE_CLEANUP_DETAILS", "PRIVATE_PATH")
+
+    # Patch only the corpus module's shutil reference, not pytest/tempfile cleanup.
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(corpus, "shutil", SimpleNamespace(rmtree=fail))
+    return attempts
+
+
+@pytest.mark.parametrize("previous_publication", [False, True])
+def test_cleanup_failure_preserves_missing_source_error_and_publication(
+    environment, monkeypatch, previous_publication
+):
+    root, config, spec = environment
+    old = publish(environment) if previous_publication else None
+    pointer = (root / "current.json").read_bytes() if old else None
+    config.write_text(
+        config.read_text() + '\n[[html_sources]]\nlabel="Synthetic Argonne guide"\n'
+        'url="https://example.org/argonne"\n'
+    )
+    changed = corpus.specification(config, "a" * 40)
+    attempts = []
+
+    def fail_cleanup(work):
+        attempts.append(work)
+        raise OSError(errno.ENOTEMPTY, "PRIVATE_CLEANUP_DETAILS", "PRIVATE_PATH")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(corpus.shutil, "rmtree", fail_cleanup)
+        with pytest.warns(RuntimeWarning, match="cleanup incomplete") as warning:
+            with pytest.raises(
+                corpus.CorpusError, match="Configured sources are missing"
+            ):
+                corpus.ensure_snapshot(root, changed, build=write_database, timeout=0)
+
+    assert len(attempts) == len(warning) == 1
+    work = attempts[0]
+    message = str(warning[0].message)
+    assert work.name in message and str(errno.ENOTEMPTY) in message
+    assert str(root) not in message and "PRIVATE_" not in message
+    assert work.is_dir()
+    if os.name == "posix":
+        assert work.stat().st_mode & 0o777 == 0o700
+    assert list(root.glob("snapshot-*")) == ([old] if old else [])
+    if old:
+        assert (root / "current.json").read_bytes() == pointer
+        assert corpus.current_snapshot(root, spec)[0] == old
+    else:
+        assert not (root / "current.json").exists()
+    # Failure must also unwind the writer lock, without deleting its stable inode.
+    lock_stat = (root / ".build.lock").stat()
+    with corpus._try_lock(root) as fd:
+        assert fd is not None
+        assert os.path.samestat(lock_stat, os.fstat(fd))
+
+
+@pytest.mark.parametrize(
+    "error_type", [corpus.CorpusError, RuntimeError, KeyboardInterrupt]
+)
+def test_cleanup_and_warning_errors_cannot_replace_original_exception(
+    environment, failed_cleanup, error_type
+):
+    root, _, spec = environment
+    original = error_type("Baseline source loss / new omission detected")
+
+    def abort(_):
+        raise original
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(error_type) as raised:
+            corpus.ensure_snapshot(root, spec, build=abort, timeout=0)
+    assert raised.value is original
+    assert len(failed_cleanup) == 1
+    assert not (root / "current.json").exists()
+    assert not list(root.glob("snapshot-*"))
+
+
+def test_cleanup_failure_after_publication_keeps_success(environment, failed_cleanup):
+    root, _, spec = environment
+    with pytest.warns(RuntimeWarning, match="cleanup incomplete"):
+        snapshot = corpus.ensure_snapshot(root, spec, build=write_database, timeout=0)
+    assert corpus.current_snapshot(root, spec)[0] == snapshot
+    assert len(failed_cleanup) == 1
+    assert failed_cleanup[0].is_dir()
+    assert not (failed_cleanup[0] / "snapshot").exists()
+    assert (
+        corpus.ensure_snapshot(
+            root, spec, build=lambda _: pytest.fail("duplicate build"), timeout=0
+        )
+        == snapshot
+    )
+
+
+def test_cli_reports_original_build_failure_when_cleanup_fails(
+    environment, failed_cleanup, monkeypatch, capsys
+):
+    root, config, _ = environment
+
+    def abort(_):
+        raise corpus.CorpusError("Baseline source loss / new omission detected")
+
+    monkeypatch.setattr(corpus, "scraper_revision", lambda _: "a" * 40)
+    monkeypatch.setattr(corpus, "scraper_builder", lambda *_: abort)
+    with pytest.warns(RuntimeWarning, match="cleanup incomplete"):
+        result = corpus.main(
+            [
+                "ensure",
+                "--shared-root",
+                str(root),
+                "--scraper-dir",
+                str(config.parent),
+                "--config",
+                str(config),
+                "--allow-build",
+                "--timeout",
+                "0",
+            ]
+        )
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert "setup failed: Baseline source loss / new omission detected" in captured.err
+    assert "PRIVATE_" not in captured.err
+    assert len(failed_cleanup) == 1
     assert not (root / "current.json").exists()
 
 
