@@ -17,6 +17,26 @@ Inkly is designed for command-line use in shared research environments and can b
 - an SSH-tunneled Ollama server
 - a local `ollama run` workflow
 
+## Windows Desktop: download the development test build
+
+Double-click [Get-InklyDesktop-Test.cmd](Get-InklyDesktop-Test.cmd) in this
+checkout to verify, smoke-test and launch the pinned Windows build. The EXE is
+**not inside Git**. To download it, sign into GitHub and open
+[Quality run 43600766207](https://github.com/thealice-lab/hpc-ink-setup/actions/runs/43600766207).
+At the bottom of the page, under **Artifacts**, click **InklyDesktop-windows**
+and save the ZIP in Downloads. The helper also offers this browser flow when
+neither a ZIP nor authenticated GitHub CLI is available.
+
+This is an **unsigned development build**, pinned to `f5c9b926`, not a release
+or an automatic download of the latest `dev`. The artifact expires **2027-02-12**.
+Its EXE SHA-256 is
+`C178EFF40C323FB34A2AF7DD3523018554F8CBEADCED67CCADEA0F67F21DC76B`.
+Windows PowerShell 5.1, Windows OpenSSH Client and GitHub artifact read access
+are required; Python is bundled. Actual HPC use also needs the site's
+network/VPN, verified host key, authorized account and a matching Inkly HPC
+endpoint. See [Desktop download and testing instructions](docs/DESKTOP.md#download-the-pinned-development-build)
+for the versioned EXE location, troubleshooting and standalone helper use.
+
 ## What Inkly Does
 
 Inkly helps users interact with an HPC system in a more natural and productive way.
