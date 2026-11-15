@@ -884,6 +884,48 @@ def test_native_cancel_and_run_again_follow_selected_rows(
         app.close()
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+def test_native_window_collects_garbage_only_on_the_tk_thread(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    calls = []
+    monkeypatch.setattr(
+        gui,
+        "gc",
+        SimpleNamespace(
+            disable=lambda: calls.append("disable"),
+            enable=lambda: calls.append("enable"),
+            collect=lambda *args: calls.append("collect"),
+        ),
+    )
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    try:
+        # Automatic collection is off before any worker thread can trigger it.
+        assert calls == ["disable"]
+        app.drain()
+        assert calls == ["disable"]  # Not due yet.
+        app.next_collection = 0
+        app.drain()
+        assert calls == ["disable", "collect"]
+        assert app.next_collection > 0
+    finally:
+        app.close()
+    # Closing collects on the Tk thread and never re-enables automatic collection.
+    assert calls == ["disable", "collect", "collect"]
+
+
 native_display = pytest.mark.skipif(
     sys.platform != "win32" and not os.environ.get("DISPLAY"),
     reason="Native Tk display required",
