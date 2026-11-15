@@ -1006,7 +1006,31 @@ def test_native_cancel_and_run_again_follow_selected_rows(
         app.busy = True
         app.buttons()
         assert str(app.cancel_button["state"]) == "disabled"
-        app.busy = False
+
+        # While watching submitted jobs, Cancel job stays available and goes to
+        # the running watch on its open connection instead of starting anew.
+        requests = []
+        monkeypatch.setattr(
+            w.controller, "request_cancel", lambda *args: requests.append(args)
+        )
+        app.action = "submit"
+        app.buttons()
+        assert str(app.cancel_button["state"]) == "normal"
+        assert str(app.rerun_button["state"]) == "disabled"
+        started = len(scheduled)
+        app.cancel_button.invoke()
+        assert requests == [([first], SETTINGS)]
+        assert len(scheduled) == started
+        app.busy, app.action = False, None
+
+        # Expected outcomes are shown as information, not errors.
+        shown = []
+        monkeypatch.setattr(
+            gui.messagebox, "showinfo", lambda *args, **kwargs: shown.append(args)
+        )
+        app.events.put(("notice", "job 2406955 already completed"))
+        app.drain()
+        assert shown == [("Cancel job", "job 2406955 already completed")]
     finally:
         app.close()
 
