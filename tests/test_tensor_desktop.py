@@ -531,17 +531,72 @@ def test_cancel_only_pending_jobs_after_checking_the_endpoint(workflow):
     assert "sample_1" not in json.dumps(events)
 
 
-@pytest.mark.parametrize("state", ["RUNNING", "COMPLETED", "SUBMISSION_UNKNOWN"])
-def test_cancel_checks_every_selected_row_before_cancelling_any(workflow, state):
+def notices(workflow):
+    return [data for kind, data in workflow.events if kind == "notice"]
+
+
+@pytest.mark.parametrize(
+    "state, explanation",
+    [
+        ("CONFIGURING", "has already started (CONFIGURING)"),
+        ("COMPLETED", "job 124 already completed, so there was nothing to cancel"),
+        ("CANCELLED by 7", "job 124 was already cancelled"),
+        ("FAILED", "job 124 already ended (FAILED)"),
+        ("SUBMISSION_UNKNOWN", "cannot confirm a Slurm job"),
+    ],
+)
+def test_cancel_explains_jobs_that_are_not_waiting_and_cancels_the_rest(
+    workflow, state, explanation
+):
     w = workflow
     w.controller.preview(w.paths, SETTINGS)
-    recorded_job(w, w.paths[0], "PENDING")
-    recorded_job(w, w.paths[1], state)
+    recorded_job(w, w.paths[0], "PENDING", "123")
+    recorded_job(w, w.paths[1], state, "124")
     w.calls.clear()
-    with pytest.raises(ValueError, match="not PENDING, so nothing was cancelled"):
-        w.controller.cancel_jobs(w.paths, SETTINGS)
-    assert "cancel" not in actions(w) and "submit" not in actions(w)
-    assert record_for(w, w.paths[0])["state"] == "PENDING"
+    w.events.clear()
+    w.controller.cancel_jobs(w.paths, SETTINGS)  # No exception.
+    assert [bundle for bundle, action in w.calls if action == "cancel"] == [
+        json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    ]
+    assert record_for(w, w.paths[0])["state"] == "CANCELLED by 1000"
+    assert "submit" not in actions(w)
+    assert len(notices(w)) == 1 and explanation in notices(w)[0]
+    assert "sample_2.gjf" in notices(w)[0] and "sample_1.gjf" not in notices(w)[0]
+    assert w.controller.session is not None  # The connection stays open.
+
+
+def test_cancelling_a_finished_job_shows_a_notice_and_keeps_the_connection(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "COMPLETED", "2406955")
+    w.events.clear()
+    connections = len(w.connections)
+    w.controller.execute("cancel_jobs", [w.paths[0]], SETTINGS)
+    assert not [data for kind, data in w.events if kind == "error"]
+    assert notices(w) == [
+        "sample_1.gjf: job 2406955 already completed, so there was nothing to "
+        "cancel. Check & return results brings back its log."
+    ]
+    assert rows_for(w, w.paths[0])[-1]["state"] == "COMPLETED"
+    assert ("done", "cancel_jobs") in w.events
+    assert "cancel" not in actions(w)
+    assert w.controller.session is not None and len(w.connections) == connections
+
+
+def test_job_that_starts_before_the_cancel_arrives_is_explained(workflow, monkeypatch):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "123")
+
+    def starts_now(operation, receipt):
+        record_for(w, w.paths[0])["state"] = "CONFIGURING"
+        return True
+
+    monkeypatch.setattr(w.controller, "endpoint_supports", starts_now)
+    w.events.clear()
+    w.controller.cancel_jobs([w.paths[0]], SETTINGS)
+    assert "has already started (CONFIGURING)" in notices(w)[0]
+    assert rows_for(w, w.paths[0])[-1]["state"] == "CONFIGURING"
 
 
 def test_cancel_needs_a_saved_handoff(workflow):
@@ -557,23 +612,12 @@ def test_older_hpc_endpoint_explains_and_cancels_nothing(workflow):
     recorded_job(w, w.paths[0], "PENDING", "2406999")
     w.endpoint["capabilities"] = None
     w.calls.clear()
-    with pytest.raises(ValueError, match="too old to cancel") as error:
-        w.controller.cancel_jobs([w.paths[0]], SETTINGS)
-    assert "scancel 2406999" in str(error.value)
-    assert actions(w) == ["status", "version"]
-    assert record_for(w, w.paths[0])["state"] == "PENDING"
-
-
-def test_cancel_errors_reach_the_window_and_close_only_ssh(workflow):
-    w = workflow
-    w.controller.preview(w.paths[:1], SETTINGS)
-    recorded_job(w, w.paths[0], "RUNNING")
     w.events.clear()
-    w.controller.execute("cancel_jobs", [w.paths[0]], SETTINGS)
-    errors = [data for kind, data in w.events if kind == "error"]
-    assert len(errors) == 1 and "not PENDING" in errors[0]
-    assert ("done", "cancel_jobs") in w.events
-    assert "cancel" not in actions(w)
+    w.controller.cancel_jobs([w.paths[0]], SETTINGS)
+    assert actions(w) == ["status", "version"]
+    assert "too old to cancel" in notices(w)[0]
+    assert "scancel 2406999" in notices(w)[0]
+    assert record_for(w, w.paths[0])["state"] == "PENDING"
 
 
 def test_monitor_treats_cancelled_as_final_and_keeps_watching_others(workflow):
