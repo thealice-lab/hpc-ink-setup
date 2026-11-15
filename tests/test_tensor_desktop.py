@@ -1223,6 +1223,81 @@ def test_native_window_collects_garbage_only_on_the_tk_thread(
     assert calls == ["disable", "collect", "collect"]
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+def test_native_new_work_goes_to_the_watch_and_stop_keeps_the_connection(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    requests, calls, scheduled = [], [], []
+    monkeypatch.setattr(w.controller, "request", lambda *args: requests.append(args))
+    monkeypatch.setattr(w.controller, "pause", lambda: calls.append("pause"))
+    monkeypatch.setattr(w.controller, "stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *args, **kwargs: True)
+    try:
+        app.settings = dict(SETTINGS)
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.busy, app.action = True, "monitor"  # Watching submitted jobs.
+        app.buttons()
+        state = {
+            name: str(getattr(app, f"{name}_button")["state"])
+            for name in ("add", "folder", "preview", "submit", "remove", "clear")
+        }
+        assert state == {
+            "add": "normal",
+            "folder": "normal",
+            "preview": "normal",
+            "submit": "normal",
+            "remove": "disabled",
+            "clear": "disabled",
+        }
+        assert str(app.settings_button["state"]) == "disabled"
+        assert str(app.monitor_button["state"]) == "disabled"
+
+        review_id = app.review["id"]
+        app.submit_button.invoke()
+        assert requests[-1] == ("submit", review_id, True)
+        assert app.review is None and str(app.submit_button["state"]) == "disabled"
+        app.preview_button.invoke()
+        assert requests[-1] == ("preview", app.files, SETTINGS)
+        assert not scheduled  # Nothing started a new action beside the watch.
+
+        # Stop watching pauses and keeps the connection...
+        app.stop_button.invoke()
+        assert calls == ["pause"] and app.stop_deadline
+        # ...and disconnects only if the same watch is still running later.
+        app.force_stop(app.run_id + 1)
+        assert calls == ["pause"]
+        app.force_stop(app.run_id)
+        assert calls == ["pause", "stop"]
+
+        # When idle, Check & return results works even without a connection.
+        app.busy, app.action = False, None
+        w.controller.session = None
+        app.buttons()
+        assert str(app.monitor_button["state"]) == "normal"
+    finally:
+        w.controller.session = None
+        app.close()
+
+
 native_display = pytest.mark.skipif(
     sys.platform != "win32" and not os.environ.get("DISPLAY"),
     reason="Native Tk display required",
