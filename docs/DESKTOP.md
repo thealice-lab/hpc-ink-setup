@@ -10,31 +10,28 @@ This is a development build for workflow review, not a signed installer.
 Follow your institution's software distribution process; code signing and
 automatic updates are not part of this change.
 
-## Download the pinned development build
+## Download and open Inkly Desktop
 
-The EXE is **not committed to Git**. This helper pins the reviewed development
-build from [Quality run 43657445804](https://github.com/thealice-lab/hpc-ink-setup/actions/runs/43657445804),
-source commit `18620b6a642083e81606c6e3ca4a2d1e1461fbff`. It never silently
-selects a newer `dev` build. This unsigned artifact expires **2027-02-12**;
-if it is expired or inaccessible, ask the maintainer for a reviewed replacement.
-Do not substitute another EXE or bypass a hash failure.
+The EXE is **not committed to Git**. The helper pins the
+[Inkly Desktop 0.3.0 (preview)](https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.3.0)
+release, built by GitHub Actions from commit
+`e1314258575d72c51ecd1dda13eb9fe4a2faa0c4`. It never silently selects a newer
+build. Do not substitute another EXE or bypass a hash failure.
 
 1. In this checkout, double-click **Get-InklyDesktop-Test.cmd** at the repository
    root. Windows PowerShell 5.1 is required. Python and administrator rights
-   are not needed to run the helper, and it does not change persistent
-   execution policy or install Windows components.
-2. It looks for `InklyDesktop-windows*.zip` in your Windows Downloads folder.
-   If absent, it can use an already authenticated GitHub CLI (`gh`). Otherwise
-   it opens the exact Actions run above. Sign into GitHub with artifact read
-   access, scroll to the bottom of the page to **Artifacts**, click
-   **InklyDesktop-windows**, and save the ZIP. Return to the helper and press
-   Enter, or paste the full ZIP path if saved elsewhere. Enter **Q** to cancel.
-   The helper never collects credentials. Browser-download and authenticated
-   CLI failures do not cause it to choose another build.
-3. The helper extracts only `InklyDesktop.exe`, verifies its SHA-256, and places
-   it at `%LOCALAPPDATA%\Inkly\DesktopBuilds\18620b6a\InklyDesktop.exe`.
-   This is separate from the checkout and other builds. It preserves existing
-   settings and refuses to replace an unverified EXE already at that path.
+   are not needed, and the helper does not change persistent execution policy
+   or install Windows components.
+2. It downloads `InklyDesktop-0.3.0-windows.zip` from the release. Release
+   downloads are public: no GitHub sign-in, and they do not expire. If the
+   download is blocked (for example by a proxy), the helper opens the release
+   page instead: download the ZIP there, return to the helper and press Enter,
+   or paste the ZIP's full path. Enter **Q** to cancel. The helper never
+   collects credentials and never chooses another build.
+3. It extracts only `InklyDesktop.exe`, verifies its SHA-256, and places it at
+   `%LOCALAPPDATA%\Inkly\DesktopBuilds\0.3.0\InklyDesktop.exe`. This is
+   separate from the checkout and other builds. It preserves existing settings
+   and refuses to replace an unverified EXE already at that path.
 4. It runs a fresh **local-only** smoke test of the real window, bundled sign-in
    dialog, packaged Python and local OpenSSH availability, then launches the
    GUI. Each run saves `local-smoke-test-<id>.json` beside the versioned EXE.
@@ -42,39 +39,38 @@ Do not substitute another EXE or bypass a hash failure.
    Opening the GUI also does not submit a job; later cluster actions require
    the connection prerequisites described below.
 
-The ZIP contains `InklyDesktop.exe` and CI's `smoke-test.json`. The helper checks
-the **EXE**, not the ZIP, against this exact SHA-256 from the pinned Windows CI:
+The helper checks the **EXE** against this exact SHA-256, also listed in the
+release's `SHA256SUMS.txt`:
 
 ```text
-5CAE3F27B81C5EB8523932CEEDDF314E3145DD196D9F63BAEB2E30CEDD848B66
+6FC66028C6C2B0335195E5C0E3967A262FEF45E11AA62E9ED49EFB23FD3C3395
 ```
+
+Anyone can also confirm that GitHub Actions built it from this repository with
+`gh attestation verify InklyDesktop.exe --repo thealice-lab/hpc-ink-setup`.
 
 For standalone use without a clone, download both `Get-InklyDesktop-Test.cmd`
 and `scripts/windows/get_inklydesktop_test.ps1` from the same reviewed source
 revision and keep them beside one another. The `.cmd` supports both layouts.
-For a ZIP outside Downloads, or a local check without launching the full GUI:
+For an already downloaded ZIP, or a local check without launching the full GUI:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\get_inklydesktop_test.ps1 -ArtifactZip 'C:\path\to\InklyDesktop-windows.zip' -NoLaunch
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\get_inklydesktop_test.ps1 -ArtifactZip 'C:\path\to\InklyDesktop-0.3.0-windows.zip' -NoLaunch
 ```
 
-If a newer or unrelated ZIP is found in Downloads, verification stops; pass the
-correct ZIP's exact path with `-ArtifactZip`. A bad existing cached EXE is also
-left untouched for review. If OpenSSH is missing, enable **OpenSSH Client** in
+A ZIP with the wrong contents stops verification, and a bad existing cached EXE
+is left untouched for review. If OpenSSH is missing, enable **OpenSSH Client** in
 Windows Optional Features according to your institution's policy and retry.
-Do not override Windows security warnings for an unverified source. A guessed
-path or a PowerShell variable does not download an EXE: use the helper's printed
-verified path after it reports success. Opening `InklyDesktop.exe` straight from
-a downloaded ZIP can show a Windows SmartScreen warning because development
-builds are unsigned; the helper checks the EXE's exact SHA-256 before running it.
+Do not override Windows security warnings for an unverified source. Opening
+`InklyDesktop.exe` straight from a downloaded ZIP can show a Windows SmartScreen
+warning because the build is not Authenticode-signed; the helper checks the
+EXE's exact SHA-256 before running it.
 
-Maintainers: when a newer build is reviewed, update the helper's run ID, source
-commit and EXE SHA-256 together (from that run's Windows build log), along with
-this page, the README and `tests/test_windows_desktop_download.py`.
-
-Actions artifacts are temporary development downloads. Versioned builds are
-published as GitHub Releases (see **Publish a release** below). Do not commit
-ZIP/EXE binaries or treat this helper as an HPC deployment tool.
+Maintainers: after publishing a new release (see **Publish a release** below),
+update the helper's version, source commit and EXE SHA-256 (from the release's
+`SHA256SUMS.txt`) together, along with this page, the README and
+`tests/test_windows_desktop_download.py`. Do not commit ZIP/EXE binaries or
+treat this helper as an HPC deployment tool.
 
 ## First calculation
 
