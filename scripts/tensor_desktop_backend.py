@@ -33,6 +33,8 @@ class DesktopController:
         # its own SSH session; `wake` ends its wait between checks early.
         self.requests = queue.Queue()
         self.wake = threading.Event()
+        # Stop watching: end the monitor loop but keep the SSH session open.
+        self.paused = threading.Event()
 
     def audit(self, event_type, payload=None):
         try:
@@ -60,6 +62,17 @@ class DesktopController:
                 process.terminate()
             except OSError:
                 pass
+
+    def pause(self):
+        """Stop watching without disconnecting. Never cancels a Slurm job.
+
+        The monitor loop ends after the check in progress, and Check & return
+        results can resume on the same connection without a new sign-in.
+        """
+        self.audit("desktop_stop")
+        self.paused.set()
+        self.wake.set()
+        self.drop_requests()
 
     def drop_requests(self):
         """Forget cancel requests the watch has not handled; rows show what happened."""
@@ -392,13 +405,23 @@ class DesktopController:
             changed = changed or action != "cancel_jobs"
 
     def monitor(self):
-        if not self.session or not self.items:
+        if not self.items or not self.items[0].get("receipt"):
             raise ValueError("Preview the files first to load their saved handoffs.")
+        if not self.session:
+            # Watching again after the connection closed: sign in for these jobs.
+            connection = self.items[0]["receipt"]
+            self.connect(connection)
+            self.emit(
+                "target",
+                {key: connection.get(key) for key in ("host", "ink_path", "auth")},
+            )
         pending = list(self.items)
-        while True:
+        while not self.paused.is_set():
             if self.handle_requests():
                 pending = list(self.items)  # A preview or submit changed the list.
             for item in list(pending):
+                if self.paused.is_set():
+                    break
                 self.check_stop()
                 response = self.session.exchange(
                     {"action": "status"}, receipt=item["receipt"]
@@ -430,16 +453,25 @@ class DesktopController:
                     raise ValueError(
                         f"{item['path'].name}: {state} (exit {response.get('exit_code')}). Other jobs may continue. Keep receipts and inspect this job."
                     )
-            if not pending and self.requests.empty():
+            if self.paused.is_set():
                 break
+            if not pending and self.requests.empty():
+                self.emit(
+                    "message",
+                    "Check complete. Open verified returned logs in TENSOR's Analysis & 3D view. Prepared jobs remain unsubmitted.",
+                )
+                return
             if pending:
                 # Wait for the next check; Stop watching or a request wakes early.
                 self.wake.wait(self.interval)
                 self.wake.clear()
                 self.check_stop()
+        self.paused.clear()
+        self.drop_requests()
         self.emit(
             "message",
-            "Check complete. Open verified returned logs in TENSOR's Analysis & 3D view. Prepared jobs remain unsubmitted.",
+            "Stopped watching. Submitted jobs continue on the HPC and the connection "
+            "stays open; choose Check & return results to watch again.",
         )
 
     def endpoint_supports(self, operation, receipt):

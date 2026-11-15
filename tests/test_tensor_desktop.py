@@ -780,6 +780,57 @@ def test_watch_takes_preview_submit_and_cancel_requests_in_turn(workflow):
     assert len(w.connections) == connections
 
 
+def test_stop_watching_keeps_the_connection_so_watching_can_resume(workflow):
+    import threading
+    import time
+
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    connections = len(w.connections)
+    w.controller.interval = 30
+    watch = threading.Thread(target=w.controller.monitor, daemon=True)
+    watch.start()
+    deadline = time.monotonic() + 5
+    while actions(w).count("status") < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    w.controller.request_cancel([w.paths[0]], SETTINGS)  # Dropped by the stop.
+    w.controller.pause()
+    watch.join(timeout=5)
+    assert not watch.is_alive()
+    assert w.controller.session is not None  # Still connected.
+    assert w.controller.requests.empty() and not w.controller.paused.is_set()
+    assert "cancel" not in actions(w)
+    assert any("Stopped watching" in text for text in messages(w))
+    # Watching again needs no new connection or sign-in.
+    w.controller.interval = 0
+    record_for(w, w.paths[0])["state"] = "RUNNING"
+    w.controller.monitor()
+    assert rows_for(w, w.paths[0])[-1]["state"] == "RETURNED"
+    assert len(w.connections) == connections
+
+
+def test_stop_during_submit_lets_the_submission_finish_then_stops(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.controller.pause()  # Clicked while jobs were still being submitted.
+    w.controller.submit(w.controller.review_id, True)
+    assert record_for(w, w.paths[0])["submission"] == "SUBMITTED"
+    assert any("Stopped watching" in text for text in messages(w))
+    assert w.controller.session is not None
+
+
+def test_check_after_the_connection_closed_signs_in_again(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "RUNNING", "1")
+    w.controller.close()
+    connections = len(w.connections)
+    w.controller.monitor()
+    assert len(w.connections) == connections + 1
+    assert rows_for(w, w.paths[0])[-1]["state"] == "RETURNED"
+
+
 def test_cancelled_row_does_not_block_submitting_other_prepared_files(workflow):
     w = workflow
     w.controller.preview(w.paths, SETTINGS)
