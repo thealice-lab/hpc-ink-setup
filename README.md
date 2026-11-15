@@ -20,14 +20,14 @@ Inkly is designed for command-line use in shared research environments and can b
 ## Windows Desktop: one double-click from this checkout
 
 Double-click [Get-InklyDesktop-Test.cmd](Get-InklyDesktop-Test.cmd). It downloads
-[Inkly Desktop 0.4.0 (preview)](https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.4.0)
+[Inkly Desktop 0.4.1 (preview)](https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.4.1)
 from this repository's Releases, checks the EXE's exact SHA-256, runs a
 local-only smoke test and opens the app. No GitHub sign-in is needed, and the
 EXE is **not inside Git**.
 
-This is an **unsigned pre-release**, built by GitHub Actions from `bd246f8`.
+This is an **unsigned pre-release**, built by GitHub Actions from `8c55e79`.
 Its EXE SHA-256 is
-`110FD25DD45C4E63A7AAECE8EFC41BDBBED08BF5CB65ECEBAC1DAD40565B4658`.
+`4304FBE0C8E68740C070A382FB09AA04D246361896DFE2BDE38468AA46C0EF9A`.
 Windows PowerShell 5.1 and Windows OpenSSH Client are required; Python is
 bundled. Actual HPC use also needs the site's network/VPN, verified host key,
 authorized account and a matching Inkly HPC endpoint. See
