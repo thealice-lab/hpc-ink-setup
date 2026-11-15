@@ -1,4 +1,4 @@
-<# Download, verify and locally test one reviewed development build (not a release).
+<# Download, verify, locally test and launch the pinned Inkly Desktop release.
 No credentials, SSH connections, Slurm operations or HPC deployment. #>
 #requires -Version 5.1
 [CmdletBinding()]
@@ -8,12 +8,16 @@ param(
 )
 
 $repo = 'thealice-lab/hpc-ink-setup'
-$runId = '43657445804'
-$artifactName = 'InklyDesktop-windows'
-$runUrl = "https://github.com/$repo/actions/runs/$runId"
-$sourceCommit = '18620b6a642083e81606c6e3ca4a2d1e1461fbff'
-$build = $sourceCommit.Substring(0, 8)
-$expectedSha = '5CAE3F27B81C5EB8523932CEEDDF314E3145DD196D9F63BAEB2E30CEDD848B66'
+$version = '0.3.0'
+$releaseTag = "desktop-v$version"
+$zipName = "InklyDesktop-$version-windows.zip"
+# Public release downloads need no GitHub sign-in and do not expire.
+$releaseUrl = "https://github.com/$repo/releases/tag/$releaseTag"
+$downloadUrl = "https://github.com/$repo/releases/download/$releaseTag/$zipName"
+$sourceCommit = 'e1314258575d72c51ecd1dda13eb9fe4a2faa0c4'
+$build = $version
+# InklyDesktop.exe SHA-256 from the release's SHA256SUMS.txt.
+$expectedSha = '6FC66028C6C2B0335195E5C0E3967A262FEF45E11AA62E9ED49EFB23FD3C3395'
 
 function Assert-InklyExeHash([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -28,7 +32,7 @@ function Assert-InklyExeHash([string]$Path) {
         finally { $stream.Dispose() }
     } finally { $hasher.Dispose() }
     if ($actual -ne $expectedSha) {
-        throw "SHA-256 mismatch. Refusing to run or replace this file: $Path. Download the artifact from $runUrl and pass -ArtifactZip with its exact ZIP path."
+        throw "SHA-256 mismatch. Refusing to run or replace this file: $Path. Download $zipName from $releaseUrl and pass -ArtifactZip with its exact ZIP path."
     }
     Write-Host "SHA-256 verified: $actual"
 }
@@ -39,7 +43,7 @@ function Find-InklyArtifactZip {
     $folders = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction SilentlyContinue
     $configured = $folders.'{374DE290-123F-4565-9164-39C4925E467B}'
     if ($configured) { $downloads = [Environment]::ExpandEnvironmentVariables($configured) }
-    Get-ChildItem -LiteralPath $downloads -Filter 'InklyDesktop-windows*.zip' -File -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $downloads -Filter "InklyDesktop-$version-windows*.zip" -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 }
 
@@ -59,45 +63,40 @@ function Expand-InklyArtifact([string]$Zip, [string]$Directory) {
     }
 }
 
+function Save-InklyRelease([string]$Directory) {
+    $zip = Join-Path $Directory $zipName
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    # Windows PowerShell 5.1 downloads far faster without its progress bar.
+    $previous = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try { Invoke-WebRequest -Uri $downloadUrl -OutFile $zip -UseBasicParsing -TimeoutSec 300 }
+    finally { $ProgressPreference = $previous }
+    return $zip
+}
+
 function Get-InklyArtifact([string]$Zip, [string]$Directory) {
-    if (-not $Zip) { $Zip = Find-InklyArtifactZip }
     if ($Zip) {
-        Write-Host "Using artifact ZIP: $Zip"
+        Write-Host "Using ZIP: $Zip"
         Expand-InklyArtifact $Zip $Directory
         return
     }
-    $gh = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue
-    if ($gh) {
-        # gh manages authentication; never prompt for, read or print a token.
-        try {
-            & $gh.Source auth status *> $null
-            if ($LASTEXITCODE -eq 0) {
-                # Isolate partial CLI output from a subsequent browser download.
-                $cliDir = Join-Path $Directory 'gh'
-                New-Item -ItemType Directory -Path $cliDir | Out-Null
-                & $gh.Source run download $runId -R $repo -n $artifactName -D $cliDir *> $null
-                if ($LASTEXITCODE -eq 0) {
-                    $candidate = Join-Path $cliDir 'InklyDesktop.exe'
-                    Assert-InklyExeHash $candidate
-                    [IO.File]::Copy($candidate, (Join-Path $Directory 'InklyDesktop.exe'), $false)
-                    return
-                }
-            }
-        } catch {
-            # Authentication, network, expiry or download failure: offer the same pinned run.
-        }
-        Write-Host 'GitHub CLI could not retrieve the verified build; using browser instructions.'
+    Write-Host "Downloading Inkly Desktop $version from the GitHub release..."
+    try {
+        Expand-InklyArtifact (Save-InklyRelease $Directory) $Directory
+        return
+    } catch {
+        # Network or proxy failure: offer the same pinned release in the browser.
+        Write-Host ('Automatic download failed: ' + $_.Exception.Message)
     }
-    Write-Host "Sign into GitHub with Actions artifact read access: $runUrl"
-    Write-Host 'At the bottom of that page, under Artifacts, download InklyDesktop-windows.'
-    Write-Host 'This pinned artifact expires 2027-02-12; an expired or unavailable artifact needs maintainer review.'
-    try { Start-Process -FilePath $runUrl | Out-Null }
+    Write-Host "Open the release page and download ${zipName}: $releaseUrl"
+    Write-Host 'No GitHub sign-in is needed.'
+    try { Start-Process -FilePath $releaseUrl | Out-Null }
     catch { Write-Host 'Could not open the browser. Open the link above manually.' }
     $answer = Read-Host 'After downloading, paste the ZIP path (or press Enter to search Downloads; Q to cancel)'
     if ($answer -eq 'q') { throw 'Download cancelled; no application was launched.' }
     $Zip = $answer.Trim().Trim('"')
     if (-not $Zip) { $Zip = Find-InklyArtifactZip }
-    if (-not $Zip) { throw 'No artifact ZIP found. Download it and rerun with -ArtifactZip and the exact path.' }
+    if (-not $Zip) { throw "No $zipName found. Download it and rerun with -ArtifactZip and the exact path." }
     Expand-InklyArtifact $Zip $Directory
 }
 
@@ -152,8 +151,8 @@ function Invoke-InklyDesktopTest([string]$Zip, [switch]$SkipLaunch) {
     $destination = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA "Inkly\DesktopBuilds\$build"))
     Assert-InklyDestination $destination
     $exe = Join-Path $destination 'InklyDesktop.exe'
-    Write-Host "Inkly Desktop - pinned development test build $sourceCommit (unsigned, not a release)"
-    Write-Host "Build: $runUrl"
+    Write-Host "Inkly Desktop $version (pre-release, unsigned) built from $($sourceCommit.Substring(0, 7))"
+    Write-Host "Release: $releaseUrl"
     Write-Host "Local destination: $destination"
     if (Test-Path -LiteralPath $exe) { Assert-InklyExeHash $exe }
     if ($Zip -or -not (Test-Path -LiteralPath $exe)) {

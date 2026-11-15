@@ -16,8 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts/windows/get_inklydesktop_test.ps1"
 SYNTHETIC = b"synthetic fixture, never executed"
 DIGEST = hashlib.sha256(SYNTHETIC).hexdigest()
-BUILD = "Inkly/DesktopBuilds/18620b6a"
-RUN = "https://github.com/thealice-lab/hpc-ink-setup/actions/runs/43657445804"
+BUILD = "Inkly/DesktopBuilds/0.3.0"
+RELEASE = "https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.3.0"
+DOWNLOAD = (
+    "https://github.com/thealice-lab/hpc-ink-setup/releases/download/"
+    "desktop-v0.3.0/InklyDesktop-0.3.0-windows.zip"
+)
 
 
 def ps_quote(value):
@@ -202,46 +206,59 @@ function Start-Process($FilePath) {{ Write-Host ('OPEN:' + $FilePath) }}
 """
 
 
-@pytest.mark.parametrize(
-    "gh_status", ["absent", "unauthenticated", "failed", "success"]
-)
-def test_browser_and_cli_always_use_pinned_run(tmp_path, sandbox, gh_status):
+@pytest.mark.parametrize("download", ["success", "failure"])
+def test_release_download_and_browser_fallback_use_pinned_release(
+    tmp_path, sandbox, download
+):
     zip_path = artifact(tmp_path)
-    setup = "function Get-Command { return $null }\n"
-    if gh_status != "absent":
-        cli = tmp_path / "fake-gh.cmd"
-        binary = tmp_path / "synthetic.exe"
-        binary.write_bytes(SYNTHETIC)
-        log = tmp_path / "gh arguments.txt"
-        sandbox["INKLY_TEST_EXE"] = str(binary)
-        sandbox["INKLY_TEST_ARGS"] = str(log)
-        # Simulate a partial CLI download before a browser retry as well.
-        cli.write_text(
-            "@echo off\n"
-            'echo %* >> "%INKLY_TEST_ARGS%"\n'
-            f'if "%1"=="auth" exit /b {1 if gh_status == "unauthenticated" else 0}\n'
-            'copy /b "%INKLY_TEST_EXE%" "%~9\\InklyDesktop.exe" > nul\n'
-            f"exit /b {1 if gh_status == 'failed' else 0}\n"
-        )
-        setup = f"function Get-Command {{ return [pscustomobject]@{{ Source={ps_quote(cli)} }} }}\n"
+    if download == "success":
+        fetch = f"""
+function Invoke-WebRequest($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec) {{
+    Write-Host ('GET:' + $Uri)
+    [IO.File]::Copy({ps_quote(zip_path)}, $OutFile)
+}}
+"""
+    else:
+        fetch = """
+function Invoke-WebRequest($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec) {
+    Write-Host ('GET:' + $Uri)
+    throw 'proxy refused the connection'
+}
+"""
     result = run_ps(
         tmp_path,
         sandbox,
         f"$expectedSha = '{DIGEST}'\n"
         + fake_smoke()
         + browser_scenario(zip_path)
-        + setup
+        + fetch
         + "Invoke-InklyDesktopTest -SkipLaunch",
     )
     assert result.returncode == 0, result.stderr
     assert target(sandbox).read_bytes() == SYNTHETIC
-    assert ("OPEN:" + RUN in result.stdout) == (gh_status != "success")
-    if gh_status in {"failed", "success"}:
-        args = log.read_text()
-        assert (
-            "run download 43657445804 -R thealice-lab/hpc-ink-setup -n InklyDesktop-windows"
-            in args
-        )
+    # Both paths use the same pinned public release; no sign-in is involved.
+    assert "GET:" + DOWNLOAD in result.stdout
+    assert ("OPEN:" + RELEASE in result.stdout) == (download == "failure")
+    assert not list(Path(sandbox["TEMP"]).glob("inkly-desktop-*"))
+
+
+def test_downloaded_release_with_wrong_hash_never_runs(tmp_path, sandbox):
+    zip_path = artifact(tmp_path, data=b"tampered download")
+    result = run_ps(
+        tmp_path,
+        sandbox,
+        f"$expectedSha = '{DIGEST}'\n"
+        + "function Start-Process { throw 'Must never run a process' }\n"
+        + f"""
+function Invoke-WebRequest($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec) {{
+    [IO.File]::Copy({ps_quote(zip_path)}, $OutFile)
+}}
+Invoke-InklyDesktopTest -SkipLaunch
+""",
+    )
+    assert result.returncode == 1
+    assert "SHA-256 mismatch" in result.stderr
+    assert not target(sandbox).exists()
     assert not list(Path(sandbox["TEMP"]).glob("inkly-desktop-*"))
 
 

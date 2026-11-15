@@ -17,25 +17,22 @@ Inkly is designed for command-line use in shared research environments and can b
 - an SSH-tunneled Ollama server
 - a local `ollama run` workflow
 
-## Windows Desktop: download the development test build
+## Windows Desktop: one double-click from this checkout
 
-Double-click [Get-InklyDesktop-Test.cmd](Get-InklyDesktop-Test.cmd) in this
-checkout to verify, smoke-test and launch the pinned Windows build. The EXE is
-**not inside Git**. To download it, sign into GitHub and open
-[Quality run 43657445804](https://github.com/thealice-lab/hpc-ink-setup/actions/runs/43657445804).
-At the bottom of the page, under **Artifacts**, click **InklyDesktop-windows**
-and save the ZIP in Downloads. The helper also offers this browser flow when
-neither a ZIP nor authenticated GitHub CLI is available.
+Double-click [Get-InklyDesktop-Test.cmd](Get-InklyDesktop-Test.cmd). It downloads
+[Inkly Desktop 0.3.0 (preview)](https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.3.0)
+from this repository's Releases, checks the EXE's exact SHA-256, runs a
+local-only smoke test and opens the app. No GitHub sign-in is needed, and the
+EXE is **not inside Git**.
 
-This is an **unsigned development build**, pinned to `18620b6a`, not a release
-or an automatic download of the latest `dev`. The artifact expires **2027-02-12**.
+This is an **unsigned pre-release**, built by GitHub Actions from `e131425`.
 Its EXE SHA-256 is
-`5CAE3F27B81C5EB8523932CEEDDF314E3145DD196D9F63BAEB2E30CEDD848B66`.
-Windows PowerShell 5.1, Windows OpenSSH Client and GitHub artifact read access
-are required; Python is bundled. Actual HPC use also needs the site's
-network/VPN, verified host key, authorized account and a matching Inkly HPC
-endpoint. See [Desktop download and testing instructions](docs/DESKTOP.md#download-the-pinned-development-build)
-for the versioned EXE location, troubleshooting and standalone helper use.
+`6FC66028C6C2B0335195E5C0E3967A262FEF45E11AA62E9ED49EFB23FD3C3395`.
+Windows PowerShell 5.1 and Windows OpenSSH Client are required; Python is
+bundled. Actual HPC use also needs the site's network/VPN, verified host key,
+authorized account and a matching Inkly HPC endpoint. See
+[Desktop download and testing instructions](docs/DESKTOP.md#download-and-open-inkly-desktop)
+for the install location, troubleshooting and standalone helper use.
 
 ## What Inkly Does
 
