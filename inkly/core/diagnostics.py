@@ -67,9 +67,15 @@ DESKTOP_FIELDS = {
     "desktop_job_state": {"state": DESKTOP_STATES, "job_id": int},
     "desktop_retrieval": {"job_id": int},
     "desktop_recovery": {"status": {"required", "approved", "prepared"}, "count": int},
+    "desktop_cancel": {
+        "status": {"approved", "requested", "unsupported"},
+        "count": int,
+        "job_id": int,
+    },
+    "desktop_rerun": {"status": {"approved", "prepared"}, "count": int},
     "desktop_stop": {},
     "desktop_error": {
-        "action": {"preview", "submit", "monitor", "close"},
+        "action": {"preview", "submit", "monitor", "cancel_jobs", "rerun", "close"},
         "code": {"interrupted", "permission", "io", "validation", "unexpected"},
     },
 }

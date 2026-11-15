@@ -92,7 +92,8 @@ class DesktopController:
         current = state or response.get("state", response["submission"])
         if current != item.get("_logged_state"):
             self.audit(
-                "desktop_job_state", {"state": current, **self.job_metadata(response)}
+                "desktop_job_state",
+                {"state": picker.state_name(current), **self.job_metadata(response)},
             )
             item["_logged_state"] = current
         self.emit(
@@ -106,6 +107,8 @@ class DesktopController:
                 "stages": response["stages"],
                 "script": response.get("script", ""),
                 "output": str(output) if output else "",
+                # The file was edited after this bundle was prepared.
+                "input_changed": bool(item.get("changed")),
             },
         )
 
@@ -155,6 +158,20 @@ class DesktopController:
             except bridge.MissingBundleError:
                 missing.append(item)
                 continue
+            except picker.InputChangedError as error:
+                # Show the recorded job; the edited file is never submitted
+                # under the old bundle. Run again prepares it as a new job.
+                item["response"] = error.response
+                item["changed"] = True
+                self.row(item)
+                self.emit(
+                    "message",
+                    f"{item['path'].name} was edited after it was prepared. Its recorded "
+                    "job is unchanged and will not be submitted with the edits. If that "
+                    "job was cancelled, failed or never submitted, select the row and "
+                    "choose Run again to prepare the edited file as a new job.",
+                )
+                continue
             resources = item["response"]["resources"]
             self.audit(
                 "desktop_prepared",
@@ -190,10 +207,13 @@ class DesktopController:
             "Preview complete. No jobs were submitted. Review the resources before choosing Submit prepared jobs.",
         )
 
+    @staticmethod
+    def ready(item):
+        """An unchanged, never-submitted bundle awaiting approval."""
+        return item["response"]["submission"] == "PREPARED" and not item.get("changed")
+
     def review(self):
-        ready = [
-            item for item in self.items if item["response"]["submission"] == "PREPARED"
-        ]
+        ready = [item for item in self.items if self.ready(item)]
         return {
             "id": self.review_id,
             "count": len(ready),
@@ -212,6 +232,8 @@ class DesktopController:
         # Review every file before any submit, including jobs in a mixed selection.
         for item in self.items:
             self.check_stop()
+            if item.get("changed"):
+                continue  # Shown for information only; never part of a submit.
             previous = item["response"]
             response = self.session.exchange(
                 {"action": "status"}, receipt=item["receipt"]
@@ -233,9 +255,13 @@ class DesktopController:
                     raise ValueError(
                         f"A result already exists and will not be overwritten: {output}"
                     )
-            elif response.get("state") not in picker.ACTIVE and not (
-                response.get("state") == "COMPLETED"
-                and response.get("exit_code") == "0:0"
+            elif (
+                response.get("state") not in picker.ACTIVE
+                and picker.state_name(response.get("state")) != "CANCELLED"
+                and not (
+                    response.get("state") == "COMPLETED"
+                    and response.get("exit_code") == "0:0"
+                )
             ):
                 raise ValueError(
                     f"{item['path'].name} has an unresolved job state. Inspect it before submitting more jobs."
@@ -249,17 +275,13 @@ class DesktopController:
         self.review_id = None  # Approval is consumed even if an SSH response is lost.
         self.audit(
             "desktop_approval",
-            {
-                "count": sum(
-                    item["response"]["submission"] == "PREPARED" for item in self.items
-                )
-            },
+            {"count": sum(self.ready(item) for item in self.items)},
         )
         self.emit("review", None)
         self.refresh_before_submit()
         for item in self.items:
             self.check_stop()
-            if item["response"]["submission"] == "PREPARED":
+            if self.ready(item):
                 self.audit("desktop_submission", {"status": "attempt"})
                 response = self.session.exchange(
                     {"action": "submit", "confirm": True}, receipt=item["receipt"]
@@ -300,6 +322,14 @@ class DesktopController:
                     self.audit("desktop_retrieval", self.job_metadata(item["response"]))
                     self.row(item, state="RETURNED", output=path)
                     pending.remove(item)
+                elif picker.state_name(state) == "CANCELLED":
+                    self.emit(
+                        "message",
+                        f"{item['path'].name}: job {response.get('job_id', '')} was cancelled. "
+                        "Inkly never resubmits it; select the row and choose Run again "
+                        "to submit it as a new job.",
+                    )
+                    pending.remove(item)
                 elif state not in picker.ACTIVE:
                     raise ValueError(
                         f"{item['path'].name}: {state} (exit {response.get('exit_code')}). Other jobs may continue. Keep receipts and inspect this job."
@@ -311,6 +341,147 @@ class DesktopController:
             "Check complete. Open verified returned logs in TENSOR's Analysis & 3D view. Prepared jobs remain unsubmitted.",
         )
 
+    def endpoint_supports(self, operation, receipt):
+        """Ask the HPC copy of Inkly; older copies answer "Unsupported operation"."""
+        try:
+            response = self.session.exchange({"action": "version"}, receipt=receipt)
+        except bridge.MissingBundleError:
+            raise
+        except ValueError as error:
+            if str(error) == "Unsupported operation":
+                return False
+            raise
+        return operation in response.get("capabilities", ())
+
+    def selected_items(self, selected, settings, empty_message):
+        settings = picker.validate_settings(dict(settings))
+        chosen = picker.selections(selected)
+        if not chosen:
+            raise ValueError(empty_message)
+        # "resume" requires a saved receipt for every selected file.
+        items = picker.plan(chosen, settings, "resume")
+        connection = items[0]["receipt"]
+        self.connect(connection)
+        self.emit(
+            "target", {key: connection.get(key) for key in ("host", "ink_path", "auth")}
+        )
+        for item in items:
+            self.check_stop()
+            response = self.session.exchange(
+                {"action": "status"}, receipt=item["receipt"]
+            )
+            if response["name"] != item["path"].name:
+                raise ValueError("The receipt belongs to a different input filename")
+            item["response"] = response
+            digest = hashlib.sha256(item["path"].read_bytes()).hexdigest()
+            item["changed"] = digest != response["sha256"]
+            self.row(item)
+        return settings, items, connection
+
+    def sync_items(self, items):
+        """Keep the last preview's items in step with rows changed elsewhere."""
+        by_path = {item["path"]: item for item in items}
+        for item in self.items:
+            update = by_path.get(item["path"])
+            if update is not None:
+                item.update(
+                    receipt=update["receipt"],
+                    response=update["response"],
+                    changed=update.get("changed", False),
+                )
+
+    def cancel_jobs(self, selected, settings):
+        """Cancel selected jobs that Slurm still reports as PENDING. Never submits."""
+        self.check_stop()
+        _, items, connection = self.selected_items(
+            selected, settings, "Select the PENDING rows to cancel first."
+        )
+        for item in items:
+            response = item["response"]
+            state = picker.state_name(response.get("state", response["submission"]))
+            if state != "PENDING" or not response.get("job_id"):
+                raise ValueError(
+                    f"{item['path'].name} is {state}, not PENDING, so nothing was "
+                    "cancelled. Only jobs that have not started can be cancelled here."
+                )
+        jobs = " ".join(item["response"]["job_id"] for item in items)
+        if not self.endpoint_supports("cancel", connection):
+            self.audit("desktop_cancel", {"status": "unsupported", "count": len(items)})
+            raise ValueError(
+                f"The Inkly copy on the HPC ({connection['ink_path']}) is too old to "
+                "cancel jobs, so nothing was cancelled. Update that copy, or cancel "
+                f"on the HPC yourself with: scancel {jobs}"
+            )
+        self.audit("desktop_cancel", {"status": "approved", "count": len(items)})
+        for item in items:
+            self.check_stop()
+            response = self.session.exchange(
+                {"action": "cancel", "confirm": True}, receipt=item["receipt"]
+            )
+            item["response"].update(response)
+            self.audit(
+                "desktop_cancel",
+                {"status": "requested", **self.job_metadata(item["response"])},
+            )
+            self.row(item)
+            state = picker.state_name(response.get("state"))
+            name, job = item["path"].name, item["response"]["job_id"]
+            self.emit(
+                "message",
+                f"Cancelled {name}: job {job} is {state}."
+                if state == "CANCELLED"
+                else f"Cancellation requested for {name}: job {job} still shows {state}. "
+                "Check again in a minute.",
+            )
+        self.sync_items(items)
+        self.emit(
+            "message",
+            "Inkly never resubmits cancelled jobs. To run a file again, select it and "
+            "choose Run again.",
+        )
+
+    def rerun(self, selected, paths, settings):
+        """Prepare selected ended or unsubmitted files as new jobs; never submits."""
+        self.check_stop()
+        self.review_id = None
+        self.emit("review", None)
+        settings, items, _ = self.selected_items(
+            selected, settings, "Select the rows to run again first."
+        )
+        # Check every selected file before changing any receipt.
+        for item in items:
+            response = item["response"]
+            state = picker.state_name(response.get("state", response["submission"]))
+            if state not in picker.RERUNNABLE:
+                advice = (
+                    "Cancel it first, or wait for it to finish."
+                    if state in picker.ACTIVE or state == "SUBMITTED"
+                    else "Its result is kept; copy the input to a new file name to run it again."
+                    if state in {"COMPLETED", "RETURNED"}
+                    else "Check your Slurm jobs first; it may still be running."
+                )
+                raise ValueError(
+                    f"{item['path'].name} is {state}, so it was not prepared again. "
+                    + advice
+                )
+            output = item["output"] / item["path"].with_suffix(".log").name
+            if output.exists():
+                raise ValueError(
+                    f"A returned log already exists and will not be overwritten: {output}"
+                )
+        self.audit("desktop_rerun", {"status": "approved", "count": len(items)})
+        for item in items:
+            self.check_stop()
+            picker.prepare_again(
+                self.session,
+                item,
+                settings,
+                report=lambda value: self.emit("message", value),
+            )
+            self.audit("desktop_rerun", {"status": "prepared", "count": 1})
+        # Re-read the whole list so the rows and the approval cover every file.
+        self.preview(paths, settings)
+
     def execute(self, action, *args):
         try:
             if action == "preview":
@@ -319,6 +490,10 @@ class DesktopController:
                 self.submit(*args)
             elif action == "monitor":
                 self.monitor()
+            elif action == "cancel_jobs":
+                self.cancel_jobs(*args)
+            elif action == "rerun":
+                self.rerun(*args)
             elif action == "close":
                 # Record SSH closure while the journal can still accept events;
                 # final metadata is handed off by the existing session close.

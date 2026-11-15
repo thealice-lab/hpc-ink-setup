@@ -38,10 +38,8 @@ UNCONFIRMED = {"SUBMISSION_UNKNOWN", "UNKNOWN"}
 FINISHED = {"COMPLETED", "RETURNED"}
 
 
-def state_name(value):
-    """Group scheduler detail such as "CANCELLED by 1234" under its state."""
-    words = str(value or "").split()
-    return words[0].upper() if words else "UNKNOWN"
+# Group scheduler detail such as "CANCELLED by 1234" under its state.
+state_name = picker.state_name
 
 
 def state_counts(rows):
@@ -123,7 +121,12 @@ def overview_text(review, rows, unconfirmed=(), submitting=False):
         )
     if "COMPLETED" in states:
         notes.append("COMPLETED logs return after verification.")
-    if states - ON_HPC - UNCONFIRMED - FINISHED - {"PREPARED"}:
+    if "CANCELLED" in states:
+        notes.append(
+            "CANCELLED jobs will not run; to submit one again, select it and choose "
+            "Run again."
+        )
+    if states - ON_HPC - UNCONFIRMED - FINISHED - {"PREPARED", "CANCELLED"}:
         notes.append("Ended jobs need inspection; Inkly never resubmits them.")
     if "RETURNED" in states:
         notes.append("RETURNED logs are verified; use Open results folder.")
