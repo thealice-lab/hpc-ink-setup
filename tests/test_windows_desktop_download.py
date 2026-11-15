@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts/windows/get_inklydesktop_test.ps1"
 SYNTHETIC = b"synthetic fixture, never executed"
 DIGEST = hashlib.sha256(SYNTHETIC).hexdigest()
-BUILD = "Inkly/DesktopBuilds/f5c9b926"
-RUN = "https://github.com/thealice-lab/hpc-ink-setup/actions/runs/43600766207"
+BUILD = "Inkly/DesktopBuilds/18620b6a"
+RUN = "https://github.com/thealice-lab/hpc-ink-setup/actions/runs/43657445804"
 
 
 def ps_quote(value):
@@ -239,7 +239,7 @@ def test_browser_and_cli_always_use_pinned_run(tmp_path, sandbox, gh_status):
     if gh_status in {"failed", "success"}:
         args = log.read_text()
         assert (
-            "run download 43600766207 -R thealice-lab/hpc-ink-setup -n InklyDesktop-windows"
+            "run download 43657445804 -R thealice-lab/hpc-ink-setup -n InklyDesktop-windows"
             in args
         )
     assert not list(Path(sandbox["TEMP"]).glob("inkly-desktop-*"))

@@ -13,8 +13,8 @@ automatic updates are not part of this change.
 ## Download the pinned development build
 
 The EXE is **not committed to Git**. This helper pins the reviewed development
-build from [Quality run 43600766207](https://github.com/thealice-lab/hpc-ink-setup/actions/runs/43600766207),
-source commit `f5c9b92635e5a3749f3924569af0dbe97be29e05`. It never silently
+build from [Quality run 43657445804](https://github.com/thealice-lab/hpc-ink-setup/actions/runs/43657445804),
+source commit `18620b6a642083e81606c6e3ca4a2d1e1461fbff`. It never silently
 selects a newer `dev` build. This unsigned artifact expires **2027-02-12**;
 if it is expired or inaccessible, ask the maintainer for a reviewed replacement.
 Do not substitute another EXE or bypass a hash failure.
@@ -32,7 +32,7 @@ Do not substitute another EXE or bypass a hash failure.
    The helper never collects credentials. Browser-download and authenticated
    CLI failures do not cause it to choose another build.
 3. The helper extracts only `InklyDesktop.exe`, verifies its SHA-256, and places
-   it at `%LOCALAPPDATA%\Inkly\DesktopBuilds\f5c9b926\InklyDesktop.exe`.
+   it at `%LOCALAPPDATA%\Inkly\DesktopBuilds\18620b6a\InklyDesktop.exe`.
    This is separate from the checkout and other builds. It preserves existing
    settings and refuses to replace an unverified EXE already at that path.
 4. It runs a fresh **local-only** smoke test of the real window, bundled sign-in
@@ -46,7 +46,7 @@ The ZIP contains `InklyDesktop.exe` and CI's `smoke-test.json`. The helper check
 the **EXE**, not the ZIP, against this exact SHA-256 from the pinned Windows CI:
 
 ```text
-C178EFF40C323FB34A2AF7DD3523018554F8CBEADCED67CCADEA0F67F21DC76B
+5CAE3F27B81C5EB8523932CEEDDF314E3145DD196D9F63BAEB2E30CEDD848B66
 ```
 
 For standalone use without a clone, download both `Get-InklyDesktop-Test.cmd`
@@ -64,7 +64,13 @@ left untouched for review. If OpenSSH is missing, enable **OpenSSH Client** in
 Windows Optional Features according to your institution's policy and retry.
 Do not override Windows security warnings for an unverified source. A guessed
 path or a PowerShell variable does not download an EXE: use the helper's printed
-verified path after it reports success.
+verified path after it reports success. Opening `InklyDesktop.exe` straight from
+a downloaded ZIP can show a Windows SmartScreen warning because development
+builds are unsigned; the helper checks the EXE's exact SHA-256 before running it.
+
+Maintainers: when a newer build is reviewed, update the helper's run ID, source
+commit and EXE SHA-256 together (from that run's Windows build log), along with
+this page, the README and `tests/test_windows_desktop_download.py`.
 
 Actions artifacts are temporary development downloads. Long-term distribution
 belongs in a separate, versioned GitHub Release with a ZIP, checksum, release

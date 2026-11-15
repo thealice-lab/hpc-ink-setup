@@ -8,12 +8,12 @@ param(
 )
 
 $repo = 'thealice-lab/hpc-ink-setup'
-$runId = '43600766207'
+$runId = '43657445804'
 $artifactName = 'InklyDesktop-windows'
 $runUrl = "https://github.com/$repo/actions/runs/$runId"
-$sourceCommit = 'f5c9b92635e5a3749f3924569af0dbe97be29e05'
+$sourceCommit = '18620b6a642083e81606c6e3ca4a2d1e1461fbff'
 $build = $sourceCommit.Substring(0, 8)
-$expectedSha = 'C178EFF40C323FB34A2AF7DD3523018554F8CBEADCED67CCADEA0F67F21DC76B'
+$expectedSha = '5CAE3F27B81C5EB8523932CEEDDF314E3145DD196D9F63BAEB2E30CEDD848B66'
 
 function Assert-InklyExeHash([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
