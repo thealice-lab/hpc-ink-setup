@@ -1,0 +1,150 @@
+name: Release Desktop
+
+# A maintainer pushes a tag such as desktop-v0.3.0 on a reviewed dev or main
+# commit. This workflow tests and builds that exact commit on Windows, checks
+# the packaged window, and publishes a pre-release with the ZIP, its SHA-256
+# sums and a signed build-provenance attestation. Promote a pre-release to a
+# full release in the GitHub web page after acceptance testing.
+# Pull requests that change this file run the same steps as a dry run that
+# publishes nothing.
+
+on:
+  push:
+    tags: ["desktop-v*"]
+  pull_request:
+    paths: [".github/workflows/release-desktop.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PUBLISH: ${{ github.event_name == 'push' }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check tag, source commit and version
+        shell: pwsh
+        run: |
+          # Expected non-zero exits (merge-base, release lookup) must not end the step.
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ($env:PUBLISH -eq 'true') {
+              if ($env:GITHUB_REF -notmatch '^refs/tags/desktop-v(\d+\.\d+\.\d+)$') {
+                  throw "Release tags must look like desktop-v0.3.0 (got $env:GITHUB_REF)."
+              }
+              $version = $Matches[1]
+              # Only reviewed history may be released.
+              git merge-base --is-ancestor $env:GITHUB_SHA origin/dev
+              $onDev = $LASTEXITCODE -eq 0
+              git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+              $onMain = $LASTEXITCODE -eq 0
+              if (-not ($onDev -or $onMain)) { throw 'The tagged commit is not on dev or main.' }
+              $package = (Select-String -Path inkly/__init__.py -Pattern '__version__ = "([^"]+)"').Matches[0].Groups[1].Value
+              if ($package -ne $version) { throw "Tag version $version does not match inkly/__init__.py ($package)." }
+              gh release view "desktop-v$version" *> $null
+              if ($LASTEXITCODE -eq 0) { throw "Release desktop-v$version already exists; it is never replaced." }
+          } else {
+              $version = '0.0.0-dry-run'
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          Write-Output "Version: $version (publish: $env:PUBLISH)"
+          $global:LASTEXITCODE = 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build and test tools
+        run: python -m pip install -r scripts/windows/requirements-build.txt pytest==8.4.2
+
+      - name: Test Windows handoff and native GUI
+        run: python -m pytest -q tests/test_desktop_diagnostics.py tests/test_desktop_safety_regressions.py tests/test_tensor_bridge.py tests/test_tensor_picker.py tests/test_tensor_desktop.py tests/test_windows_tensor_launcher.py tests/test_windows_desktop_download.py
+
+      - name: Build desktop application
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows/build_desktop.ps1 -Python (Get-Command python).Source
+
+      - name: Verify packaged application without connecting
+        shell: python
+        run: |
+          import json, pathlib, subprocess
+          output = pathlib.Path('dist/smoke-test.json').resolve()
+          subprocess.run(['dist/InklyDesktop.exe', '--smoke-test', str(output)], check=True, timeout=60)
+          result = json.loads(output.read_text())
+          assert result['frozen'] and result['askpass'] and result['ssh'], result
+          assert result['window'] == 'Inkly Desktop' and result['width'] >= 940, result
+          assert result['contact'] == 'Questions or issues? Contact: rrv9177@uncw.edu', result
+          assert result['contact_visible'] and result['controls_visible'], result
+
+      - name: Package ZIP, SHA-256 sums and release notes
+        shell: pwsh
+        run: |
+          $version = $env:VERSION
+          $zipName = "InklyDesktop-$version-windows.zip"
+          New-Item -ItemType Directory -Path release | Out-Null
+          # The download helper expects exactly one InklyDesktop.exe at the ZIP root.
+          Compress-Archive -Path dist/InklyDesktop.exe -DestinationPath "release/$zipName"
+          $exeSha = (Get-FileHash -Algorithm SHA256 dist/InklyDesktop.exe).Hash
+          $zipSha = (Get-FileHash -Algorithm SHA256 "release/$zipName").Hash
+          Set-Content -Path release/SHA256SUMS.txt -Encoding ascii -Value @(
+              "$exeSha  InklyDesktop.exe",
+              "$zipSha  $zipName"
+          )
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $notes = @"
+          Inkly Desktop $version for Windows, built by GitHub Actions from commit $short.
+
+          **Pre-release for testing.** It needs Windows OpenSSH Client, the UNCW network or VPN, your own Cuttlefish account and a matching Inkly endpoint on the HPC.
+
+          ### Run it
+          From an up-to-date checkout of this repository, double-click ``Get-InklyDesktop-Test.cmd``. It checks the EXE's SHA-256 before running it.
+
+          ### Verify
+          - InklyDesktop.exe SHA-256: ``$exeSha``
+          - $zipName SHA-256: ``$zipSha``
+          - Build provenance: ``gh attestation verify InklyDesktop.exe --repo $env:GITHUB_REPOSITORY``
+
+          The EXE is not Authenticode-signed yet, so opening it straight from a downloaded ZIP can show a Windows SmartScreen warning.
+
+          Questions or issues? Contact: rrv9177@uncw.edu
+          "@
+          Set-Content -Path release/notes.md -Encoding utf8 -Value $notes
+          Get-Content release/SHA256SUMS.txt
+
+      - name: Attest build provenance
+        if: env.PUBLISH == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/InklyDesktop.exe
+            release/InklyDesktop-*-windows.zip
+
+      - name: Publish pre-release
+        if: env.PUBLISH == 'true'
+        shell: pwsh
+        run: |
+          $tag = "desktop-v$env:VERSION"
+          gh release create $tag "release/InklyDesktop-$env:VERSION-windows.zip" release/SHA256SUMS.txt `
+              --verify-tag --prerelease --title "Inkly Desktop $env:VERSION (preview)" --notes-file release/notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release creation failed.' }
+
+      - name: Keep dry-run files for review
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: InklyDesktop-release-dry-run
+          path: release/

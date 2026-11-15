@@ -72,11 +72,9 @@ Maintainers: when a newer build is reviewed, update the helper's run ID, source
 commit and EXE SHA-256 together (from that run's Windows build log), along with
 this page, the README and `tests/test_windows_desktop_download.py`.
 
-Actions artifacts are temporary development downloads. Long-term distribution
-belongs in a separate, versioned GitHub Release with a ZIP, checksum, release
-notes and prerequisites, after researcher acceptance and matching HPC endpoint
-testing. Do not commit ZIP/EXE binaries or treat this helper as a stable release
-or an HPC deployment tool.
+Actions artifacts are temporary development downloads. Versioned builds are
+published as GitHub Releases (see **Publish a release** below). Do not commit
+ZIP/EXE binaries or treat this helper as an HPC deployment tool.
 
 ## First calculation
 
@@ -197,6 +195,28 @@ also produces the generic dialog under `build/` for source development.
 
 Packaging follows the official [PyInstaller Windows application guidance](https://pyinstaller.org/en/stable/usage.html)
 and [windowed subprocess requirements](https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html).
+
+## Publish a release (maintainers)
+
+Releases are built by GitHub, never on a personal computer. Set
+`__version__` in `inkly/__init__.py` (for example `0.3.0`), merge it, then
+create the tag `desktop-v0.3.0` on that reviewed `dev` or `main` commit. The
+**Release Desktop** workflow (`.github/workflows/release-desktop.yml`) then:
+
+1. refuses tags that are not `desktop-vX.Y.Z`, commits that are not on `dev` or
+   `main`, a version that differs from `inkly/__init__.py`, or a release that
+   already exists (releases are never replaced);
+2. runs the Windows tests, builds the EXE and checks the packaged window;
+3. publishes a **pre-release** with `InklyDesktop-<version>-windows.zip`,
+   `SHA256SUMS.txt`, release notes and a signed build-provenance attestation.
+   Anyone can check the attestation with
+   `gh attestation verify InklyDesktop.exe --repo thealice-lab/hpc-ink-setup`.
+
+Every release starts as a pre-release. After researcher acceptance and a matching
+HPC endpoint check, mark it as a full release on the GitHub release page. The EXE
+is not Authenticode-signed; removing the SmartScreen warning needs a
+code-signing certificate (for example through UNCW IT). A pull request that
+changes the workflow runs the same steps as a dry run and publishes nothing.
 
 ## Desktop diagnostic events (development build)
 
