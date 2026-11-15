@@ -1,6 +1,7 @@
 """Desktop confirmation, cancellation, recovery and native Tk tests. No network."""
 
 import base64
+import gc
 import hashlib
 import importlib.util
 import json
@@ -11,6 +12,24 @@ from types import SimpleNamespace
 import warnings
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def collect_garbage_on_main_thread():
+    """Free each test's Tk windows on the main thread.
+
+    Tcl aborts the process if a background thread (worker or diagnostics)
+    frees a Tk object, and Python's cyclic collector runs on whichever thread
+    triggers it. Closed test windows sit in reference cycles, so every test
+    runs with automatic collection off and ends with a collection here.
+    """
+    enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    yield
+    gc.collect()
+    if enabled:
+        gc.enable()
 
 
 scripts = Path(__file__).resolve().parents[1] / "scripts"
