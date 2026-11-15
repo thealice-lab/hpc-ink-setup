@@ -683,6 +683,17 @@ def test_stop_watching_drops_cancel_requests_not_yet_handled(workflow):
     assert record_for(w, w.paths[0])["state"] == "PENDING"
 
 
+def test_failed_action_drops_cancel_requests_not_yet_handled(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    w.controller.request_cancel([w.paths[0]], SETTINGS)
+    w.controller.execute("submit", "wrong-review", True)  # Fails before watching.
+    assert any(kind == "error" for kind, _ in w.events)
+    assert w.controller.requests.empty()
+    assert record_for(w, w.paths[0])["state"] == "PENDING"
+
+
 def test_watch_cancel_for_another_connection_keeps_watching(workflow):
     w = workflow
     w.controller.preview(w.paths, SETTINGS)

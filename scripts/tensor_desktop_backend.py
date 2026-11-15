@@ -52,12 +52,7 @@ class DesktopController:
         self.audit("desktop_stop")
         self.cancelled.set()
         self.wake.set()
-        # Requests not yet handled are dropped; the rows show what happened.
-        while True:
-            try:
-                self.requests.get_nowait()
-            except queue.Empty:
-                break
+        self.drop_requests()
         # Closing SSH never issues scancel. Persisted receipts recover uncertain calls.
         process = getattr(self.session, "process", None)
         if process is not None:
@@ -65,6 +60,14 @@ class DesktopController:
                 process.terminate()
             except OSError:
                 pass
+
+    def drop_requests(self):
+        """Forget cancel requests the watch has not handled; rows show what happened."""
+        while True:
+            try:
+                self.requests.get_nowait()
+            except queue.Empty:
+                return
 
     def check_stop(self):
         if self.cancelled.is_set():
@@ -649,6 +652,7 @@ class DesktopController:
             self.audit("desktop_error", {"action": action, "code": code})
             self.review_id = None
             self.emit("review", None)
+            self.drop_requests()  # Never run a stale cancel during a later check.
             self.close()
             self.emit(
                 "error",
