@@ -471,6 +471,10 @@ class DesktopApp:
             self.unconfirmed,
             submitting=self.busy and self.action == "submit",
         )
+        waiting = sum(str(path) not in self.rows for path in self.files)
+        if waiting:
+            note = f"{waiting} file(s) not previewed yet: choose Preview files to check them."
+            text = f"{text}\n{note}" if text else note
         if text:
             self.overview.configure(text=text)
 
@@ -726,6 +730,18 @@ class DesktopApp:
         self.count.configure(text=f"{len(self.files)} file(s)")
         self.buttons()
 
+    def list_changed(self):
+        """The file list changed: keep each existing row as last shown, drop rows
+        for removed files, and require a new preview before any submission."""
+        self.review = None
+        self.rows = {
+            key: row for key, row in self.rows.items() if Path(key) in self.files
+        }
+        self.unconfirmed &= set(self.rows)
+        self.count.configure(text=f"{len(self.files)} file(s)")
+        self.refresh_overview()
+        self.buttons()
+
     def add_paths(self, paths):
         try:
             new = picker.selections(paths)
@@ -741,7 +757,7 @@ class DesktopApp:
                     iid=str(path),
                     values=(path.name, "—", "—", "—", "—", "—", "Not previewed", ""),
                 )
-        self.invalidate()
+        self.list_changed()
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
@@ -775,13 +791,13 @@ class DesktopApp:
         for path in self.table.selection():
             self.files.remove(Path(path))
             self.table.delete(path)
-        self.invalidate()
+        self.list_changed()
 
     def clear(self):
         for path in self.table.get_children():
             self.table.delete(path)
         self.files.clear()
-        self.invalidate()
+        self.list_changed()
 
     def configure(self):
         dialog = tk.Toplevel(self.root)

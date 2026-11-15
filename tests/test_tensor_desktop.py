@@ -922,9 +922,21 @@ def test_native_window_add_remove_preview_and_confirmation(
         assert scheduled == [("submit", w.controller.review_id, True)]
         app.table.selection_set(str(w.paths[0]))
         app.remove_button.invoke()
+        # The list changed, so approval is gone; the remaining row keeps its details.
         assert len(app.files) == 1 and app.review is None
         assert str(app.submit_button["state"]) == "disabled"
-        assert app.table.item(str(w.paths[1]))["values"][6] == "Not previewed"
+        kept = app.table.item(str(w.paths[1]))["values"]
+        assert kept[6] == "PREPARED" and kept[1] != "—"
+        assert str(w.paths[0]) not in app.rows
+
+        # Adding a file keeps the rows already shown and asks for a preview.
+        extra = w.paths[0].parent / "sample_3.gjf"
+        extra.write_bytes(w.paths[0].read_bytes())
+        app.add_paths([extra])
+        assert app.table.item(str(w.paths[1]))["values"] == kept
+        assert app.table.item(str(extra))["values"][6] == "Not previewed"
+        assert "1 file(s) not previewed yet" in app.overview["text"]
+        assert str(app.submit_button["state"]) == "disabled"
     finally:
         app.close()
 
