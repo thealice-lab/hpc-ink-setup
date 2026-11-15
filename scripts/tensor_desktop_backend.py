@@ -3,6 +3,7 @@
 from contextlib import ExitStack
 from copy import deepcopy
 import hashlib
+import queue
 import shutil
 import threading
 import uuid
@@ -25,6 +26,13 @@ class DesktopController:
         self.review_id = None
         self.journal = journal if journal is not None else DesktopJournal()
         self.connection_verified = False
+        # Jobs cancelled through Inkly in this window; monitoring then skips
+        # repeating the cancellation message.
+        self.cancelled_paths = set()
+        # Cancel requests made while monitoring are handled by the monitor loop
+        # on its own SSH session; `wake` ends its wait between checks early.
+        self.requests = queue.Queue()
+        self.wake = threading.Event()
 
     def audit(self, event_type, payload=None):
         try:
@@ -43,6 +51,8 @@ class DesktopController:
     def stop(self):
         self.audit("desktop_stop")
         self.cancelled.set()
+        self.wake.set()
+        self.drop_requests()
         # Closing SSH never issues scancel. Persisted receipts recover uncertain calls.
         process = getattr(self.session, "process", None)
         if process is not None:
@@ -50,6 +60,14 @@ class DesktopController:
                 process.terminate()
             except OSError:
                 pass
+
+    def drop_requests(self):
+        """Forget cancel requests the watch has not handled; rows show what happened."""
+        while True:
+            try:
+                self.requests.get_nowait()
+            except queue.Empty:
+                return
 
     def check_stop(self):
         if self.cancelled.is_set():
@@ -298,11 +316,57 @@ class DesktopController:
                 )
         self.monitor()
 
+    def request_cancel(self, selected, settings):
+        """Called from the window thread while monitoring: cancel these rows next.
+
+        The monitor loop handles the request on its open SSH session, so no new
+        sign-in is needed, then keeps watching.
+        """
+        self.requests.put((list(selected), dict(settings)))
+        self.wake.set()
+
+    def handle_requests(self):
+        while True:
+            try:
+                selected, settings = self.requests.get_nowait()
+            except queue.Empty:
+                return
+            if not self.session:
+                self.emit("notice", "Desktop is not connected; nothing was cancelled.")
+                continue
+            target = None
+            try:
+                items = picker.plan(
+                    picker.selections(selected),
+                    picker.validate_settings(dict(settings)),
+                    "resume",
+                )
+                target = tuple(
+                    items[0]["receipt"].get(k) for k in ("host", "ink_path", "auth")
+                )
+            except ValueError as error:
+                self.emit("notice", f"Nothing was cancelled: {error}")
+                continue
+            if target != self.target:
+                # Switching connections would end the watch; do it separately.
+                self.emit(
+                    "notice",
+                    "Those rows use a different HPC connection from the jobs being "
+                    "watched, so nothing was cancelled. Stop watching first, then "
+                    "cancel them.",
+                )
+                continue
+            try:
+                self.cancel_jobs(selected, settings)
+            except bridge.MissingBundleError as error:
+                self.emit("notice", f"Nothing was cancelled: {error}")
+
     def monitor(self):
         if not self.session or not self.items:
             raise ValueError("Preview the files first to load their saved handoffs.")
         pending = list(self.items)
-        while pending:
+        while True:
+            self.handle_requests()
             for item in list(pending):
                 self.check_stop()
                 response = self.session.exchange(
@@ -323,19 +387,25 @@ class DesktopController:
                     self.row(item, state="RETURNED", output=path)
                     pending.remove(item)
                 elif picker.state_name(state) == "CANCELLED":
-                    self.emit(
-                        "message",
-                        f"{item['path'].name}: job {response.get('job_id', '')} was cancelled. "
-                        "Inkly never resubmits it; select the row and choose Run again "
-                        "to submit it as a new job.",
-                    )
+                    if item["path"] not in self.cancelled_paths:
+                        self.emit(
+                            "message",
+                            f"{item['path'].name}: job {response.get('job_id', '')} was cancelled. "
+                            "Inkly never resubmits it; select the row and choose Run again "
+                            "to submit it as a new job.",
+                        )
                     pending.remove(item)
                 elif state not in picker.ACTIVE:
                     raise ValueError(
                         f"{item['path'].name}: {state} (exit {response.get('exit_code')}). Other jobs may continue. Keep receipts and inspect this job."
                     )
-            if pending and self.cancelled.wait(self.interval):
-                self.check_stop()
+            if not pending:
+                break
+            # Wait for the next check; Stop watching or a cancel request wakes early.
+            self.wake.wait(self.interval)
+            self.wake.clear()
+            self.check_stop()
+        self.handle_requests()  # A request that arrived during the last check.
         self.emit(
             "message",
             "Check complete. Open verified returned logs in TENSOR's Analysis & 3D view. Prepared jobs remain unsubmitted.",
@@ -390,34 +460,84 @@ class DesktopController:
                     changed=update.get("changed", False),
                 )
 
+    @staticmethod
+    def not_cancellable(item, state):
+        """Plain explanation for a selected job that is no longer waiting."""
+        name, job = item["path"].name, item["response"].get("job_id")
+        if state == "PREPARED" and not job:
+            return f"{name} was never submitted, so there is nothing to cancel."
+        if not job or state in {"SUBMISSION_UNKNOWN", "UNKNOWN"}:
+            return (
+                f"{name}: Inkly cannot confirm a Slurm job for it ({state}), so nothing "
+                "was cancelled. Check your jobs on the HPC before trying again."
+            )
+        if state == "COMPLETED":
+            return (
+                f"{name}: job {job} already completed, so there was nothing to cancel. "
+                "Check & return results brings back its log."
+            )
+        if state == "CANCELLED":
+            return f"{name}: job {job} was already cancelled."
+        if state in picker.ACTIVE:
+            return (
+                f"{name}: job {job} has already started ({state}). Only jobs that are "
+                "still waiting can be cancelled, so it keeps running."
+            )
+        return f"{name}: job {job} already ended ({state}), so there was nothing to cancel."
+
     def cancel_jobs(self, selected, settings):
-        """Cancel selected jobs that Slurm still reports as PENDING. Never submits."""
+        """Cancel the selected jobs that Slurm still reports as PENDING. Never submits.
+
+        Each selected job is checked on the HPC first. Jobs that already started,
+        finished or were never submitted are explained in a notice rather than
+        treated as errors, and the connection stays open.
+        """
         self.check_stop()
         _, items, connection = self.selected_items(
             selected, settings, "Select the PENDING rows to cancel first."
         )
+        notes, waiting = [], []
         for item in items:
             response = item["response"]
             state = picker.state_name(response.get("state", response["submission"]))
-            if state != "PENDING" or not response.get("job_id"):
-                raise ValueError(
-                    f"{item['path'].name} is {state}, not PENDING, so nothing was "
-                    "cancelled. Only jobs that have not started can be cancelled here."
-                )
-        jobs = " ".join(item["response"]["job_id"] for item in items)
-        if not self.endpoint_supports("cancel", connection):
-            self.audit("desktop_cancel", {"status": "unsupported", "count": len(items)})
-            raise ValueError(
+            if state == "PENDING" and response.get("job_id"):
+                waiting.append(item)
+            else:
+                notes.append(self.not_cancellable(item, state))
+        if waiting and not self.endpoint_supports("cancel", connection):
+            self.audit(
+                "desktop_cancel", {"status": "unsupported", "count": len(waiting)}
+            )
+            jobs = " ".join(item["response"]["job_id"] for item in waiting)
+            notes.append(
                 f"The Inkly copy on the HPC ({connection['ink_path']}) is too old to "
                 "cancel jobs, so nothing was cancelled. Update that copy, or cancel "
                 f"on the HPC yourself with: scancel {jobs}"
             )
-        self.audit("desktop_cancel", {"status": "approved", "count": len(items)})
-        for item in items:
+            waiting = []
+        if waiting:
+            self.audit("desktop_cancel", {"status": "approved", "count": len(waiting)})
+        cancelled = 0
+        for item in waiting:
             self.check_stop()
-            response = self.session.exchange(
-                {"action": "cancel", "confirm": True}, receipt=item["receipt"]
-            )
+            name, job = item["path"].name, item["response"]["job_id"]
+            try:
+                response = self.session.exchange(
+                    {"action": "cancel", "confirm": True}, receipt=item["receipt"]
+                )
+            except ValueError as error:
+                if not str(error).startswith("Only PENDING jobs can be cancelled"):
+                    raise
+                # It started between the check and the request.
+                response = self.session.exchange(
+                    {"action": "status"}, receipt=item["receipt"]
+                )
+                item["response"].update(response)
+                self.row(item)
+                notes.append(
+                    self.not_cancellable(item, picker.state_name(response.get("state")))
+                )
+                continue
             item["response"].update(response)
             self.audit(
                 "desktop_cancel",
@@ -425,20 +545,31 @@ class DesktopController:
             )
             self.row(item)
             state = picker.state_name(response.get("state"))
-            name, job = item["path"].name, item["response"]["job_id"]
+            if state == "CANCELLED":
+                cancelled += 1
+                self.cancelled_paths.add(item["path"])
+                self.emit("message", f"Cancelled {name}: job {job} is CANCELLED.")
+            elif state == "PENDING":
+                self.cancelled_paths.add(item["path"])
+                self.emit(
+                    "message",
+                    f"Cancellation requested for {name}: job {job} still shows PENDING. "
+                    "Check again in a minute.",
+                )
+            else:
+                # Slurm started it first; scancel --state=PENDING left it running.
+                notes.append(self.not_cancellable(item, state))
+        self.sync_items(items)
+        if cancelled:
             self.emit(
                 "message",
-                f"Cancelled {name}: job {job} is {state}."
-                if state == "CANCELLED"
-                else f"Cancellation requested for {name}: job {job} still shows {state}. "
-                "Check again in a minute.",
+                "Inkly never resubmits cancelled jobs. To run a file again, select it "
+                "and choose Run again.",
             )
-        self.sync_items(items)
-        self.emit(
-            "message",
-            "Inkly never resubmits cancelled jobs. To run a file again, select it and "
-            "choose Run again.",
-        )
+        for note in notes:
+            self.emit("message", note)
+        if notes:
+            self.emit("notice", "\n\n".join(notes))
 
     def rerun(self, selected, paths, settings):
         """Prepare selected ended or unsubmitted files as new jobs; never submits."""
@@ -521,6 +652,7 @@ class DesktopController:
             self.audit("desktop_error", {"action": action, "code": code})
             self.review_id = None
             self.emit("review", None)
+            self.drop_requests()  # Never run a stale cancel during a later check.
             self.close()
             self.emit(
                 "error",

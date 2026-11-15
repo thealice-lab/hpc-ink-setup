@@ -128,18 +128,26 @@ buttons use the whole list. Select rows with a click (Ctrl or Shift for
 several). Each asks for confirmation first, and the confirmation defaults to
 No.
 
-**Cancel job** is available when every selected row is **PENDING** (waiting in
-the Slurm queue). Desktop reads each job's current state on the HPC and stops
-before cancelling anything if one of them is no longer PENDING. It then
-cancels only jobs that are still waiting (`scancel --state=PENDING`), so a job
-that started in the meantime keeps running. The row then shows **CANCELLED**.
-Your input files and receipts are not changed, and a cancelled job is never
-resubmitted. **Check & return results** treats CANCELLED rows as finished and
-keeps watching the others.
+**Cancel job** is available when every selected row shows **PENDING** (waiting
+in the Slurm queue), both while Desktop is watching jobs and when it is idle.
+While watching, the cancel happens on the connection that is already open, so
+there is no new sign-in and watching continues. When idle, Desktop reuses its
+connection if it is still open, or signs in again if it is not.
+
+Desktop reads each selected job's current state on the HPC first and cancels
+only jobs that are still waiting (`scancel --state=PENDING`), so a job that
+started in the meantime keeps running. A cancelled row shows **CANCELLED**.
+For any other selected job, Desktop shows a short notice instead of an error
+and keeps the connection open. For example, "job 2406955 already completed,
+so there was nothing to cancel", or that a job has already started, was
+already cancelled, already ended or was never submitted. Your input files and
+receipts are not changed, and a cancelled job is never resubmitted. **Check &
+return results** treats CANCELLED rows as finished and keeps watching the
+others.
 
 Cancelling needs a copy of Inkly on the HPC that supports it. If a job's saved
-handoff uses an older copy, Desktop says so and cancels nothing; the message
-includes the `scancel` command you can run on the HPC yourself.
+handoff uses an older copy, Desktop says so in a notice and cancels nothing;
+the notice includes the `scancel` command you can run on the HPC yourself.
 
 **Run again** prepares a selected file as a **new** job. It is available for
 rows that are **CANCELLED**, **FAILED**, **TIMEOUT**, **OUT_OF_MEMORY**,

@@ -384,6 +384,10 @@ class DesktopApp:
                 self.log(
                     f"Using {data['host']} with {data['ink_path']}. Saved handoffs retain their original connection and settings."
                 )
+            elif kind == "notice":
+                # Expected outcomes (for example a job that already completed),
+                # not failures; the connection stays open.
+                messagebox.showinfo("Cancel job", data, parent=self.root)
             elif kind == "error":
                 self.review = None
                 if self.action == "submit":
@@ -588,7 +592,9 @@ class DesktopApp:
         )
         self.stop_button.configure(state="normal" if self.busy else "disabled")
         self.cancel_button.configure(
-            state="normal" if not self.busy and self.cancellable() else "disabled"
+            state="normal"
+            if self.cancellable() and (not self.busy or self.watching())
+            else "disabled"
         )
         self.rerun_button.configure(
             state="normal" if not self.busy and self.rerunnable() else "disabled"
@@ -644,8 +650,15 @@ class DesktopApp:
             text += f"\n…and {len(lines) - 8} more selected rows."
         return text
 
+    def watching(self):
+        """Submitting or checking jobs: the worker is in (or about to start) its
+        monitor loop, which can take cancel requests on its open connection."""
+        return self.busy and self.action in {"submit", "monitor"}
+
     def cancel_jobs(self):
-        if self.busy or not self.cancellable() or not self.settings_ready():
+        if self.busy and not self.watching():
+            return
+        if not self.cancellable() or not self.settings_ready():
             return
         rows = self.selected_rows()
         details = self.listing(
@@ -657,10 +670,17 @@ class DesktopApp:
             "started keeps running. Your input files are not changed and nothing is "
             "resubmitted. To run a file again later, select it and choose Run again."
         )
-        if messagebox.askyesno(
+        if not messagebox.askyesno(
             "Cancel pending jobs", text, parent=self.root, default="no"
         ):
-            self.start("cancel_jobs", [path for path, _ in rows], dict(self.settings))
+            return
+        paths = [path for path, _ in rows]
+        if self.watching():
+            # Same SSH session as the watch: no new sign-in, and watching continues.
+            self.controller.request_cancel(paths, dict(self.settings))
+            self.log("Cancelling at the next check, on the open connection.")
+        else:
+            self.start("cancel_jobs", paths, dict(self.settings))
 
     def run_again(self):
         if self.busy or not self.rerunnable() or not self.settings_ready():

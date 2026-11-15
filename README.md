@@ -171,7 +171,7 @@ On Windows, [Inkly Desktop](docs/DESKTOP.md) provides file selection, resource
 preview, confirmed submission and result monitoring in an application window.
 Open `InklyDesktop.exe` or double-click `Inkly Desktop.pyw` when running from source.
 Its job summary follows each file's latest status after submission. Select
-rows to **Cancel job** (pending jobs only) or **Run again** (cancelled, failed or
+rows to **Cancel job** (pending jobs only, also while Desktop is watching) or **Run again** (cancelled, failed or
 edited files, prepared as new jobs and never submitted without confirmation);
 see [Cancel a pending job or run a file again](docs/DESKTOP.md#cancel-a-pending-job-or-run-a-file-again).
 For questions or issues, use the contact line under the window title
