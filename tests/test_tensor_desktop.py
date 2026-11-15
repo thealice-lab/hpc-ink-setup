@@ -1,6 +1,7 @@
 """Desktop confirmation, cancellation, recovery and native Tk tests. No network."""
 
 import base64
+import gc
 import hashlib
 import importlib.util
 import json
@@ -11,6 +12,24 @@ from types import SimpleNamespace
 import warnings
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def collect_garbage_on_main_thread():
+    """Free each test's Tk windows on the main thread.
+
+    Tcl aborts the process if a background thread (worker or diagnostics)
+    frees a Tk object, and Python's cyclic collector runs on whichever thread
+    triggers it. Closed test windows sit in reference cycles, so every test
+    runs with automatic collection off and ends with a collection here.
+    """
+    enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    yield
+    gc.collect()
+    if enabled:
+        gc.enable()
 
 
 scripts = Path(__file__).resolve().parents[1] / "scripts"
@@ -882,6 +901,48 @@ def test_native_cancel_and_run_again_follow_selected_rows(
         app.busy = False
     finally:
         app.close()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+def test_native_window_collects_garbage_only_on_the_tk_thread(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    calls = []
+    monkeypatch.setattr(
+        gui,
+        "gc",
+        SimpleNamespace(
+            disable=lambda: calls.append("disable"),
+            enable=lambda: calls.append("enable"),
+            collect=lambda *args: calls.append("collect"),
+        ),
+    )
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    try:
+        # Automatic collection is off before any worker thread can trigger it.
+        assert calls == ["disable"]
+        app.drain()
+        assert calls == ["disable"]  # Not due yet.
+        app.next_collection = 0
+        app.drain()
+        assert calls == ["disable", "collect"]
+        assert app.next_collection > 0
+    finally:
+        app.close()
+    # Closing collects on the Tk thread and never re-enables automatic collection.
+    assert calls == ["disable", "collect", "collect"]
 
 
 native_display = pytest.mark.skipif(

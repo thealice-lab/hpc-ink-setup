@@ -3,6 +3,7 @@
 
 import argparse
 import ctypes
+import gc
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, font, messagebox, ttk
 import webbrowser
@@ -30,8 +32,21 @@ def bundled_askpass():
     return path if path.is_file() else None
 
 
+# How often the Tk thread runs Python's cyclic garbage collector (see DesktopApp).
+GC_INTERVAL_SECONDS = 10
+
+
 class DesktopApp:
     def __init__(self, root, controller_factory=DesktopController, settings_path=None):
+        # Tk objects may only be freed on the thread that created them. Python's
+        # cyclic garbage collector runs on whichever thread triggers it, and here
+        # the worker and diagnostics threads allocate constantly; Tcl aborts the
+        # whole process if one of them frees a Tk object. So automatic
+        # collection stays off while the window exists, and drain() collects
+        # on the Tk thread instead. Reference counting still frees most memory
+        # immediately.
+        gc.disable()
+        self.next_collection = time.monotonic() + GC_INTERVAL_SECONDS
         self.root = root
         self.root.title("Inkly Desktop")
         self.root.geometry("1120x760")
@@ -429,6 +444,9 @@ class DesktopApp:
                     text="Recovery declined. Saved inputs and receipts are unchanged."
                 )
                 self.buttons()
+        if time.monotonic() >= self.next_collection:
+            gc.collect()
+            self.next_collection = time.monotonic() + GC_INTERVAL_SECONDS
         if not self.closed:
             self.timer = self.root.after(80, self.drain)
 
@@ -908,6 +926,9 @@ class DesktopApp:
         self.worker.join(timeout=2)
         self.root.after_cancel(self.timer)
         self.root.destroy()
+        # Free the closed window here, on the Tk thread. Automatic collection
+        # stays off: this window's threads may still be finishing.
+        gc.collect()
 
 
 def main(argv=None):
