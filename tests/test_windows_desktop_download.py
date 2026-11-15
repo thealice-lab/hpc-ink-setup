@@ -16,11 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts/windows/get_inklydesktop_test.ps1"
 SYNTHETIC = b"synthetic fixture, never executed"
 DIGEST = hashlib.sha256(SYNTHETIC).hexdigest()
-BUILD = "Inkly/DesktopBuilds/0.3.0"
-RELEASE = "https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.3.0"
+BUILD = "Inkly/DesktopBuilds/0.4.0"
+RELEASE = "https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.4.0"
 DOWNLOAD = (
     "https://github.com/thealice-lab/hpc-ink-setup/releases/download/"
-    "desktop-v0.3.0/InklyDesktop-0.3.0-windows.zip"
+    "desktop-v0.4.0/InklyDesktop-0.4.0-windows.zip"
 )
 
 
