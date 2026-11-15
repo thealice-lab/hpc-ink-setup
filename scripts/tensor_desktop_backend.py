@@ -29,8 +29,8 @@ class DesktopController:
         # Jobs cancelled through Inkly in this window; monitoring then skips
         # repeating the cancellation message.
         self.cancelled_paths = set()
-        # Cancel requests made while monitoring are handled by the monitor loop
-        # on its own SSH session; `wake` ends its wait between checks early.
+        # Operations requested while monitoring are run by the monitor loop on
+        # its own SSH session; `wake` ends its wait between checks early.
         self.requests = queue.Queue()
         self.wake = threading.Event()
 
@@ -287,7 +287,7 @@ class DesktopController:
             item["response"] = response
             self.row(item)
 
-    def submit(self, review_id, confirmed=False):
+    def submit(self, review_id, confirmed=False, watch=True):
         if not confirmed or not self.review_id or review_id != self.review_id:
             raise ValueError("Submission needs confirmation of the current preview.")
         self.review_id = None  # Approval is consumed even if an SSH response is lost.
@@ -314,59 +314,90 @@ class DesktopController:
                     "message",
                     f"Submitted {item['path'].name}: job {response['job_id']}",
                 )
-        self.monitor()
+        if watch:
+            self.monitor()
 
-    def request_cancel(self, selected, settings):
-        """Called from the window thread while monitoring: cancel these rows next.
+    # Operations the window may ask for while monitoring.
+    WATCH_REQUESTS = ("cancel_jobs", "preview", "submit", "rerun")
 
-        The monitor loop handles the request on its open SSH session, so no new
-        sign-in is needed, then keeps watching.
+    def request(self, action, *args):
+        """Called from the window thread while monitoring: run this operation next.
+
+        The monitor loop runs it between checks on its open SSH session, so no
+        new sign-in is needed, then keeps watching every submitted job.
         """
-        self.requests.put((list(selected), dict(settings)))
+        if action not in self.WATCH_REQUESTS:
+            raise ValueError("That operation cannot run while watching.")
+        self.requests.put((action, args))
         self.wake.set()
 
+    def request_cancel(self, selected, settings):
+        self.request("cancel_jobs", list(selected), dict(settings))
+
+    def target_for(self, paths, settings, mode):
+        """The connection a list of files would use, without contacting the HPC."""
+        settings = picker.validate_settings(dict(settings))
+        items = picker.plan(picker.selections(paths), settings, mode)
+        connection = items[0]["receipt"] or settings
+        return tuple(connection.get(key) for key in ("host", "ink_path", "auth"))
+
     def handle_requests(self):
+        """Run window requests made while monitoring.
+
+        Returns True when the prepared or submitted files may have changed, so
+        the watch re-reads them. Problems with one request are reported and do
+        not end the watch; a lost connection still does.
+        """
+        changed = False
         while True:
             try:
-                selected, settings = self.requests.get_nowait()
+                action, args = self.requests.get_nowait()
             except queue.Empty:
-                return
+                return changed
             if not self.session:
-                self.emit("notice", "Desktop is not connected; nothing was cancelled.")
-                continue
-            target = None
-            try:
-                items = picker.plan(
-                    picker.selections(selected),
-                    picker.validate_settings(dict(settings)),
-                    "resume",
-                )
-                target = tuple(
-                    items[0]["receipt"].get(k) for k in ("host", "ink_path", "auth")
-                )
-            except ValueError as error:
-                self.emit("notice", f"Nothing was cancelled: {error}")
-                continue
-            if target != self.target:
-                # Switching connections would end the watch; do it separately.
                 self.emit(
-                    "notice",
-                    "Those rows use a different HPC connection from the jobs being "
-                    "watched, so nothing was cancelled. Stop watching first, then "
-                    "cancel them.",
+                    "request_error", "Desktop is not connected; nothing was done."
                 )
                 continue
             try:
-                self.cancel_jobs(selected, settings)
-            except bridge.MissingBundleError as error:
-                self.emit("notice", f"Nothing was cancelled: {error}")
+                if action == "cancel_jobs":
+                    targets = [self.target_for(args[0], args[1], "resume")]
+                elif action == "rerun":
+                    targets = [
+                        self.target_for(args[0], args[2], "resume"),
+                        self.target_for(args[1], args[2], "preview"),
+                    ]
+                elif action == "preview":
+                    targets = [self.target_for(args[0], args[1], "preview")]
+                else:
+                    targets = []  # Submit uses the current preview's connection.
+                if any(target != self.target for target in targets):
+                    # Switching connections would end the watch; do it separately.
+                    self.emit(
+                        "notice",
+                        "Those files use a different HPC connection from the jobs "
+                        "being watched, so nothing was done. Stop watching first, "
+                        "then try again.",
+                    )
+                    continue
+                if action == "submit":
+                    self.submit(*args, watch=False)
+                else:
+                    getattr(self, action)(*args)
+            except InterruptedError:
+                raise
+            except ValueError as error:
+                self.emit("request_error", str(error))
+                continue
+            changed = changed or action != "cancel_jobs"
 
     def monitor(self):
         if not self.session or not self.items:
             raise ValueError("Preview the files first to load their saved handoffs.")
         pending = list(self.items)
         while True:
-            self.handle_requests()
+            if self.handle_requests():
+                pending = list(self.items)  # A preview or submit changed the list.
             for item in list(pending):
                 self.check_stop()
                 response = self.session.exchange(
@@ -399,13 +430,13 @@ class DesktopController:
                     raise ValueError(
                         f"{item['path'].name}: {state} (exit {response.get('exit_code')}). Other jobs may continue. Keep receipts and inspect this job."
                     )
-            if not pending:
+            if not pending and self.requests.empty():
                 break
-            # Wait for the next check; Stop watching or a cancel request wakes early.
-            self.wake.wait(self.interval)
-            self.wake.clear()
-            self.check_stop()
-        self.handle_requests()  # A request that arrived during the last check.
+            if pending:
+                # Wait for the next check; Stop watching or a request wakes early.
+                self.wake.wait(self.interval)
+                self.wake.clear()
+                self.check_stop()
         self.emit(
             "message",
             "Check complete. Open verified returned logs in TENSOR's Analysis & 3D view. Prepared jobs remain unsubmitted.",

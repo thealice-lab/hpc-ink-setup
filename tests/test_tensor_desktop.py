@@ -708,6 +708,78 @@ def test_watch_cancel_for_another_connection_keeps_watching(workflow):
     assert record_for(w, w.paths[0])["state"] == "PENDING"
 
 
+def events_of(workflow, kind):
+    return [data for event, data in workflow.events if event == kind]
+
+
+def test_preview_and_submit_a_new_file_while_watching_on_one_connection(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    connections = len(w.connections)
+    w.events.clear()
+    # The researcher adds sample_2 to the list and previews it during the watch.
+    w.controller.request("preview", w.paths, SETTINGS)
+    assert w.controller.handle_requests() is True
+    review = w.controller.review()
+    assert review["count"] == 1 and review["jobs"][0]["name"] == "sample_2.gjf"
+    w.controller.request("submit", w.controller.review_id, True)
+    assert w.controller.handle_requests() is True  # Returns; no nested watch.
+    assert actions(w).count("submit") == 1
+    assert record_for(w, w.paths[1])["submission"] == "SUBMITTED"
+    assert record_for(w, w.paths[0])["state"] == "PENDING"  # Untouched.
+    assert len(w.connections) == connections  # No reconnect, no new sign-in.
+
+
+def test_request_problems_are_reported_without_ending_the_watch(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.events.clear()
+    w.controller.request("submit", "not-the-current-review", True)
+    assert w.controller.handle_requests() is False
+    assert (
+        "needs confirmation of the current preview" in events_of(w, "request_error")[0]
+    )
+    assert "submit" not in actions(w)
+    assert w.controller.session is not None
+    with pytest.raises(ValueError, match="cannot run while watching"):
+        w.controller.request("close")
+
+
+def test_watch_takes_preview_submit_and_cancel_requests_in_turn(workflow):
+    import threading
+    import time
+
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    w.controller.interval = 30
+    connections = len(w.connections)
+    watch = threading.Thread(target=w.controller.monitor, daemon=True)
+    watch.start()
+
+    def wait_for(condition):
+        deadline = time.monotonic() + 5
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert condition()
+
+    wait_for(lambda: actions(w).count("status") >= 1)
+    first_review = w.controller.review_id
+    w.controller.request("preview", w.paths, SETTINGS)
+    wait_for(lambda: w.controller.review_id not in (None, first_review))
+    w.controller.request("submit", w.controller.review_id, True)
+    wait_for(lambda: "submit" in actions(w))
+    wait_for(lambda: record_for(w, w.paths[1])["submission"] == "SUBMITTED")
+    record_for(w, w.paths[1])["state"] = "PENDING"
+    w.controller.request_cancel(w.paths, SETTINGS)
+    watch.join(timeout=5)
+    assert not watch.is_alive()
+    assert record_for(w, w.paths[0])["state"] == "CANCELLED by 1000"
+    assert record_for(w, w.paths[1])["state"] == "CANCELLED by 1000"
+    assert len(w.connections) == connections
+
+
 def test_cancelled_row_does_not_block_submitting_other_prepared_files(workflow):
     w = workflow
     w.controller.preview(w.paths, SETTINGS)
