@@ -820,6 +820,26 @@ def test_stop_during_submit_lets_the_submission_finish_then_stops(workflow):
     assert w.controller.session is not None
 
 
+def test_request_arriving_as_the_watch_ends_is_dropped_with_a_notice(
+    workflow, monkeypatch
+):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "RUNNING", "1")
+    real_monitor = w.controller.monitor
+
+    def monitor_then_late_click():
+        real_monitor()
+        w.controller.request("preview", w.paths, SETTINGS)  # Clicked as it ended.
+
+    monkeypatch.setattr(w.controller, "monitor", monitor_then_late_click)
+    w.events.clear()
+    w.controller.execute("monitor")
+    assert w.controller.requests.empty()
+    assert "finished before your last request ran" in notices(w)[0]
+    assert ("done", "monitor") in w.events
+
+
 def test_check_after_the_connection_closed_signs_in_again(workflow):
     w = workflow
     w.controller.preview(w.paths[:1], SETTINGS)

@@ -74,6 +74,16 @@ class DesktopController:
         self.wake.set()
         self.drop_requests()
 
+    def unhandled_requests(self):
+        """A request made just as the watch finished: never run it later."""
+        if not self.requests.empty():
+            self.drop_requests()
+            self.emit(
+                "notice",
+                "The watch finished before your last request ran, so nothing was "
+                "done. Please choose it again.",
+            )
+
     def drop_requests(self):
         """Forget cancel requests the watch has not handled; rows show what happened."""
         while True:
@@ -682,8 +692,10 @@ class DesktopController:
                 self.preview(*args)
             elif action == "submit":
                 self.submit(*args)
+                self.unhandled_requests()
             elif action == "monitor":
                 self.monitor()
+                self.unhandled_requests()
             elif action == "cancel_jobs":
                 self.cancel_jobs(*args)
             elif action == "rerun":
