@@ -30,6 +30,33 @@ ACTIVE = {
     "REQUEUED",
     "RESIZING",
 }
+# Never submitted, or ended without a result: safe to prepare again as a new
+# job. Running, finished, or unconfirmed jobs are never re-prepared.
+RERUNNABLE = {
+    "PREPARED",
+    "CANCELLED",
+    "FAILED",
+    "TIMEOUT",
+    "OUT_OF_MEMORY",
+    "NODE_FAIL",
+    "PREEMPTED",
+    "BOOT_FAIL",
+    "DEADLINE",
+}
+
+
+class InputChangedError(ValueError):
+    """The selected file no longer matches the bundle its saved receipt names."""
+
+    def __init__(self, message, response):
+        super().__init__(message)
+        self.response = response
+
+
+def state_name(value):
+    """Group scheduler detail such as "CANCELLED by 1234" under its state."""
+    words = str(value or "").split()
+    return words[0].upper() if words else "UNKNOWN"
 
 
 def config_path():
@@ -241,7 +268,7 @@ def _new_handoff(session, item, settings, report=print, receipt_path=None):
     return session.exchange(request, receipt=receipt), receipt
 
 
-def _archive_receipt(item):
+def _archive_receipt(item, label="orphaned"):
     """Copy the exact old receipt aside before atomically replacing it."""
     path = item["receipt_path"]
     try:
@@ -257,7 +284,7 @@ def _archive_receipt(item):
         )
 
     for _ in range(5):
-        archive = path.with_name(f"{path.name}.orphaned-{uuid.uuid4().hex}.bak")
+        archive = path.with_name(f"{path.name}.{label}-{uuid.uuid4().hex}.bak")
         try:
             with archive.open("xb") as stream:
                 stream.write(original)
@@ -273,11 +300,17 @@ def _archive_receipt(item):
     raise OSError("Could not create a unique archive for the old recovery receipt")
 
 
-def _recover_missing_bundle(session, item, settings, report):
+def _replace_receipt(item, settings, label, changed_message):
+    """Archive the saved receipt, then publish a new one for a fresh bundle.
+
+    The new receipt keeps the original connection and output folder and uses
+    the current time limit. Returns the prepare request (not yet sent) and the
+    archive path. Nothing is sent to the HPC here.
+    """
     old_receipt = item["receipt"]
-    archive, original = _archive_receipt(item)
+    archive, original = _archive_receipt(item, label)
     temporary = item["receipt_path"].with_name(
-        f".{item['receipt_path'].name}.recovery-{uuid.uuid4().hex}.tmp"
+        f".{item['receipt_path'].name}.{label}-{uuid.uuid4().hex}.tmp"
     )
     try:
         # Persist a fresh bundle ID to a temporary receipt first. The original
@@ -297,9 +330,7 @@ def _recover_missing_bundle(session, item, settings, report):
             report=lambda _message: None,
         )
         if item["receipt_path"].read_bytes() != original:
-            raise ValueError(
-                "The saved recovery receipt changed during recovery; no replacement was made"
-            )
+            raise ValueError(changed_message)
         os.replace(temporary, item["receipt_path"])
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -311,17 +342,48 @@ def _recover_missing_bundle(session, item, settings, report):
         except OSError:
             pass
         raise
+    item["receipt"] = json.loads(item["receipt_path"].read_text(encoding="utf-8"))
+    return request, archive
 
-    new_receipt = json.loads(item["receipt_path"].read_text(encoding="utf-8"))
-    item["receipt"] = new_receipt
+
+def _recover_missing_bundle(session, item, settings, report):
+    request, archive = _replace_receipt(
+        item,
+        settings,
+        "orphaned",
+        "The saved recovery receipt changed during recovery; no replacement was made",
+    )
     item["recovered"] = True
     item["recovered_from"] = archive
     report(f"Archived the missing-bundle receipt: {archive.name}")
     report(f"Created a new recovery receipt: {item['receipt_path'].name}")
-    response = session.exchange(request, receipt=new_receipt)
+    response = session.exchange(request, receipt=item["receipt"])
     report(
         f"Re-prepared {item['path'].name} for preview only. No Slurm job was submitted."
     )
+    return response
+
+
+def prepare_again(session, item, settings, report=print):
+    """Prepare the file's current contents as a new bundle; never submits.
+
+    The caller must first confirm on the HPC that the recorded job's state is in
+    RERUNNABLE. The old receipt is archived beside the input, not deleted.
+    """
+    request, archive = _replace_receipt(
+        item,
+        settings,
+        "rerun",
+        "The saved receipt changed while preparing again; no replacement was made",
+    )
+    item["rerun_from"] = archive
+    item.pop("changed", None)
+    report(f"Archived the old receipt: {archive.name}")
+    response = session.exchange(request, receipt=item["receipt"])
+    if response["name"] != item["path"].name:
+        raise ValueError("The HPC prepared a different input filename")
+    item["response"] = response
+    report(f"Prepared {item['path'].name} again as a new job. Nothing was submitted.")
     return response
 
 
@@ -344,8 +406,9 @@ def prepare(session, item, settings, report=print, recover_bundles=None):
         raise ValueError("The receipt belongs to a different input filename")
     # A reused receipt must still describe the selected export, not an older edit.
     if hashlib.sha256(item["path"].read_bytes()).hexdigest() != response["sha256"]:
-        raise ValueError(
-            f"{item['path'].name} changed since preparation; keep its receipt and review the original handoff"
+        raise InputChangedError(
+            f"{item['path'].name} changed since preparation; keep its receipt and review the original handoff",
+            response,
         )
     item["response"] = response
 

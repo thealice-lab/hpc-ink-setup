@@ -368,3 +368,151 @@ sys.exit(tensor.main(session=True))
     assert [
         p.read_text() for p in (tmp_path / "bundles").glob("*/synthetic-submit-count")
     ] == ["1"]
+
+
+def test_version_reports_capabilities_without_files_locks_or_slurm(
+    tmp_path, monkeypatch
+):
+    def scheduler(*args):
+        raise AssertionError("version must not call Slurm")
+
+    monkeypatch.setattr(tensor, "_scheduler", scheduler)
+    root = tmp_path / "bundles"
+    result = tensor.handle({"action": "version", "bundle": "d" * 32}, root)
+    assert result["bundle"] == "d" * 32
+    assert result["version"]
+    assert {"prepare", "submit", "status", "fetch", "cancel", "version"} <= set(
+        result["capabilities"]
+    )
+    assert not root.exists()
+
+
+def test_unknown_operation_reply_keeps_session_open(monkeypatch, capsys):
+    """Desktop probes older endpoints with "version"; an error must not end SSH."""
+    import io
+    import sys
+    from types import SimpleNamespace
+
+    requests = [
+        {"action": "something-new", "bundle": "d" * 32},
+        {"action": "version", "bundle": "d" * 32},
+    ]
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        SimpleNamespace(
+            buffer=io.BytesIO(
+                b"".join(json.dumps(r).encode() + b"\n" for r in requests)
+            )
+        ),
+    )
+    assert tensor.main(session=True) == 0
+    replies = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert replies[0] == {"ok": False, "error": "Unsupported operation"}
+    assert replies[1]["ok"] and "cancel" in replies[1]["capabilities"]
+
+
+def submitted(prepared, monkeypatch):
+    monkeypatch.setattr(
+        tensor,
+        "_scheduler",
+        lambda *a: subprocess.CompletedProcess(a, 0, "12345\n", ""),
+    )
+    operate(prepared, "submit", confirm=True)
+
+
+def slurm(states, calls, scancel_code=0, check=None):
+    """Fake sacct answers in order (last repeats) and record every call."""
+    answers = list(states)
+
+    def scheduler(args, directory):
+        calls.append(list(args))
+        if args[0] == "scancel":
+            if check:
+                check(directory)
+            return subprocess.CompletedProcess(args, scancel_code, "", "")
+        if args[0] == "sacct":
+            state = answers.pop(0) if len(answers) > 1 else answers[0]
+            return subprocess.CompletedProcess(args, 0, f"12345|{state}|0:0\n", "")
+        raise AssertionError(f"unexpected scheduler call {args}")
+
+    return scheduler
+
+
+def test_cancel_needs_confirmation_and_a_recorded_job(prepared, monkeypatch):
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", slurm(["PENDING"], calls))
+    with pytest.raises(ValueError, match="No Slurm job"):
+        operate(prepared, "cancel", confirm=True)
+    submitted(prepared, monkeypatch)
+    monkeypatch.setattr(tensor, "_scheduler", slurm(["PENDING"], calls))
+    with pytest.raises(ValueError, match="confirmation"):
+        operate(prepared, "cancel")
+    assert not calls
+
+
+def test_cancel_pending_job_records_request_before_scancel(prepared, monkeypatch):
+    submitted(prepared, monkeypatch)
+    calls = []
+
+    def recorded_first(directory):
+        persisted = json.loads((directory / "receipt.json").read_text())
+        assert len(persisted["cancel_requested"]) == 1
+
+    monkeypatch.setattr(
+        tensor,
+        "_scheduler",
+        slurm(["PENDING", "CANCELLED by 1000"], calls, check=recorded_first),
+    )
+    result = operate(prepared, "cancel", confirm=True)
+    assert result["state"] == "CANCELLED by 1000"
+    assert result["job_id"] == "12345"
+    assert result["submission"] == "SUBMITTED"
+    scancels = [call for call in calls if call[0] == "scancel"]
+    assert scancels == [["scancel", "--state=PENDING", "12345"]]
+    with pytest.raises(ValueError, match="Only PENDING.*CANCELLED"):
+        operate(prepared, "cancel", confirm=True)
+    assert len([call for call in calls if call[0] == "scancel"]) == 1
+    with pytest.raises(ValueError, match="Already attempted"):
+        operate(prepared, "submit", confirm=True)
+
+
+@pytest.mark.parametrize(
+    "state", ["RUNNING", "COMPLETING", "COMPLETED", "FAILED", "CANCELLED by 7"]
+)
+def test_cancel_refuses_jobs_that_are_not_pending(prepared, monkeypatch, state):
+    submitted(prepared, monkeypatch)
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", slurm([state], calls))
+    with pytest.raises(ValueError, match="Only PENDING"):
+        operate(prepared, "cancel", confirm=True)
+    assert all(call[0] != "scancel" for call in calls)
+    root, request, _ = prepared
+    receipt = json.loads((root / request["bundle"] / "receipt.json").read_text())
+    assert "cancel_requested" not in receipt
+
+
+def test_failed_scancel_is_reported_once_and_never_retried(prepared, monkeypatch):
+    submitted(prepared, monkeypatch)
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", slurm(["PENDING"], calls, 1))
+    with pytest.raises(ValueError, match="unconfirmed"):
+        operate(prepared, "cancel", confirm=True)
+    assert len([call for call in calls if call[0] == "scancel"]) == 1
+    root, request, _ = prepared
+    receipt = json.loads((root / request["bundle"] / "receipt.json").read_text())
+    assert len(receipt["cancel_requested"]) == 1
+
+
+def test_status_reads_after_cancel_are_bounded(prepared, monkeypatch):
+    submitted(prepared, monkeypatch)
+    calls, sleeps = [], []
+    monkeypatch.setattr(tensor, "_scheduler", slurm(["PENDING"], calls))
+    monkeypatch.setattr(tensor.time, "sleep", sleeps.append)
+    result = operate(prepared, "cancel", confirm=True)
+    assert result["state"] == "PENDING"
+    assert len([call for call in calls if call[0] == "scancel"]) == 1
+    assert len([call for call in calls if call[0] == "sacct"]) == 1 + (
+        tensor.CANCEL_STATUS_READS
+    )
+    assert len(sleeps) == tensor.CANCEL_STATUS_READS - 1

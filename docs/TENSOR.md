@@ -153,6 +153,12 @@ print("Installed TENSOR session endpoint and supported profile: ready")
 PY
 ```
 
+To see whether that copy can cancel pending jobs for Inkly Desktop, add
+`print(tensor.CAPABILITIES)` before the last line; it should include
+`cancel`. Copies installed before that support answer Desktop's `version`
+request with "Unsupported operation", and Desktop then explains that
+cancelling needs an update.
+
 This readiness check does not submit a job. It does not establish Gaussian
 license/group access, available resources or scientific suitability; verify
 those prerequisites with your site's setup guide. A model service is used by
@@ -331,6 +337,10 @@ python .\scripts\tensor_bridge.py --help
 ```
 
 Its `run`, `resume`, `prepare`, `submit RECEIPT --confirm`, `status` and `fetch`
-operations use the same protocol. Direct callers must arrange their own
+operations use the same protocol. The HPC endpoint also answers `version`
+(the Inkly version and the operations it supports) and `cancel` with
+`"confirm": true`. Cancel works only while Slurm reports the recorded job as
+PENDING, records the request before calling `scancel --state=PENDING`, and
+never resubmits. Inkly Desktop uses both; the CLI does not. Direct callers must arrange their own
 OpenSSH authentication environment. The Windows launcher packages that setup
 and preserves receipt-based recovery; no TENSOR interface modification is added.

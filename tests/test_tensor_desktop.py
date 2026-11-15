@@ -42,6 +42,8 @@ def workflow(tmp_path, monkeypatch):
         )
     records, calls, events, connections = {}, [], [], []
     missing_bundles = set()
+    # None imitates an older HPC endpoint without the "version" operation.
+    endpoint = {"capabilities": ["prepare", "submit", "status", "fetch", "cancel"]}
 
     class Session:
         def __init__(self, connection, ssh):
@@ -63,6 +65,15 @@ def workflow(tmp_path, monkeypatch):
                 raise backend.bridge.MissingBundleError(
                     "Unknown bundle; prepare a new input first"
                 )
+            if action == "version":
+                if endpoint["capabilities"] is None:
+                    raise ValueError("Unsupported operation")
+                return {"bundle": bundle, "capabilities": endpoint["capabilities"]}
+            if action == "cancel":
+                assert request.get("confirm") is True
+                if records[bundle]["state"] != "PENDING":
+                    raise ValueError("Only PENDING jobs can be cancelled")
+                records[bundle]["state"] = "CANCELLED by 1000"
             if action == "prepare":
                 data = base64.b64decode(request["data"])
                 records[bundle] = {
@@ -108,6 +119,7 @@ def workflow(tmp_path, monkeypatch):
         events=events,
         connections=connections,
         missing_bundles=missing_bundles,
+        endpoint=endpoint,
     )
     controller.close()
     controller.journal.close()
@@ -115,6 +127,30 @@ def workflow(tmp_path, monkeypatch):
 
 def actions(workflow):
     return [action for _, action in workflow.calls]
+
+
+def record_for(workflow, path):
+    receipt = json.loads(path.with_suffix(".gjf.inkly.json").read_text())
+    return workflow.records[receipt["bundle"]]
+
+
+def recorded_job(workflow, path, state, job_id="123"):
+    """Mark a previewed file as submitted, with the given Slurm state."""
+    record_for(workflow, path).update(
+        submission="SUBMITTED", state=state, job_id=job_id
+    )
+
+
+def messages(workflow):
+    return [data for kind, data in workflow.events if kind == "message"]
+
+
+def rows_for(workflow, path):
+    return [
+        data
+        for kind, data in workflow.events
+        if kind == "row" and data["path"] == str(path)
+    ]
 
 
 def test_logging_records_safe_workflow_and_one_submission_per_file(workflow):
@@ -454,6 +490,198 @@ def test_stop_before_worker_starts_prevents_connection(workflow):
     assert not w.connections and not w.calls
 
 
+def test_cancel_only_pending_jobs_after_checking_the_endpoint(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "123")
+    recorded_job(w, w.paths[1], "PENDING", "124")
+    w.calls.clear()
+    w.events.clear()
+    w.controller.cancel_jobs([w.paths[0]], SETTINGS)
+    assert actions(w) == ["status", "version", "cancel"]
+    assert record_for(w, w.paths[0])["state"] == "CANCELLED by 1000"
+    assert record_for(w, w.paths[1])["state"] == "PENDING"
+    assert rows_for(w, w.paths[0])[-1]["state"] == "CANCELLED by 1000"
+    assert "Cancelled sample_1.gjf: job 123 is CANCELLED." in messages(w)
+    assert any("never resubmits" in text for text in messages(w))
+    w.controller.execute("close")
+    events = w.controller.journal.take()
+    cancels = [e["payload"] for e in events if e["event_type"] == "desktop_cancel"]
+    assert [e["status"] for e in cancels] == ["approved", "requested"]
+    assert cancels[1]["job_id"] == 123
+    assert "sample_1" not in json.dumps(events)
+
+
+@pytest.mark.parametrize("state", ["RUNNING", "COMPLETED", "SUBMISSION_UNKNOWN"])
+def test_cancel_checks_every_selected_row_before_cancelling_any(workflow, state):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING")
+    recorded_job(w, w.paths[1], state)
+    w.calls.clear()
+    with pytest.raises(ValueError, match="not PENDING, so nothing was cancelled"):
+        w.controller.cancel_jobs(w.paths, SETTINGS)
+    assert "cancel" not in actions(w) and "submit" not in actions(w)
+    assert record_for(w, w.paths[0])["state"] == "PENDING"
+
+
+def test_cancel_needs_a_saved_handoff(workflow):
+    w = workflow
+    with pytest.raises(ValueError, match="No saved handoff"):
+        w.controller.cancel_jobs([w.paths[0]], SETTINGS)
+    assert not w.calls and not w.connections
+
+
+def test_older_hpc_endpoint_explains_and_cancels_nothing(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "2406999")
+    w.endpoint["capabilities"] = None
+    w.calls.clear()
+    with pytest.raises(ValueError, match="too old to cancel") as error:
+        w.controller.cancel_jobs([w.paths[0]], SETTINGS)
+    assert "scancel 2406999" in str(error.value)
+    assert actions(w) == ["status", "version"]
+    assert record_for(w, w.paths[0])["state"] == "PENDING"
+
+
+def test_cancel_errors_reach_the_window_and_close_only_ssh(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "RUNNING")
+    w.events.clear()
+    w.controller.execute("cancel_jobs", [w.paths[0]], SETTINGS)
+    errors = [data for kind, data in w.events if kind == "error"]
+    assert len(errors) == 1 and "not PENDING" in errors[0]
+    assert ("done", "cancel_jobs") in w.events
+    assert "cancel" not in actions(w)
+
+
+def test_monitor_treats_cancelled_as_final_and_keeps_watching_others(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], "CANCELLED by 1000", "1")
+    recorded_job(w, w.paths[1], "RUNNING", "2")
+    w.controller.monitor()
+    assert rows_for(w, w.paths[1])[-1]["state"] == "RETURNED"
+    assert (w.paths[1].parent / "returned" / "sample_2.log").exists()
+    assert not (w.paths[0].parent / "returned" / "sample_1.log").exists()
+    assert any("was cancelled" in text and "Run again" in text for text in messages(w))
+    assert "submit" not in actions(w)
+
+
+def test_cancelled_row_does_not_block_submitting_other_prepared_files(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], "CANCELLED by 1000", "1")
+    w.controller.preview(w.paths, SETTINGS)
+    assert w.controller.review()["count"] == 1
+    w.controller.submit(w.controller.review_id, True)
+    assert actions(w).count("submit") == 1
+    assert record_for(w, w.paths[0])["state"] == "CANCELLED by 1000"
+
+
+def test_run_again_archives_receipt_and_prepares_without_submitting(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    receipt_path = w.paths[0].with_suffix(".gjf.inkly.json")
+    original = receipt_path.read_bytes()
+    recorded_job(w, w.paths[0], "CANCELLED by 1000", "1")
+    w.calls.clear()
+    w.events.clear()
+    w.controller.rerun([w.paths[0]], w.paths, {**SETTINGS, "hours": 3})
+    archives = list(w.paths[0].parent.glob("sample_1.gjf.inkly.json.rerun-*.bak"))
+    assert len(archives) == 1 and archives[0].read_bytes() == original
+    new_receipt = json.loads(receipt_path.read_text())
+    assert new_receipt["bundle"] != json.loads(original)["bundle"]
+    assert {key: new_receipt[key] for key in ("host", "ink_path", "auth")} == {
+        key: json.loads(original)[key] for key in ("host", "ink_path", "auth")
+    }
+    assert w.records[new_receipt["bundle"]]["resources"]["hours"] == 3
+    assert "submit" not in actions(w)
+    # One status check before any change, then the new bundle, then the refresh.
+    assert actions(w)[:2] == ["status", "prepare"]
+    assert actions(w).count("prepare") == 1
+    review = w.controller.review()
+    assert review["count"] == 2  # The new bundle plus the other unsubmitted file.
+    assert rows_for(w, w.paths[0])[-1]["state"] == "PREPARED"
+    assert any("Nothing was submitted" in text for text in messages(w))
+    w.controller.execute("close")
+    reruns = [
+        e["payload"]
+        for e in w.controller.journal.take()
+        if e["event_type"] == "desktop_rerun"
+    ]
+    assert [e["status"] for e in reruns] == ["approved", "prepared"]
+
+
+@pytest.mark.parametrize(
+    "state, advice",
+    [
+        ("PENDING", "Cancel it first"),
+        ("SUSPENDED", "Cancel it first"),
+        ("COMPLETED", "result is kept"),
+        ("SUBMISSION_UNKNOWN", "may still be running"),
+        ("UNKNOWN", "may still be running"),
+    ],
+)
+def test_run_again_refuses_active_finished_or_unconfirmed_jobs(workflow, state, advice):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    receipt_path = w.paths[0].with_suffix(".gjf.inkly.json")
+    original = receipt_path.read_bytes()
+    recorded_job(w, w.paths[0], "CANCELLED by 1000", "1")
+    recorded_job(w, w.paths[1], state, "2")
+    w.calls.clear()
+    with pytest.raises(ValueError, match=advice):
+        w.controller.rerun(w.paths, w.paths, SETTINGS)
+    assert receipt_path.read_bytes() == original
+    assert not list(w.paths[0].parent.glob("*.rerun-*.bak"))
+    assert "prepare" not in actions(w) and "submit" not in actions(w)
+
+
+def test_run_again_never_overwrites_a_returned_log(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "FAILED", "1")
+    output = w.paths[0].parent / "returned" / "sample_1.log"
+    output.parent.mkdir()
+    output.write_text("earlier result")
+    with pytest.raises(ValueError, match="will not be overwritten"):
+        w.controller.rerun(w.paths[:1], w.paths[:1], SETTINGS)
+    assert output.read_text() == "earlier result"
+    assert "prepare" not in actions(w)[1:]
+
+
+def test_edited_input_is_shown_never_submitted_and_can_run_again(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    old_bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())[
+        "bundle"
+    ]
+    w.paths[0].write_bytes(w.paths[0].read_bytes() + b"! edited\n")
+    w.events.clear()
+    w.controller.preview(w.paths, SETTINGS)  # No longer stops the whole list.
+    row = rows_for(w, w.paths[0])[-1]
+    assert row["input_changed"] and row["state"] == "PREPARED"
+    assert any("was edited after it was prepared" in text for text in messages(w))
+    assert w.controller.review()["count"] == 1
+    w.controller.submit(w.controller.review_id, True)
+    submitted = [bundle for bundle, action in w.calls if action == "submit"]
+    assert submitted and old_bundle not in submitted
+    assert w.records[old_bundle]["submission"] == "PREPARED"
+
+    w.controller.rerun([w.paths[0]], w.paths, SETTINGS)
+    receipt = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())
+    assert receipt["bundle"] != old_bundle
+    assert (
+        w.records[receipt["bundle"]]["sha256"]
+        == hashlib.sha256(w.paths[0].read_bytes()).hexdigest()
+    )
+    assert not rows_for(w, w.paths[0])[-1]["input_changed"]
+    assert w.controller.review()["count"] == 1
+
+
 def test_bundled_dialog_fallback_restores_auth_environment(tmp_path, monkeypatch):
     dialog = tmp_path / "packaged-dialog.exe"
     dialog.write_bytes(b"synthetic placeholder; never executed")
@@ -559,6 +787,99 @@ def test_native_window_add_remove_preview_and_confirmation(
         assert len(app.files) == 1 and app.review is None
         assert str(app.submit_button["state"]) == "disabled"
         assert app.table.item(str(w.paths[1]))["values"][6] == "Not previewed"
+    finally:
+        app.close()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+def test_native_cancel_and_run_again_follow_selected_rows(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    first, second = (str(path) for path in w.paths)
+
+    def show(path, **changes):
+        app.events.put(("row", {**app.rows[path], **changes}))
+        app.drain()
+
+    try:
+        app.settings = dict(SETTINGS)
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        assert str(app.cancel_button["state"]) == "disabled"
+        assert str(app.rerun_button["state"]) == "disabled"
+
+        show(first, state="PENDING", job_id="123")
+        app.table.selection_set(first)
+        app.buttons()
+        assert str(app.cancel_button["state"]) == "normal"
+        assert str(app.rerun_button["state"]) == "disabled"
+
+        scheduled, questions = [], []
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+
+        def answer(value):
+            def ask(title, text, **kwargs):
+                questions.append((title, text, kwargs.get("default")))
+                return value
+
+            return ask
+
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.cancel_button.invoke()
+        assert not scheduled
+        assert "job 123" in questions[-1][1] and questions[-1][2] == "no"
+        assert "already started keeps running" in questions[-1][1]
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(True))
+        app.cancel_button.invoke()
+        assert scheduled[-1] == ("cancel_jobs", [first], SETTINGS)
+
+        show(first, state="CANCELLED by 1000")
+        app.buttons()
+        assert str(app.cancel_button["state"]) == "disabled"
+        assert str(app.rerun_button["state"]) == "normal"
+        app.rerun_button.invoke()
+        assert scheduled[-1] == ("rerun", [first], [first, second], SETTINGS)
+        assert "Nothing is submitted" in questions[-1][1]
+        assert "CANCELLED" in questions[-1][1]
+
+        # An unchanged PREPARED row is simply submitted; an edited one runs again.
+        show(second, state="PREPARED")
+        app.table.selection_set(second)
+        app.buttons()
+        assert str(app.rerun_button["state"]) == "disabled"
+        show(second, input_changed=True)
+        assert app.table.item(second)["values"][6] == "PREPARED (input edited)"
+        app.buttons()
+        assert str(app.rerun_button["state"]) == "normal"
+
+        # Mixed selections and busy windows offer neither action.
+        show(first, state="PENDING", job_id="123")
+        app.table.selection_set([first, second])
+        app.buttons()
+        assert str(app.cancel_button["state"]) == "disabled"
+        assert str(app.rerun_button["state"]) == "disabled"
+        app.table.selection_set(first)
+        app.busy = True
+        app.buttons()
+        assert str(app.cancel_button["state"]) == "disabled"
+        app.busy = False
     finally:
         app.close()
 
@@ -689,7 +1010,8 @@ def test_overview_reports_mixed_states_without_implying_only_prepared():
     # Only jobs still held by Slurm count toward requested limits.
     assert "2 submitted job(s): 32 CPUs, 84,652 MiB" in text
     assert "not measured usage" in text
-    assert "Ended jobs need inspection; Inkly never resubmits them." in text
+    assert "CANCELLED jobs will not run" in text and "Run again" in text
+    assert "Ended jobs need inspection" not in text
     assert "COMPLETED logs return after verification." in text
 
     review = {"count": 1, "cpus": 16, "memory_mib": 42326, "recovered": []}
@@ -704,6 +1026,7 @@ def test_overview_reports_mixed_states_without_implying_only_prepared():
         None, [summary_row("a", "RETURNED"), summary_row("b", "FAILED")]
     )
     assert "Requested limits" not in finished and "PREPARED" not in finished
+    assert "Ended jobs need inspection; Inkly never resubmits them." in finished
 
 
 def test_interrupted_or_inflight_submission_never_claims_nothing_was_submitted():

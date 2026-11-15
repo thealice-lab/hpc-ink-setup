@@ -170,8 +170,11 @@ and [the complete TENSOR handoff guide](docs/TENSOR.md).
 On Windows, [Inkly Desktop](docs/DESKTOP.md) provides file selection, resource
 preview, confirmed submission and result monitoring in an application window.
 Open `InklyDesktop.exe` or double-click `Inkly Desktop.pyw` when running from source.
-Its job summary follows each file's latest status after submission. For
-questions or issues, use the contact line under the window title
+Its job summary follows each file's latest status after submission. Select
+rows to **Cancel job** (pending jobs only) or **Run again** (cancelled, failed or
+edited files, prepared as new jobs and never submitted without confirmation);
+see [Cancel a pending job or run a file again](docs/DESKTOP.md#cancel-a-pending-job-or-run-a-file-again).
+For questions or issues, use the contact line under the window title
 (rrv9177@uncw.edu).
 
 For a console workflow, run `tensor.cmd` for a file picker that accepts one or several

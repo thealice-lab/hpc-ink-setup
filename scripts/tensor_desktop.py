@@ -167,12 +167,25 @@ class DesktopApp:
         self.remove_button.pack(side="left")
         self.clear_button = ttk.Button(bar, text="Clear list", command=self.clear)
         self.clear_button.pack(side="left", padx=8)
+        # These act on the HPC jobs of the selected rows, not on the list itself.
+        self.cancel_button = ttk.Button(
+            bar, text="Cancel job", command=self.cancel_jobs
+        )
+        self.cancel_button.pack(side="left", padx=(16, 0))
+        self.rerun_button = ttk.Button(bar, text="Run again", command=self.run_again)
+        self.rerun_button.pack(side="left", padx=8)
+        # Packed last so the file count gives way first in narrow windows.
         self.count = ttk.Label(bar, text="No files added")
         self.count.pack(side="right")
-        ttk.Label(
+        self.hint = ttk.Label(
             content,
-            text="Add the .gjf or .com files your preparation tool created. Actions apply to all files in this list.",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+            text=(
+                "Add .gjf or .com inputs. Preview, Submit and Check use the whole "
+                "list; Cancel job and Run again use selected rows."
+            ),
+            wraplength=1000,
+        )
+        self.hint.grid(row=1, column=0, sticky="w", pady=(0, 8))
         frame = ttk.Frame(content)
         frame.grid(row=2, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
@@ -228,14 +241,13 @@ class DesktopApp:
             wraplength=1000,
         )
         self.overview.grid(row=3, column=0, sticky="w", pady=(12, 8))
+
         # Wrap the summary inside narrower or scaled windows instead of clipping it.
-        content.bind(
-            "<Configure>",
-            lambda event: self.overview.configure(
-                wraplength=max(300, event.width - 44)
-            ),
-            add="+",
-        )
+        def wrap(event):
+            for label in (self.hint, self.overview):
+                label.configure(wraplength=max(300, event.width - 44))
+
+        content.bind("<Configure>", wrap, add="+")
         actions = ttk.Frame(content)
         actions.grid(row=4, column=0, sticky="ew")
         self.preview_button = ttk.Button(
@@ -314,6 +326,8 @@ class DesktopApp:
                 "preview": "Preparing preview…",
                 "submit": "Submitting approved jobs and watching results…",
                 "monitor": "Checking recorded jobs…",
+                "cancel_jobs": "Cancelling the selected pending jobs…",
+                "rerun": "Preparing the selected files again (nothing is submitted)…",
             }[action]
         )
         self.progress.start(12)
@@ -338,7 +352,8 @@ class DesktopApp:
                             r["slurm_memory_mib"],
                             r["hours"],
                             data["stages"],
-                            data["state"],
+                            data["state"]
+                            + (" (input edited)" if data.get("input_changed") else ""),
                             data["job_id"],
                         ),
                     )
@@ -496,6 +511,8 @@ class DesktopApp:
             "folder": self.folder_button,
             "remove": self.remove_button,
             "clear": self.clear_button,
+            "cancel": self.cancel_button,
+            "rerun": self.rerun_button,
             "preview": self.preview_button,
             "submit": self.submit_button,
             "monitor": self.monitor_button,
@@ -552,6 +569,12 @@ class DesktopApp:
             else "disabled"
         )
         self.stop_button.configure(state="normal" if self.busy else "disabled")
+        self.cancel_button.configure(
+            state="normal" if not self.busy and self.cancellable() else "disabled"
+        )
+        self.rerun_button.configure(
+            state="normal" if not self.busy and self.rerunnable() else "disabled"
+        )
         self.script_button.configure(
             state="normal" if self.table.selection() and self.rows else "disabled"
         )
@@ -560,6 +583,95 @@ class DesktopApp:
             if any(row.get("output") for row in self.rows.values())
             else "disabled"
         )
+
+    def selected_rows(self):
+        """Displayed rows for the selection; None where a row is not previewed."""
+        return [(path, self.rows.get(path)) for path in self.table.selection()]
+
+    def cancellable(self):
+        rows = self.selected_rows()
+        return bool(rows) and all(
+            row
+            and status.state_name(row.get("state")) == "PENDING"
+            and row.get("job_id")
+            for _, row in rows
+        )
+
+    def rerunnable(self):
+        # An unchanged PREPARED row can simply be submitted; an edited one
+        # needs a fresh bundle.
+        rows = self.selected_rows()
+        return bool(rows) and all(
+            row
+            and status.state_name(row.get("state")) in picker.RERUNNABLE
+            and (
+                status.state_name(row.get("state")) != "PREPARED"
+                or row.get("input_changed")
+            )
+            for _, row in rows
+        )
+
+    def settings_ready(self):
+        try:
+            picker.validate_settings(self.settings)
+        except (ValueError, KeyError, TypeError):
+            self.configure()
+            return False
+        return True
+
+    @staticmethod
+    def listing(lines):
+        text = "\n".join(lines[:8])
+        if len(lines) > 8:
+            text += f"\n…and {len(lines) - 8} more selected rows."
+        return text
+
+    def cancel_jobs(self):
+        if self.busy or not self.cancellable() or not self.settings_ready():
+            return
+        rows = self.selected_rows()
+        details = self.listing(
+            [f"{row['name']}: job {row['job_id']}" for _, row in rows]
+        )
+        text = (
+            f"Cancel {len(rows)} pending job(s) on the HPC?\n\n{details}\n\n"
+            "Only jobs that are still waiting are cancelled. A job that has already "
+            "started keeps running. Your input files are not changed and nothing is "
+            "resubmitted. To run a file again later, select it and choose Run again."
+        )
+        if messagebox.askyesno(
+            "Cancel pending jobs", text, parent=self.root, default="no"
+        ):
+            self.start("cancel_jobs", [path for path, _ in rows], dict(self.settings))
+
+    def run_again(self):
+        if self.busy or not self.rerunnable() or not self.settings_ready():
+            return
+        rows = self.selected_rows()
+        details = self.listing(
+            [
+                f"{row['name']}: {status.state_name(row.get('state'))}"
+                + (" (input edited)" if row.get("input_changed") else "")
+                for _, row in rows
+            ]
+        )
+        text = (
+            f"Prepare {len(rows)} file(s) again as new job(s)?\n\n{details}\n\n"
+            "Inkly keeps a copy of each old receipt beside the input and prepares the "
+            "file as it is now, with its original HPC connection and your current time "
+            f"limit ({self.settings['hours']} hour(s)). Nothing is submitted: review "
+            "the preview, then choose Submit prepared jobs."
+        )
+        if messagebox.askyesno(
+            "Run again as new jobs", text, parent=self.root, default="no"
+        ):
+            self.review = None
+            self.start(
+                "rerun",
+                [path for path, _ in rows],
+                [str(path) for path in self.files],
+                dict(self.settings),
+            )
 
     def invalidate(self):
         self.review = None
@@ -702,10 +814,7 @@ class DesktopApp:
         ).grid(row=6, column=1, sticky="e")
 
     def preview_files(self):
-        try:
-            picker.validate_settings(self.settings)
-        except (ValueError, KeyError, TypeError):
-            self.configure()
+        if not self.settings_ready():
             return
         self.invalidate()
         self.start("preview", list(self.files), dict(self.settings))

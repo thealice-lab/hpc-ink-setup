@@ -118,8 +118,47 @@ their saved handoffs. **Check & return results** watches existing jobs and
 downloads successful results; it never submits a prepared job.
 
 Previously submitted jobs are not submitted again. Already returned logs are
-verified and left unchanged. Unknown/failed states, changed inputs, changed
-resource previews and output collisions stop the workflow for inspection.
+verified and left unchanged. Unknown/failed states, changed resource previews
+and output collisions stop the workflow for inspection.
+
+## Cancel a pending job or run a file again
+
+**Cancel job** and **Run again** act on the **selected rows**; the other
+buttons use the whole list. Select rows with a click (Ctrl or Shift for
+several). Each asks for confirmation first, and the confirmation defaults to
+No.
+
+**Cancel job** is available when every selected row is **PENDING** (waiting in
+the Slurm queue). Desktop reads each job's current state on the HPC and stops
+before cancelling anything if one of them is no longer PENDING. It then
+cancels only jobs that are still waiting (`scancel --state=PENDING`), so a job
+that started in the meantime keeps running. The row then shows **CANCELLED**.
+Your input files and receipts are not changed, and a cancelled job is never
+resubmitted. **Check & return results** treats CANCELLED rows as finished and
+keeps watching the others.
+
+Cancelling needs a copy of Inkly on the HPC that supports it. If a job's saved
+handoff uses an older copy, Desktop says so and cancels nothing; the message
+includes the `scancel` command you can run on the HPC yourself.
+
+**Run again** prepares a selected file as a **new** job. It is available for
+rows that are **CANCELLED**, **FAILED**, **TIMEOUT**, **OUT_OF_MEMORY**,
+**NODE_FAIL** or **PREEMPTED**, and for **PREPARED** rows whose input was
+edited after preview. Desktop checks each state on the HPC first and changes
+nothing if a selected job is pending, running, finished or unconfirmed. Then
+it keeps a copy of each old receipt beside the input (`….inkly.json.rerun-….bak`)
+and prepares the file as it is now. The new job keeps the file's original HPC
+connection and results folder and uses your current time-limit setting.
+**Run again never submits:** the list is previewed again, and you choose
+**Submit prepared jobs** as usual. It refuses to run if a returned log with the
+same name already exists, so earlier results are never overwritten. Completed
+jobs are not run again; copy the input to a new file name instead.
+
+If you edit an input after it was prepared, Preview shows the row as, for
+example, **PREPARED (input edited)** instead of stopping. The recorded job is
+left as it is, and the edited file is never submitted under the old
+preparation. To submit the edits, select the row and choose **Run again**. A
+pending or running job must be cancelled or finish first.
 
 If a saved receipt refers to a bundle that is missing on the HPC, Desktop offers
 an explicit **Re-prepare** confirmation. Accepting archives the old receipt
@@ -245,6 +284,10 @@ remote log counts may therefore differ. Slow, blocked or failed logging must
 not prevent the normal safe job workflow. No event is proof that a Slurm
 submission succeeded; rely on the existing receipt and verified scheduler job
 state for that.
+
+Cancel and Run again add `desktop_cancel` (approved, requested or unsupported;
+count or job ID) and `desktop_rerun` (approved or prepared; count) events.
+Older HPC copies ignore event types they do not know.
 
 The Windows executable and the HPC `inkly` package must be upgraded together
 for remote event delivery. Until the new HPC endpoint is installed, treat
