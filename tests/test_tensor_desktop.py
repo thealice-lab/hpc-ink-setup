@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import warnings
 
 import pytest
 
@@ -558,5 +559,338 @@ def test_native_window_add_remove_preview_and_confirmation(
         assert len(app.files) == 1 and app.review is None
         assert str(app.submit_button["state"]) == "disabled"
         assert app.table.item(str(w.paths[1]))["values"][6] == "Not previewed"
+    finally:
+        app.close()
+
+
+native_display = pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+SAMPLE_RESOURCES = {
+    "cpus": 16,
+    "slurm_memory_mib": 42326,
+    "gaussian_memory_mb": 31744,
+    "hours": 1,
+}
+
+
+def summary_row(path, state):
+    return {"path": path, "state": state, "resources": dict(SAMPLE_RESOURCES)}
+
+
+def queue_before_running(workflow, monkeypatch):
+    """Report one PENDING status after sbatch, as Slurm did for a real job."""
+    w = workflow
+
+    class QueuedSession(backend.bridge.Session):
+        def exchange(self, request, *, receipt):
+            response = super().exchange(request, receipt=receipt)
+            record = w.records[receipt["bundle"]]
+            if request["action"] == "submit":
+                record["state"] = "PENDING"
+            elif response.get("state") == "PENDING":
+                record["state"] = "RUNNING"
+            return response
+
+    monkeypatch.setattr(backend.bridge, "Session", QueuedSession)
+
+
+def replay_overviews(events, review=None, rows=None):
+    """Mirror the window's row/review bookkeeping without a display."""
+    import tensor_desktop_status as status
+
+    rows = {} if rows is None else rows
+    texts = []
+    for kind, data in events:
+        if kind == "row":
+            rows[data["path"]] = data
+        elif kind == "review":
+            review = data
+        else:
+            continue
+        texts.append(status.overview_text(review, rows.values()))
+    return texts, review, rows
+
+
+def test_support_contact_is_the_approved_public_address():
+    import tensor_desktop_status as status
+
+    assert status.SUPPORT_EMAIL == "rrv9177@uncw.edu"
+    assert status.SUPPORT_TEXT == "Questions or issues? Contact: rrv9177@uncw.edu"
+    assert status.SUPPORT_URL == "mailto:rrv9177@uncw.edu"
+
+
+@pytest.mark.parametrize("recovered", [[], ["sample_1.gjf"]])
+def test_pre_submit_preview_wording_is_preserved(recovered):
+    import tensor_desktop_status as status
+
+    review = {"count": 2, "cpus": 4, "memory_mib": 2048, "recovered": recovered}
+    expected = (
+        "2 prepared job(s). If all start together: 4 CPUs and 2,048 MiB "
+        "Slurm memory. Slurm decides start times."
+    )
+    if recovered:
+        expected += (
+            "\nRecovered handoff(s): sample_1.gjf. Check for any earlier running "
+            "calculation before submitting a replacement."
+        )
+    rows = [summary_row("a", "PREPARED"), summary_row("b", "PREPARED")]
+    assert status.overview_text(review, rows) == expected
+
+
+def test_overview_follows_real_rows_from_prepared_to_pending_to_returned(
+    workflow, monkeypatch
+):
+    w = workflow
+    queue_before_running(w, monkeypatch)
+    w.controller.preview(w.paths[:1], SETTINGS)
+    texts, review, rows = replay_overviews(w.events)
+    assert texts[-1].startswith("1 prepared job(s). If all start together: 2 CPUs")
+
+    w.events.clear()
+    w.controller.submit(w.controller.review_id, True)
+    texts, review, rows = replay_overviews(w.events, review, rows)
+    assert review is None
+    # Once the approval is consumed, no summary may still call this work prepared.
+    assert not any("prepared job(s)" in text for text in texts)
+    states = [data["state"] for kind, data in w.events if kind == "row"]
+    assert states == ["PREPARED", "SUBMITTED", "PENDING", "COMPLETED", "RETURNED"]
+    pending = texts[states.index("PENDING") + 1]
+    assert pending.startswith("Current status of 1 file(s): 1 PENDING.")
+    assert "2 CPUs, 1,024 MiB Slurm memory (not measured usage)" in pending
+    assert texts[-1] == (
+        "Current status of 1 file(s): 1 RETURNED.\n"
+        "RETURNED logs are verified; use Open results folder."
+    )
+    assert actions(w).count("submit") == 1
+
+
+def test_overview_reports_mixed_states_without_implying_only_prepared():
+    import tensor_desktop_status as status
+
+    rows = [
+        summary_row("a", "PREPARED"),
+        summary_row("b", "RUNNING"),
+        summary_row("c", "PENDING"),
+        summary_row("d", "RETURNED"),
+        summary_row("e", "CANCELLED by 4242"),
+        summary_row("f", "SUBMISSION_UNKNOWN"),
+        summary_row("g", "COMPLETED"),
+    ]
+    text = status.overview_text(None, rows)
+    assert text.splitlines()[0] == (
+        "Current status of 7 file(s): 1 PREPARED, 1 SUBMISSION_UNKNOWN, "
+        "1 PENDING, 1 RUNNING, 1 COMPLETED, 1 RETURNED, 1 CANCELLED."
+    )
+    assert "prepared job(s)" not in text
+    assert "PREPARED files are not submitted." in text
+    assert "check your Slurm jobs before submitting again" in text
+    # Only jobs still held by Slurm count toward requested limits.
+    assert "2 submitted job(s): 32 CPUs, 84,652 MiB" in text
+    assert "not measured usage" in text
+    assert "Ended jobs need inspection; Inkly never resubmits them." in text
+    assert "COMPLETED logs return after verification." in text
+
+    review = {"count": 1, "cpus": 16, "memory_mib": 42326, "recovered": []}
+    with_review = status.overview_text(review, rows)
+    assert with_review.startswith("1 prepared job(s). If all start together")
+    assert "Also in this list: 1 SUBMISSION_UNKNOWN, 1 PENDING, 1 RUNNING" in (
+        with_review
+    )
+    assert "recorded jobs are never resubmitted" in with_review
+
+    finished = status.overview_text(
+        None, [summary_row("a", "RETURNED"), summary_row("b", "FAILED")]
+    )
+    assert "Requested limits" not in finished and "PREPARED" not in finished
+
+
+def test_interrupted_or_inflight_submission_never_claims_nothing_was_submitted():
+    import tensor_desktop_status as status
+
+    rows = [summary_row("a", "PREPARED"), summary_row("b", "SUBMITTED")]
+    interrupted = status.overview_text(None, rows, unconfirmed={"a"})
+    assert "may already be submitted" in interrupted
+    assert "are not submitted" not in interrupted
+    inflight = status.overview_text(None, rows[:1], submitting=True)
+    assert "wait for job IDs" in inflight and "are not submitted" not in inflight
+    assert "are not submitted" in status.overview_text(None, rows[:1])
+
+
+@native_display
+def test_native_window_shows_contact_and_opens_mailto(workflow, tmp_path, monkeypatch):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    try:
+        assert app.contact.cget("text") == (
+            "Questions or issues? Contact: rrv9177@uncw.edu"
+        )
+        assert app.contact.winfo_manager() == "pack"
+        assert app.contact.master is app.banner
+        for sequence in ("<Button-1>", "<Return>", "<space>"):
+            assert app.contact.bind(sequence)
+        opened, shown = [], []
+        monkeypatch.setattr(
+            gui.messagebox, "showinfo", lambda *args, **kwargs: shown.append(args)
+        )
+        monkeypatch.setattr(gui.webbrowser, "open", lambda url: opened.append(url) or 1)
+        assert app.contact_support() == "break"
+        assert opened == ["mailto:rrv9177@uncw.edu"] and not shown
+
+        monkeypatch.setattr(gui.webbrowser, "open", lambda url: False)
+        app.contact_support()
+        assert "rrv9177@uncw.edu" in shown[-1][1]
+        assert root.clipboard_get() == "rrv9177@uncw.edu"
+    finally:
+        app.close()
+
+
+@native_display
+def test_native_overview_tracks_submission_until_logs_return(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    queue_before_running(w, monkeypatch)
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    try:
+        app.add_paths(w.paths[:1])
+        w.controller.preview(w.paths[:1], SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        assert app.overview.cget("text").startswith("1 prepared job(s).")
+
+        w.events.clear()
+        w.controller.submit(w.controller.review_id, True)
+        app.busy, app.action = True, "submit"
+        texts = []
+        for event in [*w.events, ("done", "submit")]:
+            app.events.put(event)
+            app.drain()
+            texts.append(app.overview.cget("text"))
+        assert any(
+            text.startswith("Current status of 1 file(s): 1 PENDING.") for text in texts
+        )
+        assert not any("prepared job(s)" in text for text in texts)
+        assert texts[-1].startswith("Current status of 1 file(s): 1 RETURNED.")
+        assert app.table.item(str(w.paths[0]))["values"][6] == "RETURNED"
+        assert str(app.submit_button["state"]) == "disabled"
+    finally:
+        app.close()
+
+
+@native_display
+def test_native_interrupted_submit_keeps_prepared_rows_unconfirmed(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    monkeypatch.setattr(gui.messagebox, "showerror", lambda *args, **kwargs: None)
+    try:
+        app.add_paths(w.paths[:1])
+        w.controller.preview(w.paths[:1], SETTINGS)
+        rows = [event for event in w.events if event[0] == "row"]
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.busy, app.action = True, "submit"
+        for event in [
+            ("review", None),
+            ("error", "SSH interrupted or timed out; keep the receipt and resume"),
+            ("done", "submit"),
+        ]:
+            app.events.put(event)
+        app.drain()
+        text = app.overview.cget("text")
+        assert "may already be submitted" in text
+        assert "are not submitted" not in text
+        # The next real status read replaces the doubt with the recorded state.
+        unknown = {**rows[-1][1], "state": "SUBMISSION_UNKNOWN"}
+        app.events.put(("row", unknown))
+        app.drain()
+        text = app.overview.cget("text")
+        assert text.startswith("Current status of 1 file(s): 1 SUBMISSION_UNKNOWN.")
+        assert "check your Slurm jobs before submitting again" in text
+        assert not app.unconfirmed
+    finally:
+        app.close()
+
+
+def settle(root):
+    for _ in range(10):
+        root.update_idletasks()
+        root.update()
+
+
+@native_display
+@pytest.mark.parametrize("scale", [100, 125, 150])
+@pytest.mark.parametrize("size", ["1120x760", "940x640"])
+def test_native_contact_never_obstructs_controls_at_common_scaling(
+    workflow, tmp_path, scale, size
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    root = tk.Tk()
+    # Windows 100/125/150% is 96/120/144 DPI; Tk scaling is pixels per point.
+    # Set it absolutely: CI's own display scaling is not 100%.
+    root.tk.call("tk", "scaling", 96 * scale / 100 / 72)
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    try:
+        root.geometry(size + "+0+0")
+        settle(root)
+        shown = app.layout_report()
+        # Measure the same window without the contact line to isolate its effect.
+        app.contact.pack_forget()
+        settle(root)
+        baseline = app.layout_report()
+        evidence = {"with_contact": shown, "without_contact": baseline}
+        if baseline["clipped"] or baseline["table_height"] <= 60:
+            # Recorded for review: a limit of the existing layout, not of the contact.
+            warnings.warn(f"Desktop layout at {size}, {scale}%: {evidence}")
+        assert shown["contact"] == "Questions or issues? Contact: rrv9177@uncw.edu"
+        assert shown["contact_visible"], evidence
+        # The contact line may never be the reason a control is cut off.
+        assert set(shown["clipped"]) <= set(baseline["clipped"]), evidence
+        # Nor may it collapse a table that is otherwise visible.
+        if baseline["table_height"] > 60:
+            assert shown["table_height"] > 30, evidence
+        if scale == 100:
+            # At 100% everything must fit, at the default and minimum sizes.
+            assert shown["controls_visible"], evidence
+            assert shown["table_height"] > 30, evidence
     finally:
         app.close()

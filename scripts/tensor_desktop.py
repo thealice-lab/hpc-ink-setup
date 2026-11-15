@@ -13,11 +13,13 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, font, messagebox, ttk
+import webbrowser
 
 # Source launches and the packaged app use the same stdlib-only diagnostic code.
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import tensor_desktop_status as status
 import tensor_picker as picker
 from tensor_desktop_backend import DesktopController
 
@@ -55,6 +57,9 @@ class DesktopApp:
         self.rows = {}
         self.review = None
         self.recovery_request = None
+        self.action = None
+        # PREPARED rows displayed before an interrupted submission may be stale.
+        self.unconfirmed = set()
         self.busy = False
         self.closed = False
         self.events = queue.Queue()
@@ -97,8 +102,10 @@ class DesktopApp:
         self.root.configure(background="#f3f6fa")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(2, weight=1)
-        banner = tk.Frame(self.root, background="#142b45", padx=24, pady=18)
+        # Slightly tighter padding offsets most of the added contact line height.
+        banner = tk.Frame(self.root, background="#142b45", padx=24, pady=14)
         banner.grid(row=0, column=0, sticky="ew")
+        self.banner = banner
         tk.Label(
             banner,
             text="Inkly Desktop",
@@ -113,6 +120,22 @@ class DesktopApp:
             foreground="#bed6e8",
             font=("Segoe UI", 11),
         ).pack(anchor="w", pady=(4, 0))
+        # The full address stays readable even when no email app is configured.
+        self.contact = tk.Label(
+            banner,
+            text=status.SUPPORT_TEXT,
+            background="#142b45",
+            foreground="#dcefff",
+            font=("Segoe UI", 10, "underline"),
+            cursor="hand2",
+            takefocus=1,
+            highlightthickness=1,
+            highlightbackground="#142b45",
+            highlightcolor="white",
+        )
+        self.contact.pack(anchor="w", pady=(2, 0))
+        for sequence in ("<Button-1>", "<Return>", "<space>"):
+            self.contact.bind(sequence, self.contact_support)
         tools = ttk.Frame(self.root, padding=(22, 14))
         tools.grid(row=1, column=0, sticky="ew")
         tools.columnconfigure(0, weight=1)
@@ -205,6 +228,14 @@ class DesktopApp:
             wraplength=1000,
         )
         self.overview.grid(row=3, column=0, sticky="w", pady=(12, 8))
+        # Wrap the summary inside narrower or scaled windows instead of clipping it.
+        content.bind(
+            "<Configure>",
+            lambda event: self.overview.configure(
+                wraplength=max(300, event.width - 44)
+            ),
+            add="+",
+        )
         actions = ttk.Frame(content)
         actions.grid(row=4, column=0, sticky="ew")
         self.preview_button = ttk.Button(
@@ -276,6 +307,7 @@ class DesktopApp:
         if self.busy:
             return
         self.busy = True
+        self.action = action
         self.controller.cancelled.clear()
         self.status.configure(
             text={
@@ -310,21 +342,12 @@ class DesktopApp:
                             data["job_id"],
                         ),
                     )
+                # A fresh HPC status read replaces any interrupted-submit doubt.
+                self.unconfirmed.discard(data["path"])
+                self.refresh_overview()
             elif kind == "review":
                 self.review = data
-                if data:
-                    overview = (
-                        f"{data['count']} prepared job(s). If all start together: "
-                        f"{data['cpus']} CPUs and {data['memory_mib']:,} MiB "
-                        "Slurm memory. Slurm decides start times."
-                    )
-                    if data.get("recovered"):
-                        overview += (
-                            "\nRecovered handoff(s): "
-                            + ", ".join(data["recovered"])
-                            + ". Check for any earlier running calculation before submitting a replacement."
-                        )
-                    self.overview.configure(text=overview)
+                self.refresh_overview()
             elif kind == "recovery_required":
                 self.recovery_request = data
             elif kind == "target":
@@ -333,6 +356,9 @@ class DesktopApp:
                 )
             elif kind == "error":
                 self.review = None
+                if self.action == "submit":
+                    self.mark_unconfirmed()
+                self.refresh_overview()
                 self.log(data)
                 self.status.configure(
                     text="Stopped. See the message below; recorded jobs are preserved."
@@ -340,7 +366,9 @@ class DesktopApp:
                 messagebox.showerror("Handoff stopped", data, parent=self.root)
             elif kind == "done":
                 self.busy = False
+                self.action = None
                 self.progress.stop()
+                self.refresh_overview()
                 if data != "close" and self.review:
                     self.status.configure(
                         text="Preview ready. Review each row before submitting."
@@ -397,6 +425,110 @@ class DesktopApp:
         self.activity.see("end")
         self.activity.configure(state="disabled")
 
+    def refresh_overview(self):
+        """Summarize the latest displayed rows, or the unconsumed preview approval."""
+        rows = [self.rows[str(path)] for path in self.files if str(path) in self.rows]
+        text = status.overview_text(
+            self.review,
+            rows,
+            self.unconfirmed,
+            submitting=self.busy and self.action == "submit",
+        )
+        if text:
+            self.overview.configure(text=text)
+
+    def mark_unconfirmed(self):
+        # An interrupted submit may have reached sbatch, so a PREPARED row
+        # shown before it is no longer proof that nothing was submitted.
+        self.unconfirmed = {
+            path
+            for path, row in self.rows.items()
+            if status.state_name(row.get("state")) == "PREPARED"
+        }
+
+    def contact_support(self, event=None):
+        opened = False
+        try:
+            opened = webbrowser.open(status.SUPPORT_URL)
+        except (OSError, webbrowser.Error):
+            opened = False
+        if not opened:
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(status.SUPPORT_EMAIL)
+                copied = " The address was copied to the clipboard."
+            except tk.TclError:
+                copied = ""
+            messagebox.showinfo(
+                "Contact Inkly support",
+                f"No email app opened. Write to {status.SUPPORT_EMAIL} "
+                f"from any email service.{copied}",
+                parent=self.root,
+            )
+        return "break"
+
+    def layout_report(self):
+        """Geometry evidence for the packaged smoke test and scaled-font tests."""
+        self.root.update_idletasks()
+        left, top = self.root.winfo_rootx(), self.root.winfo_rooty()
+        width, height = self.root.winfo_width(), self.root.winfo_height()
+
+        def box(widget):
+            x, y = widget.winfo_rootx() - left, widget.winfo_rooty() - top
+            return x, y, x + widget.winfo_width(), y + widget.winfo_height()
+
+        def fits(widget):
+            # Children are clipped by every parent frame, not only by the window.
+            x1, y1, x2, y2 = box(widget)
+            if not widget.winfo_ismapped() or x2 - x1 <= 1 or y2 - y1 <= 1:
+                return False
+            parent = widget.master
+            while parent is not None and parent is not self.root:
+                px1, py1, px2, py2 = box(parent)
+                if x1 < px1 or y1 < py1 or x2 > px2 or y2 > py2:
+                    return False
+                parent = parent.master
+            return x1 >= 0 and y1 >= 0 and x2 <= width and y2 <= height
+
+        controls = {
+            "settings": self.settings_button,
+            "add": self.add_button,
+            "folder": self.folder_button,
+            "remove": self.remove_button,
+            "clear": self.clear_button,
+            "preview": self.preview_button,
+            "submit": self.submit_button,
+            "monitor": self.monitor_button,
+            "stop": self.stop_button,
+            "script": self.script_button,
+            "results": self.results_button,
+            "status": self.status,
+        }
+        clipped = sorted(name for name, widget in controls.items() if not fits(widget))
+        shown = self.contact.winfo_manager() == "pack"
+        cx1, cy1, cx2, cy2 = box(self.contact)
+        overlaps = shown and any(
+            x1 < cx2 and cx1 < x2 and y1 < cy2 and cy1 < y2
+            for x1, y1, x2, y2 in map(box, controls.values())
+        )
+        return {
+            "contact": self.contact.cget("text"),
+            "contact_visible": shown
+            and fits(self.contact)
+            and cy2 <= box(self.banner)[3]
+            and not overlaps,
+            "controls_visible": not clipped,
+            "clipped": clipped,
+            "table_height": self.table.winfo_height(),
+            # Diagnostics for layout reviews at different display scaling.
+            "window_size": [width, height],
+            "tk_scaling": round(float(self.root.tk.call("tk", "scaling")), 3),
+            "screen": [self.root.winfo_screenwidth(), self.root.winfo_screenheight()],
+            "contact_height": cy2 - cy1 if shown else 0,
+            "bottoms": {name: box(widget)[3] for name, widget in controls.items()},
+            "requested_height": self.root.winfo_reqheight(),
+        }
+
     def buttons(self):
         for widget in (
             self.add_button,
@@ -432,6 +564,7 @@ class DesktopApp:
     def invalidate(self):
         self.review = None
         self.rows = {}
+        self.unconfirmed = set()
         for path in self.files:
             self.table.item(
                 str(path),
@@ -605,6 +738,9 @@ class DesktopApp:
     def stop(self):
         self.controller.stop()
         self.review = None
+        if self.busy and self.action == "submit":
+            self.mark_unconfirmed()
+        self.refresh_overview()
         self.status.configure(
             text="Stopping the connection. Submitted HPC jobs continue."
         )
@@ -678,7 +814,8 @@ def main(argv=None):
     app = DesktopApp(root)
     if args.smoke_test:
         # Local build verification only: draw the real window and invoke no SSH.
-        root.update()
+        for _ in range(5):
+            root.update()
         ssh = shutil.which("ssh")
         checked = (
             subprocess.run(
@@ -700,6 +837,7 @@ def main(argv=None):
                     "ssh": bool(checked and checked.returncode == 0),
                     "askpass": bool(bundled_askpass()),
                     "frozen": bool(getattr(sys, "frozen", False)),
+                    **app.layout_report(),
                 }
             ),
             encoding="utf-8",
