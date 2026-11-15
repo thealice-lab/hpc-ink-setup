@@ -3,6 +3,7 @@
 from contextlib import ExitStack
 from copy import deepcopy
 import hashlib
+import queue
 import shutil
 import threading
 import uuid
@@ -28,6 +29,10 @@ class DesktopController:
         # Jobs cancelled through Inkly in this window; monitoring then skips
         # repeating the cancellation message.
         self.cancelled_paths = set()
+        # Cancel requests made while monitoring are handled by the monitor loop
+        # on its own SSH session; `wake` ends its wait between checks early.
+        self.requests = queue.Queue()
+        self.wake = threading.Event()
 
     def audit(self, event_type, payload=None):
         try:
@@ -46,6 +51,13 @@ class DesktopController:
     def stop(self):
         self.audit("desktop_stop")
         self.cancelled.set()
+        self.wake.set()
+        # Requests not yet handled are dropped; the rows show what happened.
+        while True:
+            try:
+                self.requests.get_nowait()
+            except queue.Empty:
+                break
         # Closing SSH never issues scancel. Persisted receipts recover uncertain calls.
         process = getattr(self.session, "process", None)
         if process is not None:
@@ -301,11 +313,57 @@ class DesktopController:
                 )
         self.monitor()
 
+    def request_cancel(self, selected, settings):
+        """Called from the window thread while monitoring: cancel these rows next.
+
+        The monitor loop handles the request on its open SSH session, so no new
+        sign-in is needed, then keeps watching.
+        """
+        self.requests.put((list(selected), dict(settings)))
+        self.wake.set()
+
+    def handle_requests(self):
+        while True:
+            try:
+                selected, settings = self.requests.get_nowait()
+            except queue.Empty:
+                return
+            if not self.session:
+                self.emit("notice", "Desktop is not connected; nothing was cancelled.")
+                continue
+            target = None
+            try:
+                items = picker.plan(
+                    picker.selections(selected),
+                    picker.validate_settings(dict(settings)),
+                    "resume",
+                )
+                target = tuple(
+                    items[0]["receipt"].get(k) for k in ("host", "ink_path", "auth")
+                )
+            except ValueError as error:
+                self.emit("notice", f"Nothing was cancelled: {error}")
+                continue
+            if target != self.target:
+                # Switching connections would end the watch; do it separately.
+                self.emit(
+                    "notice",
+                    "Those rows use a different HPC connection from the jobs being "
+                    "watched, so nothing was cancelled. Stop watching first, then "
+                    "cancel them.",
+                )
+                continue
+            try:
+                self.cancel_jobs(selected, settings)
+            except bridge.MissingBundleError as error:
+                self.emit("notice", f"Nothing was cancelled: {error}")
+
     def monitor(self):
         if not self.session or not self.items:
             raise ValueError("Preview the files first to load their saved handoffs.")
         pending = list(self.items)
-        while pending:
+        while True:
+            self.handle_requests()
             for item in list(pending):
                 self.check_stop()
                 response = self.session.exchange(
@@ -338,8 +396,13 @@ class DesktopController:
                     raise ValueError(
                         f"{item['path'].name}: {state} (exit {response.get('exit_code')}). Other jobs may continue. Keep receipts and inspect this job."
                     )
-            if pending and self.cancelled.wait(self.interval):
-                self.check_stop()
+            if not pending:
+                break
+            # Wait for the next check; Stop watching or a cancel request wakes early.
+            self.wake.wait(self.interval)
+            self.wake.clear()
+            self.check_stop()
+        self.handle_requests()  # A request that arrived during the last check.
         self.emit(
             "message",
             "Check complete. Open verified returned logs in TENSOR's Analysis & 3D view. Prepared jobs remain unsubmitted.",

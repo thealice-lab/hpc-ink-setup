@@ -633,6 +633,70 @@ def test_monitor_treats_cancelled_as_final_and_keeps_watching_others(workflow):
     assert "submit" not in actions(w)
 
 
+def test_cancel_while_watching_uses_the_open_connection(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    recorded_job(w, w.paths[1], "RUNNING", "2")
+    connections = len(w.connections)
+    w.events.clear()
+    w.controller.request_cancel([w.paths[0]], SETTINGS)
+    w.controller.monitor()
+    assert len(w.connections) == connections  # No reconnect, no new sign-in.
+    assert record_for(w, w.paths[0])["state"] == "CANCELLED by 1000"
+    assert rows_for(w, w.paths[1])[-1]["state"] == "RETURNED"
+    assert "Cancelled sample_1.gjf: job 1 is CANCELLED." in messages(w)
+    # The watch does not repeat the cancellation it just made.
+    assert not any("was cancelled. Inkly never resubmits" in m for m in messages(w))
+    assert "submit" not in actions(w)
+
+
+def test_cancel_request_wakes_a_waiting_watch(workflow):
+    import threading
+    import time
+
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    recorded_job(w, w.paths[1], "PENDING", "2")
+    w.controller.interval = 30
+    watch = threading.Thread(target=w.controller.monitor, daemon=True)
+    watch.start()
+    deadline = time.monotonic() + 5
+    while actions(w).count("status") < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)  # Let the first check finish and the 30 s wait begin.
+    w.controller.request_cancel(w.paths, SETTINGS)
+    watch.join(timeout=5)
+    assert not watch.is_alive(), "the watch should wake and finish, not wait 30 s"
+    assert record_for(w, w.paths[0])["state"] == "CANCELLED by 1000"
+    assert record_for(w, w.paths[1])["state"] == "CANCELLED by 1000"
+
+
+def test_stop_watching_drops_cancel_requests_not_yet_handled(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    w.controller.request_cancel([w.paths[0]], SETTINGS)
+    w.controller.stop()
+    assert w.controller.requests.empty()
+    assert w.controller.wake.is_set()
+    assert record_for(w, w.paths[0])["state"] == "PENDING"
+
+
+def test_watch_cancel_for_another_connection_keeps_watching(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    recorded_job(w, w.paths[1], "RUNNING", "2")
+    w.controller.target = ("someone@elsewhere", "~/other/ink", "configured")
+    w.events.clear()
+    w.controller.request_cancel([w.paths[0]], SETTINGS)
+    w.controller.handle_requests()
+    assert "different HPC connection" in notices(w)[0]
+    assert "cancel" not in actions(w)
+    assert record_for(w, w.paths[0])["state"] == "PENDING"
+
+
 def test_cancelled_row_does_not_block_submitting_other_prepared_files(workflow):
     w = workflow
     w.controller.preview(w.paths, SETTINGS)
