@@ -18,6 +18,7 @@ import time
 from inkly.cluster_profile import resolve_cluster_profile
 from inkly.core.storage import history_lock, private_directory, private_open
 from inkly.gaussian.job_spec import GaussianJobSpec
+from inkly.gaussian.job_list import list_jobs
 from inkly.gaussian.sbatch import generate_sbatch
 
 
@@ -25,7 +26,7 @@ MAX_INPUT = 5 * 1024 * 1024
 MAX_OUTPUT = 64 * 1024 * 1024
 # Desktop asks for these before using newer operations; older endpoints reply
 # "Unsupported operation" to "version" and keep the session open.
-CAPABILITIES = ("prepare", "submit", "status", "fetch", "cancel", "version")
+CAPABILITIES = ("prepare", "submit", "status", "fetch", "cancel", "version", "jobs")
 # Slurm accounting can lag scancel by a moment; re-read briefly, never retry it.
 CANCEL_STATUS_READS = 5
 
@@ -257,6 +258,8 @@ def handle(request, root=None):
             "version": __version__,
             "capabilities": list(CAPABILITIES),
         }
+    if action == "jobs":
+        return {"bundle": bundle, **list_jobs(_scheduler, Path.home())}
     root = private_directory(root or Path.home() / ".inkly" / "tensor")
     directory = root / bundle
     if action == "prepare":
