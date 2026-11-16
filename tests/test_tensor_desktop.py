@@ -92,6 +92,16 @@ def workflow(tmp_path, monkeypatch):
                     "version": endpoint.get("version", "0.4.2"),
                     "capabilities": endpoint["capabilities"],
                 }
+            if action == "jobs":
+                return {
+                    "bundle": bundle,
+                    "jobs": [dict(job) for job in endpoint.get("jobs", [])],
+                    "unavailable": [],
+                    "truncated": False,
+                    "observed_at": "2026-11-15T12:00:00+00:00",
+                }
+            if action == "input":
+                return {**endpoint["inputs"][bundle], "bundle": bundle}
             if action == "cancel":
                 assert request.get("confirm") is True
                 if records[bundle]["state"] != "PENDING":
@@ -263,11 +273,13 @@ def record_for(workflow, path):
 def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
     c = workflow.controller
     before = {path: path.read_bytes() for path in workflow.paths}
+    every = ["prepare", "submit", "status", "fetch", "cancel", "job_details", "jobs"]
+    workflow.endpoint["capabilities"] = every
     if probe == "older-release":
         # A compatible HPC copy from an earlier release is not a warning.
         workflow.endpoint["version"] = "0.4.0"
     elif probe == "no-cancel":
-        workflow.endpoint["capabilities"] = ["prepare", "submit", "status", "fetch"]
+        workflow.endpoint["capabilities"] = [op for op in every if op != "cancel"]
     elif probe == "old":
         workflow.endpoint["capabilities"] = None
     elif probe == "missing":
@@ -303,6 +315,211 @@ def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
         assert "prepare, submit, fetch" in notice
     if probe in {"current", "older-release"}:
         assert "Not available" not in notice
+
+
+def recorded(workflow, path):
+    return json.loads(path.with_suffix(".gjf.inkly.json").read_text())["bundle"]
+
+
+def hpc_job(bundle, state, name="sample_1.gjf", ended_days=None, job_id="123"):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    return {
+        "bundle": bundle,
+        "name": name,
+        "job_id": job_id,
+        "submission": "PREPARED" if state == "PREPARED" else "SUBMITTED",
+        "state": state,
+        "prepared_at": (now - timedelta(days=30)).isoformat(),
+        "submitted_at": (now - timedelta(days=30)).isoformat(),
+        "ended_at": None
+        if ended_days is None
+        else (now - timedelta(days=ended_days)).isoformat(),
+    }
+
+
+def input_copy(name, data):
+    return {
+        "name": name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "data": base64.b64encode(data).decode(),
+    }
+
+
+def found_event(workflow):
+    return [data for kind, data in workflow.events if kind == "jobs_found"][-1]
+
+
+def test_load_my_jobs_finds_recent_files_and_lists_the_others(workflow):
+    w, c = workflow, workflow.controller
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    c.preview(w.paths, SETTINGS)
+    first, second = (recorded(w, path) for path in w.paths)
+    w.endpoint["jobs"] = [
+        hpc_job(first, "PENDING"),
+        hpc_job(second, "COMPLETED", "sample_2.gjf", ended_days=1),
+        hpc_job("c" * 32, "RUNNING", "elsewhere.gjf"),
+        hpc_job("d" * 32, "COMPLETED", "old.gjf", ended_days=10),
+        hpc_job("e" * 32, "PREPARED", "never.gjf", job_id=""),
+    ]
+    before = sorted(p.name for p in w.paths[0].parent.iterdir())
+    c.load_jobs(SETTINGS)
+    found = found_event(w)
+    assert found["paths"] == [str(path.resolve()) for path in w.paths]
+    # Only the recent job Desktop cannot find here needs a copy.
+    assert [job["bundle"] for job in found["restore"]] == ["c" * 32]
+    assert found["replaced"] == 0 and not found["from_history"]
+    assert sorted(p.name for p in w.paths[0].parent.iterdir()) == before
+    assert len(w.connections) == 1
+    assert actions(w)[-2:] == ["version", "jobs"]
+    c.execute("close")
+    events = c.journal.take()
+    load = [e["payload"] for e in events if e["event_type"] == "desktop_jobs"]
+    assert {"action": "load", "count": 3}.items() <= load[-1].items()
+    # Counts only: no file or job names in diagnostics.
+    assert "elsewhere" not in json.dumps(events) and "sample_" not in json.dumps(events)
+
+
+def test_a_run_again_replacement_is_not_loaded_again(workflow):
+    w, c = workflow, workflow.controller
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    c.preview(w.paths[:1], SETTINGS)
+    old = recorded(w, w.paths[0])
+    c.index.replaced(old)
+    w.endpoint["jobs"] = [hpc_job(old, "CANCELLED by 1000", ended_days=1)]
+    c.load_jobs(SETTINGS)
+    found = found_event(w)
+    assert found["paths"] == [] and found["restore"] == [] and found["replaced"] == 1
+    # Chosen in Job history, the old job gets a copy of its own.
+    c.load_jobs(SETTINGS, [old])
+    found = found_event(w)
+    assert [job["bundle"] for job in found["restore"]] == [old]
+    assert found["from_history"]
+
+
+def test_copies_of_jobs_from_elsewhere_work_like_added_files(workflow, tmp_path):
+    w, c = workflow, workflow.controller
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    data = b"%nprocshared=2\n%mem=768MB\n# hf/sto-3g\n\nElsewhere\n\n0 1\nH 0 0 0\n\n"
+    bundle = "c" * 32
+    w.endpoint["inputs"] = {bundle: input_copy("elsewhere.gjf", data)}
+    w.records[bundle] = {
+        "name": "elsewhere.gjf",
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "script_sha256": "abc",
+        "stages": 1,
+        "submission": "SUBMITTED",
+        "state": "PENDING",
+        "job_id": "456",
+        "resources": {
+            "cpus": 2,
+            "slurm_memory_mib": 1024,
+            "gaussian_memory_mb": 768,
+            "hours": 2,
+        },
+    }
+    folder = tmp_path / "copies"
+    job = hpc_job(bundle, "PENDING", "elsewhere.gjf")
+    c.restore_jobs([job], folder, SETTINGS)
+    restored = [data for kind, data in w.events if kind == "jobs_restored"][-1]
+    path = folder / f"elsewhere-{bundle[:8]}" / "elsewhere.gjf"
+    assert restored["paths"] == [str(path)]
+    assert path.read_bytes() == data
+    receipt = json.loads(path.with_suffix(".gjf.inkly.json").read_text())
+    assert receipt == {
+        "host": SETTINGS["host"],
+        "ink_path": SETTINGS["ink_path"],
+        "bundle": bundle,
+        "auth": SETTINGS["auth"],
+        "output": str((path.parent / "returned").resolve()),
+    }
+    assert c.index.locate(bundle) == ("found", path.resolve())
+    # Loading it again reuses the copy instead of writing another.
+    c.restore_jobs([job], folder, SETTINGS)
+    assert [data for kind, data in w.events if kind == "jobs_restored"][-1] == restored
+    assert sorted(p.name for p in path.parent.iterdir()) == [
+        "elsewhere.gjf",
+        "elsewhere.gjf.inkly.json",
+    ]
+    # The copy previews like any added file: its recorded job, nothing new.
+    c.preview([path], SETTINGS)
+    rows = [data for kind, data in w.events if kind == "row"]
+    assert rows[-1]["state"] == "PENDING" and rows[-1]["job_id"] == "456"
+    assert "prepare" not in actions(w)
+
+
+@pytest.mark.parametrize("problem", ["checksum", "unsafe-name", "existing-file"])
+def test_bad_copies_are_reported_and_never_written(workflow, tmp_path, problem):
+    w, c = workflow, workflow.controller
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    bundle, name = "c" * 32, "elsewhere.gjf"
+    copy = input_copy(name, b"%mem=1GB\n# hf\n\nx\n\n0 1\nH 0 0 0\n\n")
+    if problem == "checksum":
+        copy["sha256"] = "0" * 64
+    elif problem == "unsafe-name":
+        name = copy["name"] = "../outside.gjf"
+    w.endpoint["inputs"] = {bundle: copy}
+    folder = tmp_path / "copies"
+    if problem == "existing-file":
+        target = folder / f"elsewhere-{bundle[:8]}" / name
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"researcher's own different file")
+    c.restore_jobs([hpc_job(bundle, "PENDING", name)], folder, SETTINGS)
+    restored = [data for kind, data in w.events if kind == "jobs_restored"][-1]
+    assert restored["paths"] == []
+    assert any("was not copied" in data for kind, data in w.events if kind == "message")
+    assert not (tmp_path / "outside.gjf").exists()
+    if problem == "existing-file":
+        assert target.read_bytes() == b"researcher's own different file"
+        assert not target.with_suffix(".gjf.inkly.json").exists()
+    else:
+        assert not list(folder.rglob("*.inkly.json"))
+
+
+def test_job_history_lists_every_recorded_job(workflow):
+    w, c = workflow, workflow.controller
+    w.endpoint["capabilities"] += ["jobs"]
+    w.endpoint["jobs"] = [
+        hpc_job("a" * 32, "COMPLETED", ended_days=40),
+        hpc_job("b" * 32, "CANCELLED by 1000", ended_days=2),
+    ]
+    c.history(SETTINGS)
+    listing = [data for kind, data in w.events if kind == "history"][-1]
+    assert [job["bundle"] for job in listing["jobs"]] == ["a" * 32, "b" * 32]
+
+
+@pytest.mark.parametrize("operation", ["load_jobs", "history"])
+def test_job_lists_explain_an_older_hpc_copy(workflow, operation):
+    w, c = workflow, workflow.controller
+    getattr(c, operation)(SETTINGS)
+    notice = [data for kind, data in w.events if kind == "notice"][-1]
+    assert "needs an updated HPC copy of Inkly" in notice
+    assert not [kind for kind, _ in w.events if kind in {"jobs_found", "history"}]
+    assert "jobs" not in actions(w)
+
+
+def test_copying_explains_an_older_hpc_copy(workflow, tmp_path):
+    w, c = workflow, workflow.controller
+    w.endpoint["capabilities"] += ["jobs"]
+    c.restore_jobs([hpc_job("c" * 32, "PENDING")], tmp_path / "copies", SETTINGS)
+    assert "needs an updated HPC copy" in [d for k, d in w.events if k == "notice"][-1]
+    assert [d for k, d in w.events if k == "jobs_restored"][-1] == {"paths": []}
+    assert not (tmp_path / "copies").exists()
+
+
+def test_job_lists_run_inside_the_watch_on_its_connection(workflow):
+    w, c = workflow, workflow.controller
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    c.connect(SETTINGS)
+    c.request("load_jobs", SETTINGS)
+    c.request("history", SETTINGS)
+    c.request("load_jobs", {**SETTINGS, "host": "someone@elsewhere"})
+    c.handle_requests()
+    kinds = [kind for kind, _ in w.events]
+    assert "jobs_found" in kinds and "history" in kinds
+    assert "different HPC connection" in [d for k, d in w.events if k == "notice"][-1]
+    assert len(w.connections) == 1
 
 
 def test_connection_does_not_consume_an_existing_preview(workflow):
@@ -1167,76 +1384,6 @@ def test_bundled_dialog_fallback_restores_auth_environment(tmp_path, monkeypatch
     assert os.environ["INKLY_SSH_TARGET"] == "old-target"
 
 
-def test_my_jobs_without_files_reuses_connection_and_never_saves_receipts(workflow):
-    c = workflow.controller
-    workflow.endpoint["capabilities"].append("jobs")
-    c.connect(SETTINGS)
-    original = c.session.exchange
-
-    def exchange(request, **kwargs):
-        if request["action"] == "jobs":
-            return {
-                "jobs": [{"job_id": "42", "name": "PRIVATE_JOB_NAME"}],
-                "observed_at": "now",
-                "unavailable": [],
-            }
-        return original(request, **kwargs)
-
-    c.session.exchange = exchange
-    c.my_jobs(SETTINGS)
-    c.my_jobs(SETTINGS)
-    assert not c.items and c.review_id is None
-    assert len(workflow.connections) == 1
-    assert workflow.events[-1][0] == "my_jobs"
-    assert "PRIVATE_JOB_NAME" not in str(messages(workflow))
-    assert not list(workflow.paths[0].parent.glob("*.inkly.json"))
-    assert set(actions(workflow)) <= {"version"}
-
-
-def test_my_jobs_old_endpoint_and_watch_routing(workflow):
-    c = workflow.controller
-    c.preview(workflow.paths, SETTINGS)
-    review = c.review_id
-    c.request("my_jobs", dict(SETTINGS))
-    assert c.handle_requests() is False
-    assert "does not support My jobs" in workflow.events[-1][1]
-    assert c.review_id == review
-    assert len(workflow.connections) == 1
-    c.request("my_jobs", {**SETTINGS, "host": "different@cluster"})
-    c.handle_requests()
-    assert "different HPC connection" in workflow.events[-1][1]
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows Tk")
-def test_native_my_jobs_needs_no_files_and_shows_account_table(workflow, tmp_path):
-    import tkinter as tk
-    import tensor_desktop as gui
-
-    root = tk.Tk()
-    app = gui.DesktopApp(
-        root,
-        controller_factory=lambda *a, **k: workflow.controller,
-        settings_path=tmp_path / "settings.json",
-    )
-    try:
-        app.settings = dict(SETTINGS)
-        assert not app.files
-        app.my_jobs()
-        assert app.action == "my_jobs"
-        app.show_my_jobs(
-            {
-                "jobs": [{"job_id": "42", "name": "sample", "state": "PENDING"}],
-                "observed_at": "now",
-                "unavailable": [],
-            }
-        )
-        assert app.jobs_window.winfo_exists()
-        assert app.jobs_window.title() == "My jobs \u2014 recorded Inkly handoffs"
-    finally:
-        app.busy = False
-        app.close()
-
-
 @pytest.mark.skipif(
     sys.platform != "win32" and not os.environ.get("DISPLAY"),
     reason="Native Tk display required",
@@ -1907,3 +2054,182 @@ def test_native_contact_never_obstructs_controls_at_common_scaling(
             assert shown["table_height"] > 30, evidence
     finally:
         app.close()
+
+
+def pump(app, seconds=10):
+    """Drain window events until Desktop is idle with nothing left to start."""
+    import time as clock
+
+    deadline = clock.monotonic() + seconds
+    quiet = 0
+    while clock.monotonic() < deadline:
+        app.drain()
+        if not app.busy and app.after_done is None and app.events.empty():
+            quiet += 1
+            if quiet > 5:
+                return
+        else:
+            quiet = 0
+        clock.sleep(0.02)
+    raise AssertionError("Desktop did not become idle")
+
+
+def elsewhere_job(workflow, bundle="c" * 32, name="elsewhere.gjf", state="CONFIGURING"):
+    data = b"%nprocshared=2\n%mem=768MB\n# hf/sto-3g\n\nElsewhere\n\n0 1\nH 0 0 0\n\n"
+    workflow.endpoint.setdefault("inputs", {})[bundle] = input_copy(name, data)
+    workflow.records[bundle] = {
+        "name": name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "script_sha256": "abc",
+        "stages": 1,
+        "submission": "SUBMITTED",
+        "state": state,
+        "job_id": "456",
+        "resources": {
+            "cpus": 2,
+            "slurm_memory_mib": 1024,
+            "gaussian_memory_mb": 768,
+            "hours": 2,
+        },
+    }
+    return hpc_job(bundle, state, name, job_id="456")
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+def test_native_load_my_jobs_fills_the_list_without_adding_files(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    w.controller.emit = lambda kind, data: app.events.put((kind, data))
+    asked, shown = [], []
+    copies = tmp_path / "copies"
+    monkeypatch.setattr(
+        gui.filedialog, "askdirectory", lambda **k: asked.append(k) or str(copies)
+    )
+    monkeypatch.setattr(
+        gui.messagebox, "showinfo", lambda *args, **k: shown.append(args)
+    )
+    try:
+        app.settings = dict(SETTINGS)
+        # Earlier, this computer prepared sample_1; its job is now pending.
+        w.controller.preview(w.paths[:1], SETTINGS)
+        mine = recorded(w, w.paths[0])
+        w.records[mine].update(submission="SUBMITTED", state="PENDING", job_id="123")
+        w.endpoint["jobs"] = [hpc_job(mine, "PENDING"), elsewhere_job(w)]
+        assert not app.files
+        assert str(app.load_button["state"]) == "normal"
+        app.load_button.invoke()
+        pump(app)
+        copy = copies / f"elsewhere-{'c' * 8}" / "elsewhere.gjf"
+        assert app.files == [w.paths[0].resolve(), copy]
+        assert {app.rows[str(path)]["state"] for path in app.files} == {
+            "PENDING",
+            "CONFIGURING",
+        }
+        # The folder was asked for once, with an explanation, and is remembered.
+        assert len(asked) == 1 and shown[0][0] == "Jobs not on this computer"
+        assert app.jobs_index.folder() == copies.resolve()
+        assert "prepare" not in actions(w)[1:] and "submit" not in actions(w)
+
+        # Loading again finds both here: no question, no duplicate rows.
+        app.load_button.invoke()
+        pump(app)
+        assert len(asked) == 1 and len(app.files) == 2
+        assert len(w.connections) == 1
+
+        # While watching, the request goes to the watch; otherwise it waits.
+        requests = []
+        monkeypatch.setattr(w.controller, "request", lambda *a: requests.append(a))
+        app.busy, app.action = True, "monitor"
+        app.buttons()
+        assert str(app.load_button["state"]) == "normal"
+        app.load_button.invoke()
+        app.history_button.invoke()
+        assert requests == [("load_jobs", SETTINGS), ("history", SETTINGS)]
+        app.action = "preview"
+        app.buttons()
+        assert str(app.load_button["state"]) == "disabled"
+        assert str(app.history_button["state"]) == "disabled"
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+def test_native_job_history_filters_and_adds_selected_jobs(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    w.controller.emit = lambda kind, data: app.events.put((kind, data))
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda *a, **k: None)
+    app.jobs_index.set_folder(tmp_path / "copies")
+    (tmp_path / "copies").mkdir()
+    try:
+        app.settings = dict(SETTINGS)
+        cancelled = elsewhere_job(w, "b" * 32, "ethanol.gjf", "CANCELLED by 1000")
+        cancelled["ended_at"] = cancelled["submitted_at"] = hpc_job(
+            "x" * 32, "X", ended_days=2
+        )["ended_at"]
+        w.endpoint["jobs"] = [
+            cancelled,
+            hpc_job("a" * 32, "COMPLETED", "water.gjf", ended_days=1),
+            hpc_job("d" * 32, "PENDING", "acetone.gjf"),
+            hpc_job("e" * 32, "COMPLETED", "old.gjf", ended_days=60),
+        ]
+        w.endpoint["jobs"][1]["submitted_at"] = w.endpoint["jobs"][1]["ended_at"]
+        app.history_button.invoke()
+        pump(app)
+        table = app.history_table
+        # Default view: finished and cancelled jobs from the last 30 days.
+        assert table.get_children() == ("b" * 32, "a" * 32)
+        assert "Showing 2 of 4" in app.history_summary.cget("text")
+        assert str(tmp_path / "copies") in app.copies_label.cget("text")
+        app.history_state.set("All")
+        app.history_period.set("All time")
+        app.refresh_history()
+        assert len(table.get_children()) == 4
+        app.history_text.set("ethanol")
+        app.refresh_history()
+        assert table.get_children() == ("b" * 32,)
+        assert str(app.history_add["state"]) == "disabled"
+        table.selection_set("b" * 32)
+        app.history_buttons()
+        app.history_add.invoke()
+        pump(app)
+        copy = tmp_path / "copies" / f"ethanol-{'b' * 8}" / "ethanol.gjf"
+        assert app.files == [copy]
+        assert status_of(app, copy).startswith("CANCELLED")
+    finally:
+        app.close()
+
+
+def status_of(app, path):
+    return app.rows[str(path)]["state"]
