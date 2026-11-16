@@ -397,13 +397,13 @@ class DesktopController:
                 )
                 continue
             try:
-                if action == "my_jobs":
+                if action == "cancel_jobs":
+                    targets = [self.target_for(args[0], args[1], "resume")]
+                elif action == "my_jobs":
                     settings = picker.validate_settings(dict(args[0]))
                     targets = [
                         tuple(settings.get(key) for key in ("host", "ink_path", "auth"))
                     ]
-                elif action == "cancel_jobs":
-                    targets = [self.target_for(args[0], args[1], "resume")]
                 elif action == "rerun":
                     targets = [
                         self.target_for(args[0], args[2], "resume"),
@@ -431,7 +431,7 @@ class DesktopController:
             except ValueError as error:
                 self.emit("request_error", str(error))
                 continue
-            changed = changed or action not in {"cancel_jobs", "my_jobs"}
+            changed = changed or action in {"preview", "submit", "rerun"}
 
     def monitor(self):
         if not self.items or not self.items[0].get("receipt"):

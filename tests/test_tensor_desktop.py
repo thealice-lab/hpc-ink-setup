@@ -981,6 +981,76 @@ def test_bundled_dialog_fallback_restores_auth_environment(tmp_path, monkeypatch
     assert os.environ["INKLY_SSH_TARGET"] == "old-target"
 
 
+def test_my_jobs_without_files_reuses_connection_and_never_saves_receipts(workflow):
+    c = workflow.controller
+    workflow.endpoint["capabilities"].append("jobs")
+    c.connect(SETTINGS)
+    original = c.session.exchange
+
+    def exchange(request, **kwargs):
+        if request["action"] == "jobs":
+            return {
+                "jobs": [{"job_id": "42", "name": "PRIVATE_JOB_NAME"}],
+                "observed_at": "now",
+                "unavailable": [],
+            }
+        return original(request, **kwargs)
+
+    c.session.exchange = exchange
+    c.my_jobs(SETTINGS)
+    c.my_jobs(SETTINGS)
+    assert not c.items and c.review_id is None
+    assert len(workflow.connections) == 1
+    assert workflow.events[-1][0] == "my_jobs"
+    assert "PRIVATE_JOB_NAME" not in str(messages(workflow))
+    assert not list(workflow.paths[0].parent.glob("*.inkly.json"))
+    assert set(actions(workflow)) <= {"version"}
+
+
+def test_my_jobs_old_endpoint_and_watch_routing(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    review = c.review_id
+    c.request("my_jobs", dict(SETTINGS))
+    assert c.handle_requests() is False
+    assert "does not support My jobs" in workflow.events[-1][1]
+    assert c.review_id == review
+    assert len(workflow.connections) == 1
+    c.request("my_jobs", {**SETTINGS, "host": "different@cluster"})
+    c.handle_requests()
+    assert "different HPC connection" in workflow.events[-1][1]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows Tk")
+def test_native_my_jobs_needs_no_files_and_shows_account_table(workflow, tmp_path):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    root = tk.Tk()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda *a, **k: workflow.controller,
+        settings_path=tmp_path / "settings.json",
+    )
+    try:
+        app.settings = dict(SETTINGS)
+        assert not app.files
+        app.my_jobs()
+        assert app.action == "my_jobs"
+        app.show_my_jobs(
+            {
+                "jobs": [{"job_id": "42", "name": "sample", "state": "PENDING"}],
+                "observed_at": "now",
+                "unavailable": [],
+            }
+        )
+        assert app.jobs_window.winfo_exists()
+        assert app.jobs_window.title() == "My jobs \u2014 current HPC account"
+    finally:
+        app.busy = False
+        app.close()
+
+
 @pytest.mark.skipif(
     sys.platform != "win32" and not os.environ.get("DISPLAY"),
     reason="Native Tk display required",
@@ -1650,74 +1720,4 @@ def test_native_contact_never_obstructs_controls_at_common_scaling(
             assert shown["controls_visible"], evidence
             assert shown["table_height"] > 30, evidence
     finally:
-        app.close()
-
-
-def test_my_jobs_without_files_reuses_connection_and_never_saves_receipts(workflow):
-    c = workflow.controller
-    workflow.endpoint["capabilities"].append("jobs")
-    c.connect(SETTINGS)
-    original = c.session.exchange
-
-    def exchange(request, **kwargs):
-        if request["action"] == "jobs":
-            return {
-                "jobs": [{"job_id": "42", "name": "PRIVATE_JOB_NAME"}],
-                "observed_at": "now",
-                "unavailable": [],
-            }
-        return original(request, **kwargs)
-
-    c.session.exchange = exchange
-    c.my_jobs(SETTINGS)
-    c.my_jobs(SETTINGS)
-    assert not c.items and c.review_id is None
-    assert len(workflow.connections) == 1
-    assert workflow.events[-1][0] == "my_jobs"
-    assert "PRIVATE_JOB_NAME" not in str(messages(workflow))
-    assert not list(workflow.paths[0].parent.glob("*.inkly.json"))
-    assert set(actions(workflow)) <= {"version"}
-
-
-def test_my_jobs_old_endpoint_and_watch_routing(workflow):
-    c = workflow.controller
-    c.preview(workflow.paths, SETTINGS)
-    review = c.review_id
-    c.request("my_jobs", dict(SETTINGS))
-    assert c.handle_requests() is False
-    assert "does not support My jobs" in workflow.events[-1][1]
-    assert c.review_id == review
-    assert len(workflow.connections) == 1
-    c.request("my_jobs", {**SETTINGS, "host": "different@cluster"})
-    c.handle_requests()
-    assert "different HPC connection" in workflow.events[-1][1]
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows Tk")
-def test_native_my_jobs_needs_no_files_and_shows_account_table(workflow, tmp_path):
-    import tkinter as tk
-    import tensor_desktop as gui
-
-    root = tk.Tk()
-    app = gui.DesktopApp(
-        root,
-        controller_factory=lambda *a, **k: workflow.controller,
-        settings_path=tmp_path / "settings.json",
-    )
-    try:
-        app.settings = dict(SETTINGS)
-        assert not app.files
-        app.my_jobs()
-        assert app.action == "my_jobs"
-        app.show_my_jobs(
-            {
-                "jobs": [{"job_id": "42", "name": "sample", "state": "PENDING"}],
-                "observed_at": "now",
-                "unavailable": [],
-            }
-        )
-        assert app.jobs_window.winfo_exists()
-        assert app.jobs_window.title() == "My jobs \u2014 current HPC account"
-    finally:
-        app.busy = False
         app.close()

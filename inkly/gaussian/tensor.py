@@ -26,7 +26,7 @@ MAX_INPUT = 5 * 1024 * 1024
 MAX_OUTPUT = 64 * 1024 * 1024
 # Desktop asks for these before using newer operations; older endpoints reply
 # "Unsupported operation" to "version" and keep the session open.
-CAPABILITIES = ("prepare", "submit", "status", "fetch", "cancel", "version", "jobs")
+CAPABILITIES = ("prepare", "submit", "status", "fetch", "cancel", "version")
 # Slurm accounting can lag scancel by a moment; re-read briefly, never retry it.
 CANCEL_STATUS_READS = 5
 
@@ -247,6 +247,8 @@ def handle(request, root=None):
     if not isinstance(bundle, str) or not re.fullmatch(r"[0-9a-f]{32}", bundle):
         raise ValueError("Invalid bundle ID")
     action = request.get("action")
+    if action == "jobs":
+        return {"bundle": bundle, **list_jobs(_scheduler, Path.home())}
     if action not in CAPABILITIES:
         raise ValueError("Unsupported operation")
     if action == "version":
@@ -256,10 +258,8 @@ def handle(request, root=None):
         return {
             "bundle": bundle,
             "version": __version__,
-            "capabilities": list(CAPABILITIES),
+            "capabilities": list(CAPABILITIES) + ["jobs"],
         }
-    if action == "jobs":
-        return {"bundle": bundle, **list_jobs(_scheduler, Path.home())}
     root = private_directory(root or Path.home() / ".inkly" / "tensor")
     directory = root / bundle
     if action == "prepare":
