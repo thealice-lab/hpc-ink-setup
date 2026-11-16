@@ -98,6 +98,20 @@ class DesktopController:
                 "Stopped watching. Any submitted HPC jobs continue; preview the same files to recover."
             )
 
+    def my_jobs(self, settings):
+        """List this authenticated account's jobs without loading local inputs."""
+        settings = picker.validate_settings(dict(settings))
+        self.connect(settings)
+        receipt = {**settings, "bundle": uuid.uuid4().hex}
+        if not self.endpoint_supports("jobs", receipt):
+            self.emit(
+                "notice",
+                "This HPC endpoint does not support My jobs. Ask the maintainer for a matching endpoint.",
+            )
+            return
+        response = self.session.exchange({"action": "jobs"}, receipt=receipt)
+        self.emit("my_jobs", response)
+
     def connect(self, connection):
         target = tuple(connection.get(key) for key in ("host", "ink_path", "auth"))
         if self.session and target == self.target:
@@ -407,7 +421,7 @@ class DesktopController:
             self.monitor()
 
     # Operations the window may ask for while monitoring.
-    WATCH_REQUESTS = ("cancel_jobs", "preview", "submit", "rerun")
+    WATCH_REQUESTS = ("cancel_jobs", "preview", "submit", "rerun", "my_jobs")
 
     def request(self, action, *args):
         """Called from the window thread while monitoring: run this operation next.
@@ -451,6 +465,11 @@ class DesktopController:
             try:
                 if action in {"cancel_jobs", "job_details"}:
                     targets = [self.target_for(args[0], args[1], "resume")]
+                elif action == "my_jobs":
+                    settings = picker.validate_settings(dict(args[0]))
+                    targets = [
+                        tuple(settings.get(key) for key in ("host", "ink_path", "auth"))
+                    ]
                 elif action == "rerun":
                     targets = [
                         self.target_for(args[0], args[2], "resume"),
@@ -790,6 +809,8 @@ class DesktopController:
                 self.job_details(*args)
             elif action == "rerun":
                 self.rerun(*args)
+            elif action == "my_jobs":
+                self.my_jobs(*args)
             elif action == "close":
                 # Record SSH closure while the journal can still accept events;
                 # final metadata is handed off by the existing session close.

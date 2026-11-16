@@ -72,6 +72,25 @@ update the helper's version, source commit and EXE SHA-256 (from the release's
 `tests/test_windows_desktop_download.py`. Do not commit ZIP/EXE binaries or
 treat this helper as an HPC deployment tool.
 
+### My jobs without input files
+
+Choose **My jobs** to list owned Inkly handoff receipts on the configured HPC
+without adding local input files or locating sidecar receipts. Recorded job IDs
+are checked against the current queue and seven days of accounting.
+The separate table shows job IDs, names, states, elapsed time, exit codes and
+available start/reason fields. It includes prepared and uncertain handoffs; jobs submitted outside Inkly are
+not included. **Refresh** updates it; the observation time is shown in UTC. The view
+is limited to 200 recent receipts. A recorded job absent from accounting stays
+UNKNOWN; this does not prove it was never submitted or has stopped.
+Missing scheduler access is reported as an incomplete listing.
+
+My jobs is read-only: it cannot submit, cancel, adopt or delete a job. Result
+return and other handoff operations still use the saved input-side receipts.
+Job names appear only in this view, not Activity or diagnostic events. While
+watching, the view uses the open connection if it matches the configured HPC;
+otherwise it explains that the connection differs. Older endpoints show an
+upgrade notice. This requires the HPC endpoint's `jobs` capability.
+
 ## First calculation
 
 Use **Test connection** beside Connection settings before adding inputs. It

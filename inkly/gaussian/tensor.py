@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 
+from inkly.gaussian.job_list import list_jobs
 from inkly.cluster_profile import resolve_cluster_profile
 from inkly.core.storage import history_lock, private_directory, private_open
 from inkly.gaussian.job_spec import GaussianJobSpec
@@ -255,6 +256,13 @@ def handle(request, root=None):
     if not isinstance(bundle, str) or not re.fullmatch(r"[0-9a-f]{32}", bundle):
         raise ValueError("Invalid bundle ID")
     action = request.get("action")
+    if action == "jobs":
+        return {
+            "bundle": bundle,
+            **list_jobs(
+                _scheduler, Path.home(), root or Path.home() / ".inkly" / "tensor"
+            ),
+        }
     if action not in CAPABILITIES:
         raise ValueError("Unsupported operation")
     if action == "version":
@@ -264,7 +272,7 @@ def handle(request, root=None):
         return {
             "bundle": bundle,
             "version": __version__,
-            "capabilities": list(CAPABILITIES),
+            "capabilities": list(CAPABILITIES) + ["jobs"],
         }
     if action == "job_details":
         return job_details(
