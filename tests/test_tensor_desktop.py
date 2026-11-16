@@ -708,6 +708,149 @@ def test_watch_cancel_for_another_connection_keeps_watching(workflow):
     assert record_for(w, w.paths[0])["state"] == "PENDING"
 
 
+def events_of(workflow, kind):
+    return [data for event, data in workflow.events if event == kind]
+
+
+def test_preview_and_submit_a_new_file_while_watching_on_one_connection(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    connections = len(w.connections)
+    w.events.clear()
+    # The researcher adds sample_2 to the list and previews it during the watch.
+    w.controller.request("preview", w.paths, SETTINGS)
+    assert w.controller.handle_requests() is True
+    review = w.controller.review()
+    assert review["count"] == 1 and review["jobs"][0]["name"] == "sample_2.gjf"
+    w.controller.request("submit", w.controller.review_id, True)
+    assert w.controller.handle_requests() is True  # Returns; no nested watch.
+    assert actions(w).count("submit") == 1
+    assert record_for(w, w.paths[1])["submission"] == "SUBMITTED"
+    assert record_for(w, w.paths[0])["state"] == "PENDING"  # Untouched.
+    assert len(w.connections) == connections  # No reconnect, no new sign-in.
+
+
+def test_request_problems_are_reported_without_ending_the_watch(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.events.clear()
+    w.controller.request("submit", "not-the-current-review", True)
+    assert w.controller.handle_requests() is False
+    assert (
+        "needs confirmation of the current preview" in events_of(w, "request_error")[0]
+    )
+    assert "submit" not in actions(w)
+    assert w.controller.session is not None
+    with pytest.raises(ValueError, match="cannot run while watching"):
+        w.controller.request("close")
+
+
+def test_watch_takes_preview_submit_and_cancel_requests_in_turn(workflow):
+    import threading
+    import time
+
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    w.controller.interval = 30
+    connections = len(w.connections)
+    watch = threading.Thread(target=w.controller.monitor, daemon=True)
+    watch.start()
+
+    def wait_for(condition):
+        deadline = time.monotonic() + 5
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert condition()
+
+    wait_for(lambda: actions(w).count("status") >= 1)
+    first_review = w.controller.review_id
+    w.controller.request("preview", w.paths, SETTINGS)
+    wait_for(lambda: w.controller.review_id not in (None, first_review))
+    w.controller.request("submit", w.controller.review_id, True)
+    wait_for(lambda: "submit" in actions(w))
+    wait_for(lambda: record_for(w, w.paths[1])["submission"] == "SUBMITTED")
+    record_for(w, w.paths[1])["state"] = "PENDING"
+    w.controller.request_cancel(w.paths, SETTINGS)
+    watch.join(timeout=5)
+    assert not watch.is_alive()
+    assert record_for(w, w.paths[0])["state"] == "CANCELLED by 1000"
+    assert record_for(w, w.paths[1])["state"] == "CANCELLED by 1000"
+    assert len(w.connections) == connections
+
+
+def test_stop_watching_keeps_the_connection_so_watching_can_resume(workflow):
+    import threading
+    import time
+
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "PENDING", "1")
+    connections = len(w.connections)
+    w.controller.interval = 30
+    watch = threading.Thread(target=w.controller.monitor, daemon=True)
+    watch.start()
+    deadline = time.monotonic() + 5
+    while actions(w).count("status") < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    w.controller.request_cancel([w.paths[0]], SETTINGS)  # Dropped by the stop.
+    w.controller.pause()
+    watch.join(timeout=5)
+    assert not watch.is_alive()
+    assert w.controller.session is not None  # Still connected.
+    assert w.controller.requests.empty() and not w.controller.paused.is_set()
+    assert "cancel" not in actions(w)
+    assert any("Stopped watching" in text for text in messages(w))
+    # Watching again needs no new connection or sign-in.
+    w.controller.interval = 0
+    record_for(w, w.paths[0])["state"] = "RUNNING"
+    w.controller.monitor()
+    assert rows_for(w, w.paths[0])[-1]["state"] == "RETURNED"
+    assert len(w.connections) == connections
+
+
+def test_stop_during_submit_lets_the_submission_finish_then_stops(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.controller.pause()  # Clicked while jobs were still being submitted.
+    w.controller.submit(w.controller.review_id, True)
+    assert record_for(w, w.paths[0])["submission"] == "SUBMITTED"
+    assert any("Stopped watching" in text for text in messages(w))
+    assert w.controller.session is not None
+
+
+def test_request_arriving_as_the_watch_ends_is_dropped_with_a_notice(
+    workflow, monkeypatch
+):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "RUNNING", "1")
+    real_monitor = w.controller.monitor
+
+    def monitor_then_late_click():
+        real_monitor()
+        w.controller.request("preview", w.paths, SETTINGS)  # Clicked as it ended.
+
+    monkeypatch.setattr(w.controller, "monitor", monitor_then_late_click)
+    w.events.clear()
+    w.controller.execute("monitor")
+    assert w.controller.requests.empty()
+    assert "finished before your last request ran" in notices(w)[0]
+    assert ("done", "monitor") in w.events
+
+
+def test_check_after_the_connection_closed_signs_in_again(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    recorded_job(w, w.paths[0], "RUNNING", "1")
+    w.controller.close()
+    connections = len(w.connections)
+    w.controller.monitor()
+    assert len(w.connections) == connections + 1
+    assert rows_for(w, w.paths[0])[-1]["state"] == "RETURNED"
+
+
 def test_cancelled_row_does_not_block_submitting_other_prepared_files(workflow):
     w = workflow
     w.controller.preview(w.paths, SETTINGS)
@@ -922,9 +1065,21 @@ def test_native_window_add_remove_preview_and_confirmation(
         assert scheduled == [("submit", w.controller.review_id, True)]
         app.table.selection_set(str(w.paths[0]))
         app.remove_button.invoke()
+        # The list changed, so approval is gone; the remaining row keeps its details.
         assert len(app.files) == 1 and app.review is None
         assert str(app.submit_button["state"]) == "disabled"
-        assert app.table.item(str(w.paths[1]))["values"][6] == "Not previewed"
+        kept = app.table.item(str(w.paths[1]))["values"]
+        assert kept[6] == "PREPARED" and kept[1] != "—"
+        assert str(w.paths[0]) not in app.rows
+
+        # Adding a file keeps the rows already shown and asks for a preview.
+        extra = w.paths[0].parent / "sample_3.gjf"
+        extra.write_bytes(w.paths[0].read_bytes())
+        app.add_paths([extra])
+        assert app.table.item(str(w.paths[1]))["values"] == kept
+        assert app.table.item(str(extra))["values"][6] == "Not previewed"
+        assert "1 file(s) not previewed yet" in app.overview["text"]
+        assert str(app.submit_button["state"]) == "disabled"
     finally:
         app.close()
 
@@ -1086,6 +1241,81 @@ def test_native_window_collects_garbage_only_on_the_tk_thread(
         app.close()
     # Closing collects on the Tk thread and never re-enables automatic collection.
     assert calls == ["disable", "collect", "collect"]
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+def test_native_new_work_goes_to_the_watch_and_stop_keeps_the_connection(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    requests, calls, scheduled = [], [], []
+    monkeypatch.setattr(w.controller, "request", lambda *args: requests.append(args))
+    monkeypatch.setattr(w.controller, "pause", lambda: calls.append("pause"))
+    monkeypatch.setattr(w.controller, "stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *args, **kwargs: True)
+    try:
+        app.settings = dict(SETTINGS)
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.busy, app.action = True, "monitor"  # Watching submitted jobs.
+        app.buttons()
+        state = {
+            name: str(getattr(app, f"{name}_button")["state"])
+            for name in ("add", "folder", "preview", "submit", "remove", "clear")
+        }
+        assert state == {
+            "add": "normal",
+            "folder": "normal",
+            "preview": "normal",
+            "submit": "normal",
+            "remove": "disabled",
+            "clear": "disabled",
+        }
+        assert str(app.settings_button["state"]) == "disabled"
+        assert str(app.monitor_button["state"]) == "disabled"
+
+        review_id = app.review["id"]
+        app.submit_button.invoke()
+        assert requests[-1] == ("submit", review_id, True)
+        assert app.review is None and str(app.submit_button["state"]) == "disabled"
+        app.preview_button.invoke()
+        assert requests[-1] == ("preview", app.files, SETTINGS)
+        assert not scheduled  # Nothing started a new action beside the watch.
+
+        # Stop watching pauses and keeps the connection...
+        app.stop_button.invoke()
+        assert calls == ["pause"] and app.stop_deadline
+        # ...and disconnects only if the same watch is still running later.
+        app.force_stop(app.run_id + 1)
+        assert calls == ["pause"]
+        app.force_stop(app.run_id)
+        assert calls == ["pause", "stop"]
+
+        # When idle, Check & return results works even without a connection.
+        app.busy, app.action = False, None
+        w.controller.session = None
+        app.buttons()
+        assert str(app.monitor_button["state"]) == "normal"
+    finally:
+        w.controller.session = None
+        app.close()
 
 
 native_display = pytest.mark.skipif(

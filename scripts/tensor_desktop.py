@@ -34,6 +34,8 @@ def bundled_askpass():
 
 # How often the Tk thread runs Python's cyclic garbage collector (see DesktopApp).
 GC_INTERVAL_SECONDS = 10
+# Stop watching waits this long for the watch to end before disconnecting.
+STOP_GRACE_MS = 20000
 
 
 class DesktopApp:
@@ -77,6 +79,10 @@ class DesktopApp:
         self.unconfirmed = set()
         self.busy = False
         self.closed = False
+        # Each started action gets a number, so a delayed disconnect after Stop
+        # watching can never hit an action started later.
+        self.run_id = 0
+        self.stop_deadline = None
         self.events = queue.Queue()
         self.commands = queue.Queue()
         self.controller = controller_factory(
@@ -335,7 +341,9 @@ class DesktopApp:
             return
         self.busy = True
         self.action = action
+        self.run_id += 1
         self.controller.cancelled.clear()
+        self.controller.paused.clear()
         self.status.configure(
             text={
                 "preview": "Preparing preview…",
@@ -384,6 +392,10 @@ class DesktopApp:
                 self.log(
                     f"Using {data['host']} with {data['ink_path']}. Saved handoffs retain their original connection and settings."
                 )
+            elif kind == "request_error":
+                # Something asked for during the watch was not done; watching continues.
+                self.log(data)
+                messagebox.showerror("Not done", data, parent=self.root)
             elif kind == "notice":
                 # Expected outcomes (for example a job that already completed),
                 # not failures; the connection stays open.
@@ -399,6 +411,9 @@ class DesktopApp:
                 )
                 messagebox.showerror("Handoff stopped", data, parent=self.root)
             elif kind == "done":
+                if self.stop_deadline:
+                    self.root.after_cancel(self.stop_deadline)
+                    self.stop_deadline = None
                 self.busy = False
                 self.action = None
                 self.progress.stop()
@@ -412,7 +427,11 @@ class DesktopApp:
                         text="Operation finished. See Activity for results or recovery instructions."
                     )
             self.buttons()
-        if self.recovery_request and not self.busy and not self.closed:
+        if (
+            self.recovery_request
+            and (not self.busy or self.watching())
+            and not self.closed
+        ):
             request, self.recovery_request = self.recovery_request, None
             files = "\n".join(f"  • {name}" for name in request["files"])
             prompt = (
@@ -434,12 +453,11 @@ class DesktopApp:
                 parent=self.root,
                 default="no",
             ):
-                self.start(
-                    "preview",
-                    request["paths"],
-                    request["settings"],
-                    request["bundles"],
-                )
+                arguments = (request["paths"], request["settings"], request["bundles"])
+                if self.watching():
+                    self.controller.request("preview", *arguments)
+                else:
+                    self.start("preview", *arguments)
             else:
                 self.log(
                     "Recovery declined. The original inputs and recovery receipts were preserved."
@@ -471,6 +489,10 @@ class DesktopApp:
             self.unconfirmed,
             submitting=self.busy and self.action == "submit",
         )
+        waiting = sum(str(path) not in self.rows for path in self.files)
+        if waiting:
+            note = f"{waiting} file(s) not previewed yet: choose Preview files to check them."
+            text = f"{text}\n{note}" if text else note
         if text:
             self.overview.configure(text=text)
 
@@ -569,35 +591,31 @@ class DesktopApp:
         }
 
     def buttons(self):
-        for widget in (
-            self.add_button,
-            self.folder_button,
-            self.remove_button,
-            self.clear_button,
-            self.settings_button,
-        ):
+        # While watching, new work goes to the running watch on its open
+        # connection. Removing rows or changing the connection waits until idle.
+        ready = not self.busy or self.watching()
+        for widget in (self.add_button, self.folder_button):
+            widget.configure(state="normal" if ready else "disabled")
+        for widget in (self.remove_button, self.clear_button, self.settings_button):
             widget.configure(state="disabled" if self.busy else "normal")
         self.preview_button.configure(
-            state="normal" if self.files and not self.busy else "disabled"
+            state="normal" if self.files and ready else "disabled"
         )
         self.submit_button.configure(
             state="normal"
-            if self.review and self.review["count"] and not self.busy
+            if self.review and self.review["count"] and ready
             else "disabled"
         )
+        # Watching again reuses the open connection, or signs in if it closed.
         self.monitor_button.configure(
-            state="normal"
-            if self.rows and self.controller.session and not self.busy
-            else "disabled"
+            state="normal" if self.rows and not self.busy else "disabled"
         )
         self.stop_button.configure(state="normal" if self.busy else "disabled")
         self.cancel_button.configure(
-            state="normal"
-            if self.cancellable() and (not self.busy or self.watching())
-            else "disabled"
+            state="normal" if self.cancellable() and ready else "disabled"
         )
         self.rerun_button.configure(
-            state="normal" if not self.busy and self.rerunnable() else "disabled"
+            state="normal" if self.rerunnable() and ready else "disabled"
         )
         self.script_button.configure(
             state="normal" if self.table.selection() and self.rows else "disabled"
@@ -683,7 +701,9 @@ class DesktopApp:
             self.start("cancel_jobs", paths, dict(self.settings))
 
     def run_again(self):
-        if self.busy or not self.rerunnable() or not self.settings_ready():
+        if self.busy and not self.watching():
+            return
+        if not self.rerunnable() or not self.settings_ready():
             return
         rows = self.selected_rows()
         details = self.listing(
@@ -704,12 +724,17 @@ class DesktopApp:
             "Run again as new jobs", text, parent=self.root, default="no"
         ):
             self.review = None
-            self.start(
-                "rerun",
+            arguments = (
                 [path for path, _ in rows],
                 [str(path) for path in self.files],
                 dict(self.settings),
             )
+            if self.watching():
+                self.controller.request("rerun", *arguments)
+                self.log("Preparing again on the open connection; watching continues.")
+                self.buttons()
+            else:
+                self.start("rerun", *arguments)
 
     def invalidate(self):
         self.review = None
@@ -724,6 +749,18 @@ class DesktopApp:
             text="Preview again to review the current file list and saved job settings."
         )
         self.count.configure(text=f"{len(self.files)} file(s)")
+        self.buttons()
+
+    def list_changed(self):
+        """The file list changed: keep each existing row as last shown, drop rows
+        for removed files, and require a new preview before any submission."""
+        self.review = None
+        self.rows = {
+            key: row for key, row in self.rows.items() if Path(key) in self.files
+        }
+        self.unconfirmed &= set(self.rows)
+        self.count.configure(text=f"{len(self.files)} file(s)")
+        self.refresh_overview()
         self.buttons()
 
     def add_paths(self, paths):
@@ -741,7 +778,7 @@ class DesktopApp:
                     iid=str(path),
                     values=(path.name, "—", "—", "—", "—", "—", "Not previewed", ""),
                 )
-        self.invalidate()
+        self.list_changed()
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
@@ -775,13 +812,13 @@ class DesktopApp:
         for path in self.table.selection():
             self.files.remove(Path(path))
             self.table.delete(path)
-        self.invalidate()
+        self.list_changed()
 
     def clear(self):
         for path in self.table.get_children():
             self.table.delete(path)
         self.files.clear()
-        self.invalidate()
+        self.list_changed()
 
     def configure(self):
         dialog = tk.Toplevel(self.root)
@@ -852,13 +889,20 @@ class DesktopApp:
         ).grid(row=6, column=1, sticky="e")
 
     def preview_files(self):
-        if not self.settings_ready():
+        if (self.busy and not self.watching()) or not self.settings_ready():
+            return
+        if self.watching():
+            # Rows stay as shown until the preview updates them.
+            self.review = None
+            self.controller.request("preview", list(self.files), dict(self.settings))
+            self.log("Previewing on the open connection; watching continues.")
+            self.buttons()
             return
         self.invalidate()
         self.start("preview", list(self.files), dict(self.settings))
 
     def submit(self):
-        if not self.review or self.busy:
+        if not self.review or (self.busy and not self.watching()):
             return
         review = self.review
         details = "\n".join(
@@ -877,15 +921,45 @@ class DesktopApp:
                 "running. A missing bundle does not prove that the old job ended."
                 + "\n\nHave you checked and confirmed that it is safe to submit?"
             )
-        if messagebox.askyesno(
+        if not messagebox.askyesno(
             "Confirm HPC submission", text, parent=self.root, default="no"
         ):
+            return
+        if self.watching():
+            self.review = None  # Approval is used once.
+            self.controller.request("submit", review["id"], True)
+            self.log("Submitting on the open connection; watching continues.")
+            self.refresh_overview()
+            self.buttons()
+        else:
             self.start("submit", review["id"], True)
 
     def stop(self):
+        if self.watching() and not self.stop_deadline:
+            # End the watch after the current check and keep the connection, so
+            # Check & return results resumes without a new sign-in. Disconnect
+            # only if the watch has not ended after the grace period.
+            self.controller.pause()
+            self.status.configure(
+                text="Stopping the watch. Submitted HPC jobs continue and the "
+                "connection stays open."
+            )
+            run = self.run_id
+            self.stop_deadline = self.root.after(
+                STOP_GRACE_MS, lambda: self.force_stop(run)
+            )
+            self.buttons()
+            return
+        self.force_stop(self.run_id)  # Not watching, or Stop clicked twice.
+
+    def force_stop(self, run):
+        """Disconnect to interrupt the action that was running when Stop was clicked."""
+        self.stop_deadline = None
+        if not self.busy or run != self.run_id:
+            return
         self.controller.stop()
         self.review = None
-        if self.busy and self.action == "submit":
+        if self.action == "submit":
             self.mark_unconfirmed()
         self.refresh_overview()
         self.status.configure(
@@ -945,6 +1019,8 @@ class DesktopApp:
         self.commands.put(("close", ()))
         self.worker.join(timeout=2)
         self.root.after_cancel(self.timer)
+        if self.stop_deadline:
+            self.root.after_cancel(self.stop_deadline)
         self.root.destroy()
         # Free the closed window here, on the Tk thread. Automatic collection
         # stays off: this window's threads may still be finishing.

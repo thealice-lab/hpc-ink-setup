@@ -95,6 +95,15 @@ treat this helper as an HPC deployment tool.
    choose **Open results folder**, then import the logs in TENSOR's
    **Analysis & 3D view → Add logs**, or use the researcher's analysis tools.
 
+You can keep working while the app watches. **Add files** or **Add folder**,
+then **Preview files** and **Submit prepared jobs** for the new inputs; **Run
+again** and **Cancel job** work too. These run on the connection that is
+already open, so there is no new sign-in, and the app keeps watching every
+job, old and new. Adding or removing files keeps the rows already shown and
+marks only new files "Not previewed"; submitting always needs a fresh preview
+of the current list. **Remove selected**, **Clear list** and **Connection
+settings** wait until the app is not watching.
+
 The summary below the table follows the rows. Before submission it shows the
 prepared job count and the combined request if every job starts together. Once
 you confirm, it counts each row's latest status (for example `1 PENDING`,
@@ -111,11 +120,17 @@ structures and analysis stay under the researcher's control.
 
 ## Returning later
 
-**Stop watching** and closing the app disconnect its SSH monitoring; they do
-not cancel Slurm jobs. Keep the `*.inkly.json` receipts beside the original
-inputs. Reopen the app, add the same files and choose **Preview files** to read
-their saved handoffs. **Check & return results** watches existing jobs and
-downloads successful results; it never submits a prepared job.
+**Stop watching** ends the watch after the check in progress and keeps the
+connection open, so **Check & return results** starts watching again without a
+new sign-in. If the watch does not end within 20 seconds, or you click Stop
+watching again, the app disconnects instead. Neither cancels Slurm jobs.
+Closing the app disconnects as well.
+
+Keep the `*.inkly.json` receipts beside the original inputs. Reopen the app,
+add the same files and choose **Preview files** to read their saved handoffs.
+**Check & return results** watches existing jobs and downloads successful
+results; it signs in again if the connection has closed, and it never submits
+a prepared job.
 
 Previously submitted jobs are not submitted again. Already returned logs are
 verified and left unchanged. Unknown/failed states, changed resource previews
