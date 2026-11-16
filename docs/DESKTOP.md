@@ -74,12 +74,14 @@ treat this helper as an HPC deployment tool.
 
 ### My jobs without input files
 
-Choose **My jobs** to read the configured HPC account's current queue and last
-seven days of Slurm accounting without adding input files or locating receipts.
+Choose **My jobs** to list owned Inkly handoff receipts on the configured HPC
+without adding local input files or locating sidecar receipts. Recorded job IDs
+are checked against the current queue and seven days of accounting.
 The separate table shows job IDs, names, states, elapsed time, exit codes and
-available start/reason fields. It includes this user's jobs submitted outside
-Inkly. **Refresh** updates it; the observation time is shown in UTC. The view
-is limited to 200 entries, keeping queued jobs ahead of accounting history.
+available start/reason fields. It includes prepared and uncertain handoffs; jobs submitted outside Inkly are
+not included. **Refresh** updates it; the observation time is shown in UTC. The view
+is limited to 200 recent receipts. A recorded job absent from accounting stays
+UNKNOWN; this does not prove it was never submitted or has stopped.
 Missing scheduler access is reported as an incomplete listing.
 
 My jobs is read-only: it cannot submit, cancel, adopt or delete a job. Result

@@ -76,6 +76,87 @@ def test_limits_keep_queue_jobs_before_recent_accounting(tmp_path, monkeypatch):
     assert {row["job_id"] for row in result["jobs"]} == {"1", "104", "105"}
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Owned HPC receipts")
+def test_receipt_catalog_ignores_unrelated_jobs_and_preserves_uncertainty(tmp_path):
+    import json
+
+    root = tmp_path / "handoffs"
+    for bundle, job, submission in [
+        ("a" * 32, "42", "SUBMITTED"),
+        ("b" * 32, None, "SUBMISSION_UNKNOWN"),
+        ("c" * 32, "99", "SUBMITTED"),
+    ]:
+        directory = root / bundle
+        directory.mkdir(parents=True)
+        (directory / "receipt.json").write_text(
+            json.dumps(
+                {
+                    "bundle": bundle,
+                    "name": "sample.gjf",
+                    "job_id": job,
+                    "submission": submission,
+                }
+            )
+        )
+    before = {
+        p: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns)
+        for p in root.glob("*/receipt.json")
+    }
+    calls = []
+
+    def scheduler(args, _):
+        calls.append(args)
+        if args[0] == "sacct":
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                "42|sample|COMPLETED|00:01|0:0\n500|OUTSIDE_JOB|COMPLETED|00:02|0:0\n",
+                "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    response = job_list.list_jobs(scheduler, tmp_path, root)
+    assert len(response["jobs"]) == 3
+    states = {row["bundle"]: row["state"] for row in response["jobs"]}
+    assert states == {
+        "a" * 32: "COMPLETED",
+        "b" * 32: "SUBMISSION_UNKNOWN",
+        "c" * 32: "UNKNOWN",
+    }
+    assert "OUTSIDE_JOB" not in str(response)
+    assert all(call[-2:] == ["--jobs", "42,99"] for call in calls)
+    assert before == {
+        p: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns)
+        for p in root.glob("*/receipt.json")
+    }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Owned HPC receipts")
+def test_receipt_catalog_skips_links_and_malformed_files(tmp_path):
+    import json
+
+    root = tmp_path / "handoffs"
+    directory = root / ("a" * 32)
+    directory.mkdir(parents=True)
+    outside = tmp_path / "private.json"
+    outside.write_text(
+        json.dumps(
+            {"bundle": directory.name, "name": "PRIVATE.gjf", "submission": "PREPARED"}
+        )
+    )
+    (directory / "receipt.json").symlink_to(outside)
+    linked = root / ("b" * 32)
+    linked.symlink_to(directory, target_is_directory=True)
+    broken = root / ("c" * 32)
+    broken.mkdir()
+    (broken / "receipt.json").write_text("not JSON")
+    response = job_list.list_jobs(
+        lambda *_: pytest.fail("No valid recorded jobs"), tmp_path, root
+    )
+    assert response["jobs"] == []
+    assert "PRIVATE" not in str(response)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="HPC endpoint")
 def test_jobs_operation_never_creates_bundle_or_uses_payload_user(
     tmp_path, monkeypatch
@@ -93,5 +174,5 @@ def test_jobs_operation_never_creates_bundle_or_uses_payload_user(
     )
     assert not root.exists()
     assert response["bundle"] == "a" * 32 and response["jobs"] == []
-    assert all(str(os.getuid()) in call for call in calls)
+    assert not calls
     assert "somebody-else" not in str(calls)

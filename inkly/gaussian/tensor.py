@@ -248,7 +248,12 @@ def handle(request, root=None):
         raise ValueError("Invalid bundle ID")
     action = request.get("action")
     if action == "jobs":
-        return {"bundle": bundle, **list_jobs(_scheduler, Path.home())}
+        return {
+            "bundle": bundle,
+            **list_jobs(
+                _scheduler, Path.home(), root or Path.home() / ".inkly" / "tensor"
+            ),
+        }
     if action not in CAPABILITIES:
         raise ValueError("Unsupported operation")
     if action == "version":

@@ -1045,7 +1045,7 @@ def test_native_my_jobs_needs_no_files_and_shows_account_table(workflow, tmp_pat
             }
         )
         assert app.jobs_window.winfo_exists()
-        assert app.jobs_window.title() == "My jobs \u2014 current HPC account"
+        assert app.jobs_window.title() == "My jobs \u2014 recorded Inkly handoffs"
     finally:
         app.busy = False
         app.close()

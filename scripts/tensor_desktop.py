@@ -673,11 +673,11 @@ class DesktopApp:
         if previous is not None and previous.winfo_exists():
             previous.destroy()
         dialog = self.jobs_window = tk.Toplevel(self.root)
-        dialog.title("My jobs — current HPC account")
+        dialog.title("My jobs — recorded Inkly handoffs")
         dialog.geometry("1000x520")
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(1, weight=1)
-        summary = f"Current queue and last 7 days of accounting. Observed (UTC): {response['observed_at']}"
+        summary = f"Recorded Inkly handoffs; queue and last 7 days of accounting. Observed (UTC): {response['observed_at']}"
         if response.get("unavailable"):
             summary += (
                 "\nUnavailable: "
@@ -685,9 +685,7 @@ class DesktopApp:
                 + ". This is an incomplete listing."
             )
         if response.get("truncated"):
-            summary += (
-                "\nListing limited to 200 jobs; use Slurm directly for older records."
-            )
+            summary += "\nListing limited to 200 recent handoffs; use Slurm directly for older records."
         if not response.get("jobs") and not response.get("unavailable"):
             summary += "\nNo jobs reported in this window."
         ttk.Label(dialog, text=summary, wraplength=940).grid(
@@ -695,6 +693,7 @@ class DesktopApp:
         )
         columns = (
             "job_id",
+            "bundle",
             "name",
             "state",
             "elapsed",
@@ -707,6 +706,7 @@ class DesktopApp:
             columns,
             (
                 "Job ID",
+                "Inkly bundle",
                 "Job name",
                 "State",
                 "Elapsed",
@@ -729,7 +729,7 @@ class DesktopApp:
         table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         ttk.Label(
             dialog,
-            text="Read-only account view, including jobs submitted outside Inkly. Refresh to update; use saved handoffs for result return.",
+            text="Read-only recorded handoffs. UNKNOWN can mean accounting is unavailable or outside the history window. Keep saved handoffs for result return.",
         ).grid(row=3, column=0, sticky="w", padx=12, pady=8)
         ttk.Button(dialog, text="Refresh", command=self.my_jobs).grid(
             row=4, column=0, sticky="e", padx=12, pady=(0, 12)
