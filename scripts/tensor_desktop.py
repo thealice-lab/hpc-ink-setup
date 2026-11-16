@@ -1073,52 +1073,93 @@ class DesktopApp:
         else:
             self.after_done = step
 
-    def jobs_found(self, data):
-        paths = [Path(path) for path in data["paths"]]
-        added = [path for path in paths if path not in self.files]
+    def apply_found(self, data, add_new=True):
+        """Re-point visible copies without leaving duplicate bundle rows."""
+        moved = []
+        for move in data.get("moves", ()):
+            old, new = Path(move["old"]), Path(move["new"])
+            if old in self.files and old != new:
+                self.files.remove(old)
+                self.rows.pop(str(old), None)
+                if self.table.exists(str(old)):
+                    self.table.delete(str(old))
+                moved.append(new)
+        paths = [Path(path) for path in data["paths"]] if add_new else moved
         if paths:
             self.add_paths(paths)
+        return bool(paths)
+
+    def jobs_found(self, data):
+        before = set(self.files)
+        added = self.apply_found(data)
+        self.load_context = {
+            "settings": data["settings"],
+            "added": added,
+            "jobs": data.get("jobs", []),
+            "from_history": data["from_history"],
+            "purpose": "load",
+        }
         if data["replaced"]:
             self.log(
-                f"{data['replaced']} recent job(s) were left out because Run again "
-                "gave their files a newer job. Job history still lists them."
+                f"{data['replaced']} older job(s) were left in Job history because their files have newer handoffs."
             )
+        if data.get("cancelled"):
+            self.log(f"{data['cancelled']} cancelled job(s) were left in Job history.")
+        originals = sum(move["original"] for move in data.get("moves", ()))
+        if originals:
+            self.log(f"Switched {originals} job(s) from copies to originals.")
         if data["unavailable"]:
             self.log(
                 "Some Slurm information was unavailable ("
                 + ", ".join(data["unavailable"])
                 + "); job states may show as UNKNOWN until the next check."
             )
-        self.load_context = {"settings": data["settings"], "added": bool(paths)}
-        if paths:
+        if data["paths"]:
             self.log(
-                f"Loaded {len(paths)} job(s) from the HPC ({len(added)} new in the "
-                "list). Checking their current state; nothing is submitted."
+                f"Located {len(data['paths'])} job(s) ({len(set(self.files) - before)} new in the list). Checking their state; nothing is submitted."
             )
         if data["restore"]:
             self.resolve_missing(data["restore"], searched=False, complete=True)
-        elif paths:
+        elif added:
             self.finish_load()
+        elif not data["from_history"] and (data["replaced"] or data.get("cancelled")):
+            self.log(
+                "No other recent jobs to load. The jobs left out are available in Job history."
+            )
         else:
             messagebox.showinfo(
                 "Inkly Desktop",
-                "No pending, running or recently finished jobs were found for this "
-                "connection. Job history lists older jobs."
+                "No pending, running or recently finished jobs were found for this connection. Job history lists older jobs."
                 if not data["from_history"]
                 else "Those jobs are already in the list.",
                 parent=self.root,
             )
 
     def jobs_searched(self, data):
-        paths = [Path(path) for path in data["paths"]]
-        if paths:
-            self.add_paths(paths)
-            self.load_context["added"] = True
-            self.log(
-                f"Found {len(paths)} input(s) under {data['root']}. Desktop will "
-                "look in those folders automatically next time."
+        context = data.get("context") or self.load_context
+        self.load_context = context
+        self.load_context.setdefault("added", False)
+        locating = context.get("purpose") == "locate"
+        changed = self.apply_found(data, add_new=not locating)
+        self.load_context["added"] |= changed
+        summary = jobs.search_summary(
+            data["root"],
+            data.get("found_count", len(data["paths"])),
+            len(data["missing"]),
+            data.get("replaced", 0),
+            sum(move["original"] for move in data.get("moves", ())),
+            data["complete"],
+            data.get("copies", 0),
+        )
+        self.load_context["search_summary"] = summary
+        self.log(summary)
+        if locating:
+            self.refresh_history()
+            messagebox.showinfo(
+                "Find files results", summary, parent=self.history_window or self.root
             )
-        if data["missing"]:
+            self.finish_load()
+        elif data["missing"]:
             self.resolve_missing(
                 data["missing"], searched=True, complete=data["complete"]
             )
@@ -1126,7 +1167,7 @@ class DesktopApp:
             self.finish_load()
 
     def resolve_missing(self, missing, searched, complete):
-        """Find their files, keep copies, or skip jobs not found here."""
+        """Find local files, keep copies, or skip; receipt matches stay exact."""
         while True:
             choice = self.ask_missing(missing, searched, complete)
             if choice == "find":
@@ -1136,15 +1177,39 @@ class DesktopApp:
                     mustexist=True,
                 )
                 if not root:
-                    continue  # Back to the choice.
-                self.then(lambda: self.run_or_request("search_jobs", missing, root))
+                    continue
+                context = dict(self.load_context)
+                self.then(
+                    lambda: self.run_or_request("search_jobs", missing, root, context)
+                )
                 return
             if choice == "copy":
-                folder = self.copies_folder(len(missing))
-                if not folder:
+                local, needed = [], []
+                for job in missing:
+                    kind, path = self.jobs_index.locate(job["bundle"])
+                    if (
+                        job.get("local_copy")
+                        and kind == "found"
+                        and path == Path(job["local_copy"]).resolve()
+                    ):
+                        local.append(job)
+                    else:
+                        needed.append(job)
+                folder = self.copies_folder(len(needed)) if needed else None
+                if needed and not folder:
                     continue
-                arguments = (missing, str(folder), self.load_context["settings"])
-                self.then(lambda: self.run_or_request("restore_jobs", *arguments))
+                if local:
+                    for job in local:
+                        self.jobs_index.remember(
+                            job["local_copy"], job["bundle"], original_checked=True
+                        )
+                    self.add_paths([Path(job["local_copy"]) for job in local])
+                    self.load_context["added"] = True
+                if needed:
+                    arguments = (needed, str(folder), self.load_context["settings"])
+                    self.then(lambda: self.run_or_request("restore_jobs", *arguments))
+                else:
+                    self.finish_load()
                 return
             break
         self.log(f"{len(missing)} job(s) not found on this computer were skipped.")
@@ -1152,23 +1217,15 @@ class DesktopApp:
 
     def ask_missing(self, missing, searched, complete):
         """Find files…, Make copies or Skip; returns "find", "copy" or "skip"."""
-        names = sorted({job["name"] for job in missing})
-        listed = ", ".join(names[:6])
-        if len(names) > 6:
-            listed += f" and {len(names) - 6} more"
-        if searched:
-            intro = f"{len(missing)} job(s) were still not found"
-            intro += "." if complete else " (the search stopped at its limit)."
-        else:
-            intro = (
-                f"{len(missing)} job(s) were not found in folders Inkly Desktop "
-                "has used."
-            )
-        text = (
-            f"{intro}\n\n{listed}\n\nIf their input files are on this computer, "
-            "choose Find files… and pick a folder that contains them; its "
-            "subfolders are searched too. Otherwise Desktop can keep a copy of each "
-            "input, and its returned result, in a folder for copies."
+        summary = self.load_context.get("search_summary") if searched else None
+        if searched and not summary:
+            summary = f"{len(missing)} job(s) were still not found."
+            if not complete:
+                summary += " The search reached its limit."
+        text = jobs.missing_text(missing, summary) + (
+            "\n\nFind files searches a folder and its subfolders for matching receipts. "
+            "If a job's input is not on this computer, Make copies keeps its input "
+            "and returned result in the copies folder. Skip leaves it in Job history."
         )
         dialog = self.missing_dialog = tk.Toplevel(self.root)
         dialog.title("Jobs not found on this computer")
@@ -1184,8 +1241,13 @@ class DesktopApp:
             dialog, text=text, wraplength=480, justify="left", padding=(16, 16, 16, 8)
         ).grid(row=0, column=0, columnspan=3, sticky="w")
         self.missing_buttons = {}
+        copy_label = (
+            "Use copies"
+            if all(job.get("local_copy") for job in missing)
+            else "Use / make copies"
+        )
         for column, (label, value) in enumerate(
-            (("Find files…", "find"), ("Make copies", "copy"), ("Skip", "skip"))
+            (("Find files…", "find"), (copy_label, "copy"), ("Skip", "skip"))
         ):
             button = ttk.Button(dialog, text=label, command=lambda v=value: pick(v))
             button.grid(row=1, column=column, padx=8, pady=(0, 16))
@@ -1277,14 +1339,32 @@ class DesktopApp:
         frame.grid(row=2, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        columns = ("submitted", "file", "job", "state", "exit", "elapsed", "ended")
+        columns = (
+            "submitted",
+            "file",
+            "job",
+            "state",
+            "exit",
+            "elapsed",
+            "ended",
+            "local",
+        )
         table = self.history_table = ttk.Treeview(
             frame, columns=columns, show="headings", selectmode="extended"
         )
         for column, title, width in zip(
             columns,
-            ("Submitted", "Input file", "Job ID", "State", "Exit", "Elapsed", "Ended"),
-            (130, 230, 90, 150, 60, 80, 130),
+            (
+                "Submitted",
+                "Input file",
+                "Job ID",
+                "State",
+                "Exit",
+                "Elapsed",
+                "Ended",
+                "Local file",
+            ),
+            (130, 230, 90, 150, 60, 80, 130, 110),
         ):
             table.heading(column, text=title)
             table.column(column, width=width, minwidth=50, stretch=column == "file")
@@ -1292,24 +1372,31 @@ class DesktopApp:
         scroll = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         table.configure(yscrollcommand=scroll.set)
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=table.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        table.configure(xscrollcommand=horizontal.set)
         table.bind("<<TreeviewSelect>>", lambda _event: self.history_buttons())
         bottom = ttk.Frame(window, padding=(12, 6, 12, 12))
         bottom.grid(row=3, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
-        self.copies_label = ttk.Label(bottom)
-        self.copies_label.grid(row=0, column=0, sticky="w")
+        self.copies_label = ttk.Label(bottom, wraplength=700)
+        self.copies_label.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
         ttk.Button(
-            bottom, text="Change folder…", command=self.change_copies_folder
-        ).grid(row=0, column=1, padx=(8, 16))
+            bottom, text="Copies folder…", command=self.change_copies_folder
+        ).grid(row=1, column=0, sticky="w")
+        self.history_find = ttk.Button(
+            bottom, text="Find files…", command=self.find_history_files
+        )
+        self.history_find.grid(row=1, column=1, padx=8)
         self.history_add = ttk.Button(
             bottom, text="Add selected to list", command=self.add_from_history
         )
-        self.history_add.grid(row=0, column=2)
+        self.history_add.grid(row=1, column=2)
         self.history_refresh = ttk.Button(
             bottom, text="Refresh", command=self.job_history
         )
-        self.history_refresh.grid(row=0, column=3, padx=8)
-        ttk.Button(bottom, text="Close", command=window.destroy).grid(row=0, column=4)
+        self.history_refresh.grid(row=1, column=3, padx=8)
+        ttk.Button(bottom, text="Close", command=window.destroy).grid(row=1, column=4)
 
     def history_shown(self):
         listing = self.history_listing or {"jobs": []}
@@ -1340,11 +1427,13 @@ class DesktopApp:
                     job.get("exit_code") or "",
                     job.get("elapsed") or "",
                     jobs.local_time(job.get("ended_at")),
+                    self.local_file_kind(job),
                 ),
             )
         summary = (
             f"Showing {len(shown)} of {len(listing['jobs'])} recorded Inkly job(s), "
-            f"newest first. Checked {jobs.local_time(listing.get('observed_at'))}."
+            f"newest first. Checked {jobs.local_time(listing.get('observed_at'))}. "
+            "Find files searches selected jobs, or all shown jobs when none are selected."
         )
         if listing.get("unavailable"):
             summary += (
@@ -1370,6 +1459,43 @@ class DesktopApp:
             state="normal" if self.history_table.selection() and ready else "disabled"
         )
         self.history_refresh.configure(state="normal" if ready else "disabled")
+        self.history_find.configure(
+            state="normal" if ready and self.history_shown() else "disabled"
+        )
+
+    def local_file_kind(self, job):
+        kind, path = self.jobs_index.locate(job["bundle"])
+        if kind == "found":
+            return "Copy" if jobs.is_copy(path, job["bundle"]) else "Original"
+        return "Newer handoff" if kind == "replaced" else "Not located"
+
+    def find_history_files(self):
+        if (self.busy and not self.watching()) or not self.history_listing:
+            return
+        selected = set(self.history_table.selection())
+        chosen = [
+            job
+            for job in self.history_shown()
+            if not selected or job["bundle"] in selected
+        ]
+        if not chosen:
+            return
+        root = filedialog.askdirectory(
+            parent=self.history_window,
+            title="Find original input files for these jobs",
+            mustexist=True,
+        )
+        if not root:
+            return
+        context = {
+            "settings": dict(self.history_listing.get("settings") or self.settings),
+            "jobs": self.history_listing["jobs"],
+            "from_history": True,
+            "purpose": "locate",
+            "added": False,
+        }
+        self.load_context = context
+        self.run_or_request("search_jobs", chosen, root, context)
 
     def add_from_history(self):
         bundles = list(self.history_table.selection())
