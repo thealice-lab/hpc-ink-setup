@@ -18,6 +18,7 @@ import time
 from inkly.cluster_profile import resolve_cluster_profile
 from inkly.core.storage import history_lock, private_directory, private_open
 from inkly.gaussian.job_spec import GaussianJobSpec
+from inkly.gaussian.job_insights import job_details, query_status
 from inkly.gaussian.sbatch import generate_sbatch
 
 
@@ -25,7 +26,15 @@ MAX_INPUT = 5 * 1024 * 1024
 MAX_OUTPUT = 64 * 1024 * 1024
 # Desktop asks for these before using newer operations; older endpoints reply
 # "Unsupported operation" to "version" and keep the session open.
-CAPABILITIES = ("prepare", "submit", "status", "fetch", "cancel", "version")
+CAPABILITIES = (
+    "prepare",
+    "submit",
+    "status",
+    "fetch",
+    "cancel",
+    "version",
+    "job_details",
+)
 # Slurm accounting can lag scancel by a moment; re-read briefly, never retry it.
 CANCEL_STATUS_READS = 5
 
@@ -174,27 +183,7 @@ def _resource_preview(data, request, profile):
 
 
 def _state(directory, receipt):
-    job = receipt.get("job_id")
-    if not job:
-        return {"state": receipt["submission"], "exit_code": None}
-    result = _scheduler(
-        ["sacct", "-j", job, "-X", "-n", "-P", "-o", "JobIDRaw,State,ExitCode"],
-        directory,
-    )
-    if result.returncode == 0:
-        for line in result.stdout.splitlines():
-            fields = line.strip().split("|")
-            if len(fields) >= 3 and fields[0] == job:
-                return {"state": fields[1], "exit_code": fields[2]}
-    result = _scheduler(
-        ["squeue", "--noheader", "--jobs", job, "--format", "%A|%T"], directory
-    )
-    if result.returncode == 0:
-        for line in result.stdout.splitlines():
-            fields = line.strip().split("|")
-            if len(fields) == 2 and fields[0] == job:
-                return {"state": fields[1], "exit_code": None}
-    return {"state": "UNKNOWN", "exit_code": None}
+    return query_status(directory, receipt, _scheduler)
 
 
 def _base_state(status):
@@ -257,6 +246,10 @@ def handle(request, root=None):
             "version": __version__,
             "capabilities": list(CAPABILITIES),
         }
+    if action == "job_details":
+        return job_details(
+            root or Path.home() / ".inkly" / "tensor", bundle, _scheduler
+        )
     root = private_directory(root or Path.home() / ".inkly" / "tensor")
     directory = root / bundle
     if action == "prepare":
@@ -331,7 +324,7 @@ def handle(request, root=None):
             if receipt["submission"] == "PREPARED":
                 response["script"] = _read(directory / "job.sbatch").decode("utf-8")
             return response
-        if status != {"state": "COMPLETED", "exit_code": "0:0"}:
+        if _base_state(status) != "COMPLETED" or status.get("exit_code") != "0:0":
             raise ValueError(
                 "Output is unavailable until Slurm reports COMPLETED / 0:0"
             )

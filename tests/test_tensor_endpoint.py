@@ -434,6 +434,8 @@ def slurm(states, calls, scancel_code=0, check=None):
         if args[0] == "sacct":
             state = answers.pop(0) if len(answers) > 1 else answers[0]
             return subprocess.CompletedProcess(args, 0, f"12345|{state}|0:0\n", "")
+        if args[0] == "squeue":
+            return subprocess.CompletedProcess(args, 0, "", "")
         raise AssertionError(f"unexpected scheduler call {args}")
 
     return scheduler
