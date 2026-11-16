@@ -80,6 +80,14 @@ def test_confirmed_submission_records_job_and_prevents_duplicates(
     assert not calls
     result = operate(prepared, "submit", confirm=True)
     assert result["job_id"] == "12345"
+    assert calls == [
+        [
+            "sbatch",
+            "--parsable",
+            "--comment=inkly:" + prepared[1]["bundle"],
+            "job.sbatch",
+        ]
+    ]
     with pytest.raises(ValueError, match="Already attempted"):
         operate(prepared, "submit", confirm=True)
     assert len(calls) == 1
@@ -91,6 +99,14 @@ def test_ambiguous_or_failed_submission_never_retries(prepared, monkeypatch, fai
 
     def scheduler(args, directory):
         calls.append(args)
+        persisted = json.loads((directory / "receipt.json").read_text())
+        assert persisted["submission"] == "SUBMISSION_UNKNOWN"
+        assert args == [
+            "sbatch",
+            "--parsable",
+            "--comment=inkly:" + prepared[1]["bundle"],
+            "job.sbatch",
+        ]
         if failure == "timeout":
             raise subprocess.TimeoutExpired(args, 30)
         return subprocess.CompletedProcess(

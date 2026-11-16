@@ -154,6 +154,26 @@ Full details require a matching endpoint with the `job_details` capability.
 
 ## Returning later
 
+### Finding an uncertain submission
+
+New Desktop endpoint submissions carry the Slurm comment `inkly:<bundle>`.
+The bundle is the generated ID in the saved `.inkly.json` receipt; the comment
+contains no input name or file path. If the submission reply is lost, use your
+own read-only Slurm queue to find that exact comment before deciding what to
+do. For example, on the HPC:
+
+```sh
+squeue --me --format='%.18i %.12T %k'
+```
+
+Compare the entire comment with the bundle in your receipt. Scheduler comment
+visibility and accounting retention depend on cluster configuration. Absence
+from the queue does not prove no job was submitted; completed jobs may already
+have left it. Keep the uncertain receipt and ask the maintainer to inspect
+accounting. Inkly does not automatically resubmit, adopt a matching job, or
+rewrite a receipt based on comments. Existing jobs are not retagged. This
+requires the updated HPC endpoint; the Desktop executable alone cannot add tags.
+
 **Stop watching** ends the watch after the check in progress and keeps the
 connection open, so **Check & return results** starts watching again without a
 new sign-in. If the watch does not end within 20 seconds, or you click Stop

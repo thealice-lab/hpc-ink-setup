@@ -327,7 +327,10 @@ def handle(request, root=None):
             # not allow a second sbatch, even if its response was never received.
             receipt["submission"] = "SUBMISSION_UNKNOWN"
             _save(directory / "receipt.json", receipt)
-            result = _scheduler(["sbatch", "--parsable", "job.sbatch"], directory)
+            result = _scheduler(
+                ["sbatch", "--parsable", f"--comment=inkly:{bundle}", "job.sbatch"],
+                directory,
+            )
             match = re.fullmatch(r"([0-9]+)(?:;[A-Za-z0-9_.-]+)?\s*", result.stdout)
             if result.returncode != 0 or not match:
                 raise ValueError(
