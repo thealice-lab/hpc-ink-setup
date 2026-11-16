@@ -408,7 +408,7 @@ class DesktopApp:
             elif kind == "notice":
                 # Expected outcomes (for example a job that already completed),
                 # not failures; the connection stays open.
-                messagebox.showinfo("Cancel job", data, parent=self.root)
+                messagebox.showinfo("Inkly Desktop", data, parent=self.root)
             elif kind == "error":
                 self.review = None
                 if self.action == "submit":

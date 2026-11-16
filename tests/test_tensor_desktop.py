@@ -1269,7 +1269,7 @@ def test_native_cancel_and_run_again_follow_selected_rows(
         )
         app.events.put(("notice", "job 2406955 already completed"))
         app.drain()
-        assert shown == [("Cancel job", "job 2406955 already completed")]
+        assert shown == [("Inkly Desktop", "job 2406955 already completed")]
     finally:
         app.close()
 
