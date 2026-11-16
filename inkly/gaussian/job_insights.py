@@ -28,6 +28,11 @@ def optional_value(value):
 
 
 def query_status(directory, receipt, scheduler):
+    """Status for the on-demand Job details view only.
+
+    The watch loop keeps using the endpoint's single accounting read per
+    check; the extra queue read here happens only when a researcher asks.
+    """
     job = receipt.get("job_id")
     if not job:
         return {"state": receipt["submission"], "exit_code": None}

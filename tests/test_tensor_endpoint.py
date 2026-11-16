@@ -434,8 +434,6 @@ def slurm(states, calls, scancel_code=0, check=None):
         if args[0] == "sacct":
             state = answers.pop(0) if len(answers) > 1 else answers[0]
             return subprocess.CompletedProcess(args, 0, f"12345|{state}|0:0\n", "")
-        if args[0] == "squeue":
-            return subprocess.CompletedProcess(args, 0, "", "")
         raise AssertionError(f"unexpected scheduler call {args}")
 
     return scheduler
@@ -518,3 +516,23 @@ def test_status_reads_after_cancel_are_bounded(prepared, monkeypatch):
         tensor.CANCEL_STATUS_READS
     )
     assert len(sleeps) == tensor.CANCEL_STATUS_READS - 1
+
+
+@pytest.mark.parametrize("state", ["PENDING", "RUNNING"])
+def test_watch_status_reads_accounting_once_per_check(prepared, monkeypatch, state):
+    # Each watch check stays one sacct call per job; the queue is read only
+    # when accounting has no record (and by Job details on request).
+    root, request, _ = prepared
+    receipt_path = root / request["bundle"] / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt.update(submission="SUBMITTED", job_id="12345")
+    receipt_path.write_text(json.dumps(receipt))
+    calls = []
+
+    def scheduler(args, directory):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args, 0, f"12345|{state}|0:0\n", "")
+
+    monkeypatch.setattr(tensor, "_scheduler", scheduler)
+    response = operate(prepared, "status")
+    assert response["state"] == state and calls == ["sacct"]
