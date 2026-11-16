@@ -1170,7 +1170,7 @@ class DesktopApp:
             "subfolders are searched too. Otherwise Desktop can keep a copy of each "
             "input, and its returned result, in a folder for copies."
         )
-        dialog = tk.Toplevel(self.root)
+        dialog = self.missing_dialog = tk.Toplevel(self.root)
         dialog.title("Jobs not found on this computer")
         dialog.transient(self.root)
         dialog.resizable(False, False)
@@ -1191,7 +1191,10 @@ class DesktopApp:
             button.grid(row=1, column=column, padx=8, pady=(0, 16))
             self.missing_buttons[value] = button
         dialog.protocol("WM_DELETE_WINDOW", lambda: pick("skip"))
-        dialog.grab_set()
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass  # Not viewable yet (main window hidden); still answerable.
         self.missing_buttons["find"].focus_set()
         self.root.wait_window(dialog)
         return choice["value"]

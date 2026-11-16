@@ -2172,6 +2172,16 @@ def test_native_contact_never_obstructs_controls_at_common_scaling(
         app.close()
 
 
+def no_message_boxes(monkeypatch, gui):
+    """A message box nobody can click would hang the test: fail instead."""
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError(f"Unexpected message box: {args}")
+
+    for name in ("showinfo", "showerror", "showwarning", "askyesno", "askokcancel"):
+        monkeypatch.setattr(gui.messagebox, name, unexpected, raising=False)
+
+
 def pump(app, seconds=10):
     """Drain window events until Desktop is idle with nothing left to start."""
     import time as clock
@@ -2350,6 +2360,7 @@ def test_native_job_history_filters_and_adds_selected_jobs(
         assert app.files == [copy]
         assert status_of(app, copy).startswith("CANCELLED")
     finally:
+        app.busy, app.action = False, None
         app.close()
 
 
@@ -2402,26 +2413,29 @@ def test_native_find_files_adds_the_originals_instead_of_copies(
     monkeypatch.setattr(
         gui.filedialog, "askdirectory", lambda **k: str(tmp_path / "research")
     )
+    no_message_boxes(monkeypatch, gui)
     try:
         app.settings = dict(SETTINGS)
         app.load_button.invoke()
         pump(app)
-        assert app.files == [original]
-        assert app.rows[str(original)]["state"] == "CONFIGURING"
+        assert len(app.files) == 1 and app.files[0].resolve() == original.resolve()
+        assert app.rows[str(app.files[0])]["state"] == "CONFIGURING"
         assert not list(tmp_path.glob("**/old-cccccccc"))  # No copy was made.
         assert len(prompts) == 1
-        # Found automatically next time: no prompt.
-        app.files.clear()
+        # Found automatically next time: no prompt and no duplicate row.
         app.load_button.invoke()
         pump(app)
-        assert app.files == [original.resolve()] and len(prompts) == 1
+        assert len(app.files) == 1 and len(prompts) == 1
     finally:
+        app.busy, app.action = False, None  # Never ask before closing a test.
         app.close()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Real Tk dialog")
 @pytest.mark.parametrize("button", ["find", "copy", "skip"])
-def test_native_missing_jobs_prompt_returns_the_choice(tmp_path, button):
+def test_native_missing_jobs_prompt_returns_the_choice(
+    workflow, tmp_path, monkeypatch, button
+):
     import tkinter as tk
     import tensor_desktop as gui
 
@@ -2429,9 +2443,13 @@ def test_native_missing_jobs_prompt_returns_the_choice(tmp_path, button):
     root.withdraw()
     app = gui.DesktopApp(
         root,
-        controller_factory=lambda emit, askpass: None,
+        controller_factory=lambda emit, askpass: workflow.controller,
         settings_path=tmp_path / "gui-settings.json",
     )
+    no_message_boxes(monkeypatch, gui)
+    # If the button press never happens, close the prompt so a failure
+    # cannot leave the test waiting.
+    root.after(5000, lambda: app.missing_dialog.destroy())
     try:
         root.after(200, lambda: app.missing_buttons[button].invoke())
         choice = app.ask_missing(
@@ -2441,4 +2459,5 @@ def test_native_missing_jobs_prompt_returns_the_choice(tmp_path, button):
         )
         assert choice == button
     finally:
+        app.busy, app.action = False, None
         app.close()
