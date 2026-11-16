@@ -118,6 +118,29 @@ The table and confirmation show demand if every new job runs simultaneously.
 Original inputs and existing results are never overwritten. Scientific routes,
 structures and analysis stay under the researcher's control.
 
+## Pending and failed-job details
+
+Select one previewed row and choose **Job details** above Activity. It works
+while watching, using the same SSH connection. For a pending job it shows
+Slurm's reason, estimated start in the HPC's local time, elapsed run time and
+the observation time in UTC. Start estimates can change; unavailable estimates
+are shown explicitly. Elapsed run time excludes time waiting in the queue.
+These fields use [squeue](https://slurm.schedmd.com/squeue.html) and
+[sacct](https://slurm.schedmd.com/sacct.html) for that recorded job only.
+
+For **FAILED**, **TIMEOUT** and **OUT_OF_MEMORY**, Job details reads at most
+the final 16 KiB / 60 lines of each known Gaussian and Slurm output file and
+highlights the last Gaussian error-termination line in that excerpt. Missing,
+unreadable or unsafe files are reported as unavailable. A scheduler kill may
+leave no Gaussian error line; the excerpts do not establish a scientific cause.
+Partial failed output is never marked RETURNED or imported as a verified result.
+
+Log excerpts appear only in the requested details window. They can contain
+research data and are not written to Activity, diagnostic events or receipts.
+This operation does not modify the bundle or submit, cancel or retry jobs.
+An older HPC endpoint keeps working and displays an upgrade notice for details.
+Full details require a matching endpoint with the `job_details` capability.
+
 ## Returning later
 
 **Stop watching** ends the watch after the check in progress and keeps the
