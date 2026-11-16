@@ -351,9 +351,9 @@ class DesktopApp:
                 "preview": "Preparing preview…",
                 "submit": "Submitting approved jobs and watching results…",
                 "monitor": "Checking recorded jobs…",
-                "my_jobs": "Reading your Slurm jobs…",
                 "cancel_jobs": "Cancelling the selected pending jobs…",
                 "rerun": "Preparing the selected files again (nothing is submitted)…",
+                "my_jobs": "Reading your Slurm jobs…",
             }[action]
         )
         self.progress.start(12)
@@ -365,8 +365,6 @@ class DesktopApp:
             kind, data = self.events.get_nowait()
             if kind == "message":
                 self.log(data)
-            elif kind == "my_jobs":
-                self.show_my_jobs(data)
             elif kind == "row":
                 self.rows[data["path"]] = data
                 if self.table.exists(data["path"]):
@@ -415,6 +413,8 @@ class DesktopApp:
                     text="Stopped. See the message below; recorded jobs are preserved."
                 )
                 messagebox.showerror("Handoff stopped", data, parent=self.root)
+            elif kind == "my_jobs":
+                self.show_my_jobs(data)
             elif kind == "done":
                 if self.stop_deadline:
                     self.root.after_cancel(self.stop_deadline)
@@ -556,7 +556,6 @@ class DesktopApp:
 
         controls = {
             "settings": self.settings_button,
-            "my_jobs": self.jobs_button,
             "add": self.add_button,
             "folder": self.folder_button,
             "remove": self.remove_button,
@@ -570,6 +569,7 @@ class DesktopApp:
             "script": self.script_button,
             "results": self.results_button,
             "status": self.status,
+            "my_jobs": self.jobs_button,
         }
         clipped = sorted(name for name, widget in controls.items() if not fits(widget))
         shown = self.contact.winfo_manager() == "pack"

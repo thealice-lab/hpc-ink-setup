@@ -98,6 +98,20 @@ class DesktopController:
                 "Stopped watching. Any submitted HPC jobs continue; preview the same files to recover."
             )
 
+    def my_jobs(self, settings):
+        """List this authenticated account's jobs without loading local inputs."""
+        settings = picker.validate_settings(dict(settings))
+        self.connect(settings)
+        receipt = {**settings, "bundle": uuid.uuid4().hex}
+        if not self.endpoint_supports("jobs", receipt):
+            self.emit(
+                "notice",
+                "This HPC endpoint does not support My jobs. Ask the maintainer for a matching endpoint.",
+            )
+            return
+        response = self.session.exchange({"action": "jobs"}, receipt=receipt)
+        self.emit("my_jobs", response)
+
     def connect(self, connection):
         target = tuple(connection.get(key) for key in ("host", "ink_path", "auth"))
         if self.session and target == self.target:
@@ -164,20 +178,6 @@ class DesktopController:
         ):
             return {"job_id": int(job_id)}
         return {}
-
-    def my_jobs(self, settings):
-        """List this authenticated account's jobs without loading local inputs."""
-        settings = picker.validate_settings(dict(settings))
-        self.connect(settings)
-        receipt = {**settings, "bundle": uuid.uuid4().hex}
-        if not self.endpoint_supports("jobs", receipt):
-            self.emit(
-                "notice",
-                "This HPC endpoint does not support My jobs. Ask the maintainer for a matching endpoint.",
-            )
-            return
-        response = self.session.exchange({"action": "jobs"}, receipt=receipt)
-        self.emit("my_jobs", response)
 
     def preview(self, paths, settings, recover_bundles=None):
         self.check_stop()
@@ -707,9 +707,7 @@ class DesktopController:
 
     def execute(self, action, *args):
         try:
-            if action == "my_jobs":
-                self.my_jobs(*args)
-            elif action == "preview":
+            if action == "preview":
                 self.preview(*args)
             elif action == "submit":
                 self.submit(*args)
@@ -721,6 +719,8 @@ class DesktopController:
                 self.cancel_jobs(*args)
             elif action == "rerun":
                 self.rerun(*args)
+            elif action == "my_jobs":
+                self.my_jobs(*args)
             elif action == "close":
                 # Record SSH closure while the journal can still accept events;
                 # final metadata is handed off by the existing session close.

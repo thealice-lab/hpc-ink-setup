@@ -15,10 +15,10 @@ import sys
 import tempfile
 import time
 
+from inkly.gaussian.job_list import list_jobs
 from inkly.cluster_profile import resolve_cluster_profile
 from inkly.core.storage import history_lock, private_directory, private_open
 from inkly.gaussian.job_spec import GaussianJobSpec
-from inkly.gaussian.job_list import list_jobs
 from inkly.gaussian.sbatch import generate_sbatch
 
 
