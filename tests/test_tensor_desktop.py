@@ -331,8 +331,9 @@ def hpc_job(bundle, state, name="sample_1.gjf", ended_days=None, job_id="123"):
         "job_id": job_id,
         "submission": "PREPARED" if state == "PREPARED" else "SUBMITTED",
         "state": state,
-        "prepared_at": (now - timedelta(days=30)).isoformat(),
-        "submitted_at": (now - timedelta(days=30)).isoformat(),
+        # Older than the Job history default (30 days), away from its edge.
+        "prepared_at": (now - timedelta(days=45)).isoformat(),
+        "submitted_at": (now - timedelta(days=45)).isoformat(),
         "ended_at": None
         if ended_days is None
         else (now - timedelta(days=ended_days)).isoformat(),
@@ -2263,6 +2264,8 @@ def test_native_job_history_filters_and_adds_selected_jobs(
             hpc_job("e" * 32, "COMPLETED", "old.gjf", ended_days=60),
         ]
         w.endpoint["jobs"][1]["submitted_at"] = w.endpoint["jobs"][1]["ended_at"]
+        # Well away from the 30-day boundary, so the clock tick cannot matter.
+        w.endpoint["jobs"][3]["submitted_at"] = w.endpoint["jobs"][3]["ended_at"]
         app.history_button.invoke()
         pump(app)
         table = app.history_table
