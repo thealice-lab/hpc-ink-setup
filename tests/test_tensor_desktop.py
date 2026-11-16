@@ -157,6 +157,75 @@ def record_for(workflow, path):
     return workflow.records[receipt["bundle"]]
 
 
+@pytest.mark.parametrize("probe", ["current", "old", "missing", "invalid"])
+def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
+    c = workflow.controller
+    before = {path: path.read_bytes() for path in workflow.paths}
+    if probe == "old":
+        workflow.endpoint["capabilities"] = None
+    elif probe == "missing":
+        workflow.endpoint["capabilities"] = ["status"]
+    elif probe == "invalid":
+        c.connect(SETTINGS)
+        c.session.exchange = lambda *a, **k: {
+            "version": "PRIVATE_BAD_HANDSHAKE\n",
+            "capabilities": [],
+        }
+        with pytest.raises(ValueError, match="invalid version handshake"):
+            c.test_connection(SETTINGS)
+        assert "PRIVATE_BAD_HANDSHAKE" not in str(workflow.events)
+        return
+    c.test_connection(SETTINGS)
+    c.test_connection(SETTINGS)
+    assert len(workflow.connections) == 1
+    assert actions(workflow) == ["version", "version"]
+    assert not c.items and c.review_id is None
+    assert not list(workflow.paths[0].parent.glob("*.inkly.json"))
+    assert before == {path: path.read_bytes() for path in workflow.paths}
+    notice = [data for kind, data in workflow.events if kind == "notice"][-1]
+    assert (
+        "cannot report its version"
+        if probe == "old"
+        else "Missing required"
+        if probe == "missing"
+        else "Required handoff"
+    ) in notice
+
+
+def test_connection_does_not_consume_an_existing_preview(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    review = c.review_id
+    c.test_connection(SETTINGS)
+    assert c.review_id == review
+    assert len(workflow.connections) == 1
+    assert actions(workflow)[-1] == "version"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows Tk")
+def test_native_connection_button_needs_no_added_files(workflow, tmp_path):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    root = tk.Tk()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda *a, **k: workflow.controller,
+        settings_path=tmp_path / "settings.json",
+    )
+    try:
+        app.settings = dict(SETTINGS)
+        assert not app.files
+        app.buttons()
+        assert str(app.test_connection_button["state"]) == "normal"
+        app.test_connection()
+        assert app.action == "test_connection"
+        assert str(app.test_connection_button["state"]) == "disabled"
+    finally:
+        app.busy = False
+        app.close()
+
+
 def recorded_job(workflow, path, state, job_id="123"):
     """Mark a previewed file as submitted, with the given Slurm state."""
     record_for(workflow, path).update(
@@ -1654,73 +1723,4 @@ def test_native_contact_never_obstructs_controls_at_common_scaling(
             assert shown["controls_visible"], evidence
             assert shown["table_height"] > 30, evidence
     finally:
-        app.close()
-
-
-@pytest.mark.parametrize("probe", ["current", "old", "missing", "invalid"])
-def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
-    c = workflow.controller
-    before = {path: path.read_bytes() for path in workflow.paths}
-    if probe == "old":
-        workflow.endpoint["capabilities"] = None
-    elif probe == "missing":
-        workflow.endpoint["capabilities"] = ["status"]
-    elif probe == "invalid":
-        c.connect(SETTINGS)
-        c.session.exchange = lambda *a, **k: {
-            "version": "PRIVATE_BAD_HANDSHAKE\n",
-            "capabilities": [],
-        }
-        with pytest.raises(ValueError, match="invalid version handshake"):
-            c.test_connection(SETTINGS)
-        assert "PRIVATE_BAD_HANDSHAKE" not in str(workflow.events)
-        return
-    c.test_connection(SETTINGS)
-    c.test_connection(SETTINGS)
-    assert len(workflow.connections) == 1
-    assert actions(workflow) == ["version", "version"]
-    assert not c.items and c.review_id is None
-    assert not list(workflow.paths[0].parent.glob("*.inkly.json"))
-    assert before == {path: path.read_bytes() for path in workflow.paths}
-    notice = [data for kind, data in workflow.events if kind == "notice"][-1]
-    assert (
-        "cannot report its version"
-        if probe == "old"
-        else "Missing required"
-        if probe == "missing"
-        else "Required handoff"
-    ) in notice
-
-
-def test_connection_does_not_consume_an_existing_preview(workflow):
-    c = workflow.controller
-    c.preview(workflow.paths, SETTINGS)
-    review = c.review_id
-    c.test_connection(SETTINGS)
-    assert c.review_id == review
-    assert len(workflow.connections) == 1
-    assert actions(workflow)[-1] == "version"
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows Tk")
-def test_native_connection_button_needs_no_added_files(workflow, tmp_path):
-    import tkinter as tk
-    import tensor_desktop as gui
-
-    root = tk.Tk()
-    app = gui.DesktopApp(
-        root,
-        controller_factory=lambda *a, **k: workflow.controller,
-        settings_path=tmp_path / "settings.json",
-    )
-    try:
-        app.settings = dict(SETTINGS)
-        assert not app.files
-        app.buttons()
-        assert str(app.test_connection_button["state"]) == "normal"
-        app.test_connection()
-        assert app.action == "test_connection"
-        assert str(app.test_connection_button["state"]) == "disabled"
-    finally:
-        app.busy = False
         app.close()
