@@ -9,12 +9,13 @@ import threading
 import uuid
 
 import tensor_bridge as bridge
+import tensor_desktop_jobs as jobs
 import tensor_picker as picker
 from inkly.core.desktop_diagnostics import DesktopJournal
 
 
 class DesktopController:
-    def __init__(self, emit, askpass=None, interval=30, journal=None):
+    def __init__(self, emit, askpass=None, interval=30, journal=None, index=None):
         self.emit = emit
         self.askpass = askpass
         self.interval = interval
@@ -25,6 +26,8 @@ class DesktopController:
         self.items = []
         self.review_id = None
         self.journal = journal if journal is not None else DesktopJournal()
+        # Which input file on this computer each recorded bundle belongs to.
+        self.index = index if index is not None else jobs.Index()
         self.connection_verified = False
         # Jobs cancelled through Inkly in this window; monitoring then skips
         # repeating the cancellation message.
@@ -35,6 +38,12 @@ class DesktopController:
         self.wake = threading.Event()
         # Stop watching: end the monitor loop but keep the SSH session open.
         self.paused = threading.Event()
+
+    def remember(self, item):
+        try:
+            self.index.remember(item["path"], item["receipt"]["bundle"])
+        except Exception:
+            pass  # The list of files is a convenience; it never stops a handoff.
 
     def audit(self, event_type, payload=None):
         try:
@@ -97,20 +106,6 @@ class DesktopController:
             raise InterruptedError(
                 "Stopped watching. Any submitted HPC jobs continue; preview the same files to recover."
             )
-
-    def my_jobs(self, settings):
-        """List this authenticated account's jobs without loading local inputs."""
-        settings = picker.validate_settings(dict(settings))
-        self.connect(settings)
-        receipt = {**settings, "bundle": uuid.uuid4().hex}
-        if not self.endpoint_supports("jobs", receipt):
-            self.emit(
-                "notice",
-                "This HPC endpoint does not support My jobs. Ask the maintainer for a matching endpoint.",
-            )
-            return
-        response = self.session.exchange({"action": "jobs"}, receipt=receipt)
-        self.emit("my_jobs", response)
 
     def connect(self, connection):
         target = tuple(connection.get(key) for key in ("host", "ink_path", "auth"))
@@ -187,7 +182,11 @@ class DesktopController:
     # Operations Test connection checks for. Optional ones only switch off a
     # feature; Desktop still asks the endpoint before using each of them.
     REQUIRED_OPERATIONS = ("prepare", "submit", "status", "fetch")
-    OPTIONAL_OPERATIONS = {"cancel": "Cancel job"}
+    OPTIONAL_OPERATIONS = {
+        "cancel": "Cancel job",
+        "job_details": "Job details",
+        "jobs": "Load my jobs and Job history",
+    }
 
     def test_connection(self, settings):
         """Check only the configured SSH endpoint handshake; no bundle or Slurm work."""
@@ -284,6 +283,7 @@ class DesktopController:
                 # under the old bundle. Run again prepares it as a new job.
                 item["response"] = error.response
                 item["changed"] = True
+                self.remember(item)
                 self.row(item)
                 self.emit(
                     "message",
@@ -305,6 +305,7 @@ class DesktopController:
             )
             if item.get("recovered"):
                 self.audit("desktop_recovery", {"status": "prepared", "count": 1})
+            self.remember(item)
             self.row(item)
         if missing:
             self.audit(
@@ -376,19 +377,21 @@ class DesktopController:
                     raise ValueError(
                         f"A result already exists and will not be overwritten: {output}"
                     )
-            elif (
-                response.get("state") not in picker.ACTIVE
-                and picker.state_name(response.get("state")) != "CANCELLED"
-                and not (
-                    response.get("state") == "COMPLETED"
-                    and response.get("exit_code") == "0:0"
-                )
+            elif picker.state_name(response.get("state")) not in (
+                picker.ACTIVE | self.ENDED
             ):
+                # Only a job that may or may not have run stops new submissions.
+                # Jobs that are running or have definitely ended (completed,
+                # failed, timed out, cancelled...) do not.
                 raise ValueError(
                     f"{item['path'].name} has an unresolved job state. Inspect it before submitting more jobs."
                 )
             item["response"] = response
             self.row(item)
+
+    # Slurm states that mean a job has definitely stopped, with or without a
+    # result. A row in one of these never blocks submitting other files.
+    ENDED = (picker.RERUNNABLE - {"PREPARED"}) | {"COMPLETED", "RETURNED"}
 
     def submit(self, review_id, confirmed=False, watch=True):
         if not confirmed or not self.review_id or review_id != self.review_id:
@@ -421,7 +424,15 @@ class DesktopController:
             self.monitor()
 
     # Operations the window may ask for while monitoring.
-    WATCH_REQUESTS = ("cancel_jobs", "preview", "submit", "rerun", "my_jobs")
+    WATCH_REQUESTS = (
+        "cancel_jobs",
+        "preview",
+        "submit",
+        "rerun",
+        "load_jobs",
+        "restore_jobs",
+        "history",
+    )
 
     def request(self, action, *args):
         """Called from the window thread while monitoring: run this operation next.
@@ -465,11 +476,6 @@ class DesktopController:
             try:
                 if action in {"cancel_jobs", "job_details"}:
                     targets = [self.target_for(args[0], args[1], "resume")]
-                elif action == "my_jobs":
-                    settings = picker.validate_settings(dict(args[0]))
-                    targets = [
-                        tuple(settings.get(key) for key in ("host", "ink_path", "auth"))
-                    ]
                 elif action == "rerun":
                     targets = [
                         self.target_for(args[0], args[2], "resume"),
@@ -477,6 +483,13 @@ class DesktopController:
                     ]
                 elif action == "preview":
                     targets = [self.target_for(args[0], args[1], "preview")]
+                elif action in {"load_jobs", "history", "restore_jobs"}:
+                    settings = picker.validate_settings(
+                        dict(args[2] if action == "restore_jobs" else args[0])
+                    )
+                    targets = [
+                        tuple(settings.get(key) for key in ("host", "ink_path", "auth"))
+                    ]
                 else:
                     targets = []  # Submit uses the current preview's connection.
                 if any(target != self.target for target in targets):
@@ -544,7 +557,19 @@ class DesktopController:
                             "to submit it as a new job.",
                         )
                     pending.remove(item)
+                elif picker.state_name(state) in self.ENDED:
+                    # Ended without a result: say so once and keep watching the
+                    # others. Inkly never resubmits it.
+                    self.emit(
+                        "message",
+                        f"{item['path'].name}: job {response.get('job_id', '')} ended as "
+                        f"{picker.state_name(state)} (exit {response.get('exit_code')}) "
+                        "without a returned result. Select the row and choose Job "
+                        "details to see why, or Run again to prepare it as a new job.",
+                    )
+                    pending.remove(item)
                 elif state not in picker.ACTIVE:
+                    # A job that may or may not have run: stop for inspection.
                     raise ValueError(
                         f"{item['path'].name}: {state} (exit {response.get('exit_code')}). Other jobs may continue. Keep receipts and inspect this job."
                     )
@@ -588,6 +613,99 @@ class DesktopController:
                 "unavailable": "This HPC endpoint does not support job details. Ask the maintainer for a matching endpoint.",
             }
         self.emit("job_details", details)
+
+    def listing(self, settings, feature):
+        """The HPC's list of recorded handoffs, or None on an older HPC copy."""
+        self.connect(settings)
+        receipt = {**settings, "bundle": uuid.uuid4().hex}
+        if not self.endpoint_supports("jobs", receipt):
+            self.emit(
+                "notice",
+                f"{feature} needs an updated HPC copy of Inkly. Ask the maintainer "
+                "to update it; Add files works as before.",
+            )
+            return None
+        return self.session.exchange({"action": "jobs"}, receipt=receipt)
+
+    def load_jobs(self, settings, bundles=None):
+        """Find jobs to put in the list without Add files.
+
+        Without `bundles`: pending and running jobs, and jobs that ended in the
+        last few days. With `bundles` (from Job history): exactly those jobs.
+        Files found on this computer are added as they are; the window asks
+        where to keep a copy of the others.
+        """
+        settings = picker.validate_settings(dict(settings))
+        listing = self.listing(settings, "Load my jobs")
+        if listing is None:
+            return
+        if bundles is None:
+            chosen = jobs.load_set(listing["jobs"])
+        else:
+            wanted = set(bundles)
+            chosen = [job for job in listing["jobs"] if job["bundle"] in wanted]
+        found, restore, replaced = [], [], 0
+        for job in chosen:
+            kind, path = self.index.locate(job["bundle"])
+            if kind == "found":
+                found.append(str(path))
+            elif kind == "replaced" and bundles is None:
+                replaced += 1  # Run again gave the file a newer job.
+            else:
+                restore.append(job)
+        self.audit("desktop_jobs", {"action": "load", "count": len(chosen)})
+        self.emit(
+            "jobs_found",
+            {
+                "paths": found,
+                "restore": restore,
+                "replaced": replaced,
+                "settings": settings,
+                "unavailable": listing.get("unavailable", []),
+                "from_history": bundles is not None,
+            },
+        )
+
+    def restore_jobs(self, restore, folder, settings):
+        """Copy each job's input from the HPC into its own folder here."""
+        settings = picker.validate_settings(dict(settings))
+        self.connect(settings)
+        if not self.endpoint_supports(
+            "input", {**settings, "bundle": uuid.uuid4().hex}
+        ):
+            self.emit(
+                "notice",
+                f"{len(restore)} job(s) are not on this computer, and copying them "
+                "needs an updated HPC copy of Inkly. Ask the maintainer to update it.",
+            )
+            self.emit("jobs_restored", {"paths": []})
+            return
+        paths = []
+        for job in restore:
+            self.check_stop()
+            try:
+                copy = self.session.exchange(
+                    {"action": "input"}, receipt={**settings, "bundle": job["bundle"]}
+                )
+                path = jobs.restore(folder, job, copy, settings, self.index)
+            except (ValueError, OSError) as error:
+                self.emit(
+                    "message", f"{job.get('name', 'A job')} was not copied: {error}"
+                )
+                continue
+            paths.append(str(path))
+            self.emit("message", f"Copied {job['name']} from the HPC to {path.parent}")
+        self.audit("desktop_jobs", {"action": "restore", "count": len(paths)})
+        self.emit("jobs_restored", {"paths": paths})
+
+    def history(self, settings):
+        """Every recorded handoff for the Job history window."""
+        settings = picker.validate_settings(dict(settings))
+        listing = self.listing(settings, "Job history")
+        if listing is None:
+            return
+        self.audit("desktop_jobs", {"action": "history", "count": len(listing["jobs"])})
+        self.emit("history", listing)
 
     def endpoint_supports(self, operation, receipt):
         """Ask the HPC copy of Inkly; older copies answer "Unsupported operation"."""
@@ -781,12 +899,17 @@ class DesktopController:
         self.audit("desktop_rerun", {"status": "approved", "count": len(items)})
         for item in items:
             self.check_stop()
+            old_bundle = item["receipt"]["bundle"]
             picker.prepare_again(
                 self.session,
                 item,
                 settings,
                 report=lambda value: self.emit("message", value),
             )
+            try:
+                self.index.replaced(old_bundle)
+            except Exception:
+                pass
             self.audit("desktop_rerun", {"status": "prepared", "count": 1})
         # Re-read the whole list so the rows and the approval cover every file.
         self.preview(paths, settings)
@@ -809,8 +932,8 @@ class DesktopController:
                 self.job_details(*args)
             elif action == "rerun":
                 self.rerun(*args)
-            elif action == "my_jobs":
-                self.my_jobs(*args)
+            elif action in {"load_jobs", "restore_jobs", "history"}:
+                getattr(self, action)(*args)
             elif action == "close":
                 # Record SSH closure while the journal can still accept events;
                 # final metadata is handed off by the existing session close.

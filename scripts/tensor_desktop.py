@@ -21,6 +21,7 @@ import webbrowser
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import tensor_desktop_jobs as jobs
 import tensor_desktop_status as status
 import tensor_picker as picker
 from tensor_desktop_backend import DesktopController
@@ -83,6 +84,13 @@ class DesktopApp:
         # watching can never hit an action started later.
         self.run_id = 0
         self.stop_deadline = None
+        # Load my jobs runs in steps (find, copy, preview); the next step starts
+        # once the current action is done, or at once while watching.
+        self.after_done = None
+        self.load_found = False
+        self.jobs_index = jobs.Index()
+        self.history_window = None
+        self.history_listing = None
         self.events = queue.Queue()
         self.commands = queue.Queue()
         self.controller = controller_factory(
@@ -170,12 +178,20 @@ class DesktopApp:
             tools, text="Test connection", command=self.test_connection
         )
         self.test_connection_button.grid(row=0, column=2, rowspan=2, padx=(8, 0))
+        # These fill the list from the HPC instead of choosing files. The top
+        # bar's text column gives way first, so its buttons stay whole at 150%.
+        self.load_button = ttk.Button(
+            tools, text="Load my jobs", command=self.load_my_jobs
+        )
+        self.load_button.grid(row=0, column=3, rowspan=2, padx=(8, 0))
+        self.history_button = ttk.Button(
+            tools, text="Job history", command=self.job_history
+        )
+        self.history_button.grid(row=0, column=4, rowspan=2, padx=(8, 0))
         ttk.Label(
             tools,
             text="1  Choose inputs     →     2  Preview resources     →     3  Submit and return results",
         ).grid(row=1, column=0, sticky="w", pady=(9, 0))
-        self.jobs_button = ttk.Button(tools, text="My jobs", command=self.my_jobs)
-        self.jobs_button.grid(row=0, column=3, rowspan=2, padx=(8, 0))
 
         content = ttk.Frame(self.root, padding=(22, 0, 22, 12))
         content.grid(row=2, column=0, sticky="nsew")
@@ -207,8 +223,9 @@ class DesktopApp:
         self.hint = ttk.Label(
             content,
             text=(
-                "Add .gjf or .com inputs. Preview, Submit and Check use the whole "
-                "list; Cancel job and Run again use selected rows."
+                "Add .gjf or .com inputs, or Load my jobs from the HPC. Preview, "
+                "Submit and Check use the whole list; Cancel job and Run again use "
+                "selected rows."
             ),
             wraplength=1000,
         )
@@ -367,7 +384,9 @@ class DesktopApp:
                 "job_details": "Reading job details…",
                 "cancel_jobs": "Cancelling the selected pending jobs…",
                 "rerun": "Preparing the selected files again (nothing is submitted)…",
-                "my_jobs": "Reading your Slurm jobs…",
+                "load_jobs": "Finding your recent jobs on the HPC…",
+                "restore_jobs": "Copying jobs that are not on this computer…",
+                "history": "Reading your job history…",
             }[action]
         )
         self.progress.start(12)
@@ -381,6 +400,12 @@ class DesktopApp:
                 self.log(data)
             elif kind == "job_details":
                 self.show_job_details(data)
+            elif kind == "jobs_found":
+                self.jobs_found(data)
+            elif kind == "jobs_restored":
+                self.jobs_restored(data)
+            elif kind == "history":
+                self.show_history(data)
             elif kind == "row":
                 self.rows[data["path"]] = data
                 if self.table.exists(data["path"]):
@@ -420,6 +445,7 @@ class DesktopApp:
                 # not failures; the connection stays open.
                 messagebox.showinfo("Inkly Desktop", data, parent=self.root)
             elif kind == "error":
+                self.after_done = None  # A failed step never starts the next one.
                 self.review = None
                 if self.action == "submit":
                     self.mark_unconfirmed()
@@ -429,8 +455,6 @@ class DesktopApp:
                     text="Stopped. See the message below; recorded jobs are preserved."
                 )
                 messagebox.showerror("Handoff stopped", data, parent=self.root)
-            elif kind == "my_jobs":
-                self.show_my_jobs(data)
             elif kind == "done":
                 if self.stop_deadline:
                     self.root.after_cancel(self.stop_deadline)
@@ -448,6 +472,9 @@ class DesktopApp:
                         text="Operation finished. See Activity for results or recovery instructions."
                     )
             self.buttons()
+            if not self.busy and self.after_done and not self.closed:
+                step, self.after_done = self.after_done, None
+                step()
         if (
             self.recovery_request
             and (not self.busy or self.watching())
@@ -586,8 +613,9 @@ class DesktopApp:
             "script": self.script_button,
             "results": self.results_button,
             "details": self.details_button,
+            "load_jobs": self.load_button,
+            "history": self.history_button,
             "status": self.status,
-            "my_jobs": self.jobs_button,
         }
         clipped = sorted(name for name, widget in controls.items() if not fits(widget))
         shown = self.contact.winfo_manager() == "pack"
@@ -618,8 +646,12 @@ class DesktopApp:
         # While watching, new work goes to the running watch on its open
         # connection. Removing rows or changing the connection waits until idle.
         ready = not self.busy or self.watching()
-        self.jobs_button.configure(state="normal" if ready else "disabled")
-        for widget in (self.add_button, self.folder_button):
+        for widget in (
+            self.add_button,
+            self.folder_button,
+            self.load_button,
+            self.history_button,
+        ):
             widget.configure(state="normal" if ready else "disabled")
         for widget in (
             self.remove_button,
@@ -662,6 +694,7 @@ class DesktopApp:
             if any(row.get("output") for row in self.rows.values())
             else "disabled"
         )
+        self.history_buttons()
 
     def selected_rows(self):
         """Displayed rows for the selection; None where a row is not previewed."""
@@ -688,81 +721,6 @@ class DesktopApp:
                 or row.get("input_changed")
             )
             for _, row in rows
-        )
-
-    def my_jobs(self):
-        if not self.settings_ready():
-            return
-        if self.watching():
-            self.controller.request("my_jobs", dict(self.settings))
-        elif not self.busy:
-            self.start("my_jobs", dict(self.settings))
-
-    def show_my_jobs(self, response):
-        previous = getattr(self, "jobs_window", None)
-        if previous is not None and previous.winfo_exists():
-            previous.destroy()
-        dialog = self.jobs_window = tk.Toplevel(self.root)
-        dialog.title("My jobs — recorded Inkly handoffs")
-        dialog.geometry("1000x520")
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(1, weight=1)
-        summary = f"Recorded Inkly handoffs; queue and last 7 days of accounting. Observed (UTC): {response['observed_at']}"
-        if response.get("unavailable"):
-            summary += (
-                "\nUnavailable: "
-                + ", ".join(response["unavailable"])
-                + ". This is an incomplete listing."
-            )
-        if response.get("truncated"):
-            summary += "\nListing limited to 200 recent handoffs; use Slurm directly for older records."
-        if not response.get("jobs") and not response.get("unavailable"):
-            summary += "\nNo jobs reported in this window."
-        ttk.Label(dialog, text=summary, wraplength=940).grid(
-            row=0, column=0, sticky="w", padx=12, pady=12
-        )
-        columns = (
-            "job_id",
-            "bundle",
-            "name",
-            "state",
-            "elapsed",
-            "exit_code",
-            "start_time",
-            "reason",
-        )
-        table = ttk.Treeview(dialog, columns=columns, show="headings")
-        for key, title in zip(
-            columns,
-            (
-                "Job ID",
-                "Inkly bundle",
-                "Job name",
-                "State",
-                "Elapsed",
-                "Exit",
-                "Start (HPC time)",
-                "Reason",
-            ),
-        ):
-            table.heading(key, text=title)
-            table.column(key, width=130, minwidth=65)
-        for row in response.get("jobs", ()):
-            table.insert(
-                "", "end", values=[row.get(key) or "Unavailable" for key in columns]
-            )
-        table.grid(row=1, column=0, sticky="nsew", padx=(12, 0))
-        vertical = ttk.Scrollbar(dialog, orient="vertical", command=table.yview)
-        vertical.grid(row=1, column=1, sticky="ns")
-        horizontal = ttk.Scrollbar(dialog, orient="horizontal", command=table.xview)
-        horizontal.grid(row=2, column=0, sticky="ew", padx=12)
-        table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        ttk.Label(
-            dialog,
-            text="Read-only recorded handoffs. UNKNOWN can mean accounting is unavailable or outside the history window. Keep saved handoffs for result return.",
-        ).grid(row=3, column=0, sticky="w", padx=12, pady=8)
-        ttk.Button(dialog, text="Refresh", command=self.my_jobs).grid(
-            row=4, column=0, sticky="e", padx=12, pady=(0, 12)
         )
 
     def settings_ready(self):
@@ -1078,6 +1036,264 @@ class DesktopApp:
             text="Stopping the connection. Submitted HPC jobs continue."
         )
         self.buttons()
+
+    # Load my jobs and Job history -------------------------------------------
+
+    def run_or_request(self, action, *args):
+        """Start an action, or hand it to the running watch on its connection."""
+        if self.watching():
+            self.controller.request(action, *args)
+        elif not self.busy:
+            self.start(action, *args)
+
+    def load_my_jobs(self):
+        if (self.busy and not self.watching()) or not self.settings_ready():
+            return
+        self.run_or_request("load_jobs", dict(self.settings))
+
+    def job_history(self):
+        if (self.busy and not self.watching()) or not self.settings_ready():
+            return
+        self.run_or_request("history", dict(self.settings))
+
+    def then(self, step):
+        """Run `step` after the current action, or now while watching."""
+        if self.watching():
+            step()
+        else:
+            self.after_done = step
+
+    def jobs_found(self, data):
+        paths = [Path(path) for path in data["paths"]]
+        added = [path for path in paths if path not in self.files]
+        if paths:
+            self.add_paths(paths)
+        if data["replaced"]:
+            self.log(
+                f"{data['replaced']} recent job(s) were left out because Run again "
+                "gave their files a newer job. Job history still lists them."
+            )
+        if data["unavailable"]:
+            self.log(
+                "Some Slurm information was unavailable ("
+                + ", ".join(data["unavailable"])
+                + "); job states may show as UNKNOWN until the next check."
+            )
+        if data["restore"]:
+            folder = self.copies_folder(len(data["restore"]))
+            if folder:
+                # Preview once, after the copies are made.
+                self.load_found = bool(paths)
+                arguments = (data["restore"], str(folder), data["settings"])
+                self.then(lambda: self.run_or_request("restore_jobs", *arguments))
+                return
+            self.log(
+                f"{len(data['restore'])} job(s) not on this computer were skipped; "
+                "no folder was chosen for their copies."
+            )
+        if paths:
+            self.log(
+                f"Loaded {len(paths)} job(s) from the HPC ({len(added)} new in the "
+                "list). Checking their current state; nothing is submitted."
+            )
+            self.then(self.preview_files)
+        elif not data["restore"]:
+            messagebox.showinfo(
+                "Inkly Desktop",
+                "No pending, running or recently finished jobs were found for this "
+                "connection. Job history lists older jobs."
+                if not data["from_history"]
+                else "Those jobs are already in the list.",
+                parent=self.root,
+            )
+
+    def jobs_restored(self, data):
+        found, self.load_found = self.load_found, False
+        if data["paths"]:
+            self.add_paths([Path(path) for path in data["paths"]])
+        if data["paths"] or found:
+            self.then(self.preview_files)
+
+    def copies_folder(self, count):
+        """The remembered folder for copies, or ask for one the first time."""
+        folder = self.jobs_index.folder()
+        if folder and folder.is_dir():
+            return folder
+        messagebox.showinfo(
+            "Jobs not on this computer",
+            f"{count} job(s) were submitted from another computer, or before Inkly "
+            "Desktop kept a list of your files.\n\nChoose a folder where Desktop "
+            "will keep a copy of each input, in its own subfolder, together with its "
+            "returned results. Desktop remembers this folder; you can change it in "
+            "Job history.",
+            parent=self.root,
+        )
+        return self.choose_copies_folder()
+
+    def choose_copies_folder(self):
+        chosen = filedialog.askdirectory(
+            parent=self.root,
+            title="Choose a folder for jobs from the HPC",
+            mustexist=False,
+        )
+        if not chosen:
+            return None
+        folder = Path(chosen)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            self.jobs_index.set_folder(folder)
+        except OSError as error:
+            messagebox.showerror("Folder not available", str(error), parent=self.root)
+            return None
+        return folder
+
+    def show_history(self, listing):
+        self.history_listing = listing
+        window = self.history_window
+        if window is None or not window.winfo_exists():
+            self.build_history()
+        else:
+            window.lift()
+        self.refresh_history()
+
+    def build_history(self):
+        window = self.history_window = tk.Toplevel(self.root)
+        window.title("Job history")
+        window.geometry("1000x560")
+        window.minsize(760, 380)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(2, weight=1)
+        filters = ttk.Frame(window, padding=(12, 12, 12, 6))
+        filters.grid(row=0, column=0, sticky="ew")
+        self.history_state = tk.StringVar(value="Finished and cancelled")
+        self.history_period = tk.StringVar(value="Last 30 days")
+        self.history_text = tk.StringVar(value="")
+        for column, (label, variable, values) in enumerate(
+            (
+                ("Show", self.history_state, list(jobs.STATE_FILTERS)),
+                ("Submitted", self.history_period, list(jobs.PERIODS)),
+            )
+        ):
+            ttk.Label(filters, text=label).grid(row=0, column=column * 2, padx=(0, 6))
+            box = ttk.Combobox(
+                filters, textvariable=variable, values=values, state="readonly"
+            )
+            box.configure(width=max(len(value) for value in values) + 2)
+            box.grid(row=0, column=column * 2 + 1, padx=(0, 16))
+            box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_history())
+        ttk.Label(filters, text="File or job ID").grid(row=0, column=4, padx=(0, 6))
+        search = ttk.Entry(filters, textvariable=self.history_text, width=22)
+        search.grid(row=0, column=5)
+        self.history_text.trace_add("write", lambda *_: self.refresh_history())
+        self.history_summary = ttk.Label(window, padding=(12, 0), wraplength=960)
+        self.history_summary.grid(row=1, column=0, sticky="w")
+        frame = ttk.Frame(window, padding=(12, 6))
+        frame.grid(row=2, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        columns = ("submitted", "file", "job", "state", "exit", "elapsed", "ended")
+        table = self.history_table = ttk.Treeview(
+            frame, columns=columns, show="headings", selectmode="extended"
+        )
+        for column, title, width in zip(
+            columns,
+            ("Submitted", "Input file", "Job ID", "State", "Exit", "Elapsed", "Ended"),
+            (130, 230, 90, 150, 60, 80, 130),
+        ):
+            table.heading(column, text=title)
+            table.column(column, width=width, minwidth=50, stretch=column == "file")
+        table.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        table.configure(yscrollcommand=scroll.set)
+        table.bind("<<TreeviewSelect>>", lambda _event: self.history_buttons())
+        bottom = ttk.Frame(window, padding=(12, 6, 12, 12))
+        bottom.grid(row=3, column=0, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+        self.copies_label = ttk.Label(bottom)
+        self.copies_label.grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            bottom, text="Change folder…", command=self.change_copies_folder
+        ).grid(row=0, column=1, padx=(8, 16))
+        self.history_add = ttk.Button(
+            bottom, text="Add selected to list", command=self.add_from_history
+        )
+        self.history_add.grid(row=0, column=2)
+        self.history_refresh = ttk.Button(
+            bottom, text="Refresh", command=self.job_history
+        )
+        self.history_refresh.grid(row=0, column=3, padx=8)
+        ttk.Button(bottom, text="Close", command=window.destroy).grid(row=0, column=4)
+
+    def history_shown(self):
+        listing = self.history_listing or {"jobs": []}
+        return jobs.history_rows(
+            listing["jobs"],
+            self.history_state.get(),
+            self.history_period.get(),
+            self.history_text.get(),
+        )
+
+    def refresh_history(self):
+        if self.history_window is None or not self.history_window.winfo_exists():
+            return
+        listing = self.history_listing or {"jobs": []}
+        table = self.history_table
+        table.delete(*table.get_children())
+        shown = self.history_shown()
+        for job in shown:
+            table.insert(
+                "",
+                "end",
+                iid=job["bundle"],
+                values=(
+                    jobs.local_time(job.get("submitted_at") or job.get("prepared_at")),
+                    job["name"],
+                    job.get("job_id") or "—",
+                    status.state_name(job.get("state")),
+                    job.get("exit_code") or "",
+                    job.get("elapsed") or "",
+                    jobs.local_time(job.get("ended_at")),
+                ),
+            )
+        summary = (
+            f"Showing {len(shown)} of {len(listing['jobs'])} recorded Inkly job(s), "
+            f"newest first. Checked {jobs.local_time(listing.get('observed_at'))}."
+        )
+        if listing.get("unavailable"):
+            summary += (
+                " Some Slurm information was unavailable ("
+                + ", ".join(listing["unavailable"])
+                + "), so states may show as UNKNOWN."
+            )
+        if listing.get("truncated"):
+            summary += " Only the most recent jobs are listed."
+        self.history_summary.configure(text=summary)
+        folder = self.jobs_index.folder()
+        self.copies_label.configure(
+            text="Copies of jobs not on this computer: "
+            + (str(folder) if folder else "folder not chosen yet")
+        )
+        self.history_buttons()
+
+    def history_buttons(self):
+        if self.history_window is None or not self.history_window.winfo_exists():
+            return
+        ready = not self.busy or self.watching()
+        self.history_add.configure(
+            state="normal" if self.history_table.selection() and ready else "disabled"
+        )
+        self.history_refresh.configure(state="normal" if ready else "disabled")
+
+    def add_from_history(self):
+        bundles = list(self.history_table.selection())
+        if not bundles or (self.busy and not self.watching()):
+            return
+        self.run_or_request("load_jobs", dict(self.settings), bundles)
+
+    def change_copies_folder(self):
+        if self.choose_copies_folder():
+            self.refresh_history()
 
     def job_details(self):
         chosen = list(self.table.selection())

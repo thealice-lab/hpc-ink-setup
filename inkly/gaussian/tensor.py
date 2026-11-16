@@ -15,11 +15,11 @@ import sys
 import tempfile
 import time
 
-from inkly.gaussian.job_list import list_jobs
 from inkly.cluster_profile import resolve_cluster_profile
 from inkly.core.storage import history_lock, private_directory, private_open
 from inkly.gaussian.job_spec import GaussianJobSpec
 from inkly.gaussian.job_insights import job_details
+from inkly.gaussian.job_list import list_jobs
 from inkly.gaussian.sbatch import generate_sbatch
 
 
@@ -35,6 +35,8 @@ CAPABILITIES = (
     "cancel",
     "version",
     "job_details",
+    "jobs",
+    "input",
 )
 # Slurm accounting can lag scancel by a moment; re-read briefly, never retry it.
 CANCEL_STATUS_READS = 5
@@ -256,13 +258,6 @@ def handle(request, root=None):
     if not isinstance(bundle, str) or not re.fullmatch(r"[0-9a-f]{32}", bundle):
         raise ValueError("Invalid bundle ID")
     action = request.get("action")
-    if action == "jobs":
-        return {
-            "bundle": bundle,
-            **list_jobs(
-                _scheduler, Path.home(), root or Path.home() / ".inkly" / "tensor"
-            ),
-        }
     if action not in CAPABILITIES:
         raise ValueError("Unsupported operation")
     if action == "version":
@@ -272,7 +267,15 @@ def handle(request, root=None):
         return {
             "bundle": bundle,
             "version": __version__,
-            "capabilities": list(CAPABILITIES) + ["jobs"],
+            "capabilities": list(CAPABILITIES),
+        }
+    if action == "jobs":
+        # Read-only listing of recorded handoffs; never creates the store.
+        return {
+            "bundle": bundle,
+            **list_jobs(
+                _scheduler, Path.home(), root or Path.home() / ".inkly" / "tensor"
+            ),
         }
     if action == "job_details":
         return job_details(
@@ -349,6 +352,20 @@ def handle(request, root=None):
             return receipt
         if action == "cancel":
             return _cancel(directory, receipt, request)
+        if action == "input":
+            # The researcher's own prepared input, unchanged, so Desktop on
+            # another computer can keep a copy beside the returned result.
+            data = _read(directory / receipt["name"], MAX_INPUT)
+            if hashlib.sha256(data).hexdigest() != receipt["sha256"]:
+                raise ValueError(
+                    "The prepared input changed on the HPC; it was not copied"
+                )
+            return {
+                "bundle": bundle,
+                "name": receipt["name"],
+                "sha256": receipt["sha256"],
+                "data": base64.b64encode(data).decode("ascii"),
+            }
         status = _state(directory, receipt)
         response = {**receipt, **status}
         if action == "status":

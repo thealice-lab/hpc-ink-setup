@@ -73,9 +73,22 @@ DESKTOP_FIELDS = {
         "job_id": int,
     },
     "desktop_rerun": {"status": {"approved", "prepared"}, "count": int},
+    "desktop_jobs": {"action": {"load", "restore", "history"}, "count": int},
     "desktop_stop": {},
     "desktop_error": {
-        "action": {"preview", "submit", "monitor", "cancel_jobs", "rerun", "close"},
+        "action": {
+            "test_connection",
+            "preview",
+            "submit",
+            "monitor",
+            "cancel_jobs",
+            "job_details",
+            "rerun",
+            "load_jobs",
+            "restore_jobs",
+            "history",
+            "close",
+        },
         "code": {"interrupted", "permission", "io", "validation", "unexpected"},
     },
 }
