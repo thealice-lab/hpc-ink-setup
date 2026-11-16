@@ -57,13 +57,12 @@ def test_optional_queue_data_never_masks_accounting(tmp_path, problem):
 
 
 def test_queue_fallback_and_unknown_estimate(tmp_path):
-    response = insights.query_status(
-        tmp_path,
-        {"job_id": "42"},
-        lambda args, _: result(args, code=1)
-        if args[0] == "sacct"
-        else result(args, "42|PENDING|Resources|N/A|00:00\n"),
-    )
+    def scheduler(args, _):
+        if args[0] == "sacct":
+            return result(args, code=1)
+        return result(args, "42|PENDING|Resources|N/A|00:00\n")
+
+    response = insights.query_status(tmp_path, {"job_id": "42"}, scheduler)
     assert response["reason"] == "Resources" and response["start_time"] is None
 
 

@@ -1723,6 +1723,7 @@ def test_job_details_wording_marks_missing_estimates_and_private_excerpts():
     assert "Log unavailable" in failed and "not saved to Activity" in failed
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows Tk")
 def test_native_job_details_button_routes_read_only_watch_request(
     workflow, tmp_path, monkeypatch
 ):
