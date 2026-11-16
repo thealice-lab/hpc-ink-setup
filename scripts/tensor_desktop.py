@@ -170,6 +170,8 @@ class DesktopApp:
             tools,
             text="1  Choose inputs     →     2  Preview resources     →     3  Submit and return results",
         ).grid(row=1, column=0, sticky="w", pady=(9, 0))
+        self.jobs_button = ttk.Button(tools, text="My jobs", command=self.my_jobs)
+        self.jobs_button.grid(row=0, column=3, rowspan=2, padx=(8, 0))
 
         content = ttk.Frame(self.root, padding=(22, 0, 22, 12))
         content.grid(row=2, column=0, sticky="nsew")
@@ -349,6 +351,7 @@ class DesktopApp:
                 "preview": "Preparing preview…",
                 "submit": "Submitting approved jobs and watching results…",
                 "monitor": "Checking recorded jobs…",
+                "my_jobs": "Reading your Slurm jobs…",
                 "cancel_jobs": "Cancelling the selected pending jobs…",
                 "rerun": "Preparing the selected files again (nothing is submitted)…",
             }[action]
@@ -362,6 +365,8 @@ class DesktopApp:
             kind, data = self.events.get_nowait()
             if kind == "message":
                 self.log(data)
+            elif kind == "my_jobs":
+                self.show_my_jobs(data)
             elif kind == "row":
                 self.rows[data["path"]] = data
                 if self.table.exists(data["path"]):
@@ -551,6 +556,7 @@ class DesktopApp:
 
         controls = {
             "settings": self.settings_button,
+            "my_jobs": self.jobs_button,
             "add": self.add_button,
             "folder": self.folder_button,
             "remove": self.remove_button,
@@ -594,6 +600,7 @@ class DesktopApp:
         # While watching, new work goes to the running watch on its open
         # connection. Removing rows or changing the connection waits until idle.
         ready = not self.busy or self.watching()
+        self.jobs_button.configure(state="normal" if ready else "disabled")
         for widget in (self.add_button, self.folder_button):
             widget.configure(state="normal" if ready else "disabled")
         for widget in (self.remove_button, self.clear_button, self.settings_button):
@@ -966,6 +973,81 @@ class DesktopApp:
             text="Stopping the connection. Submitted HPC jobs continue."
         )
         self.buttons()
+
+    def my_jobs(self):
+        if not self.settings_ready():
+            return
+        if self.watching():
+            self.controller.request("my_jobs", dict(self.settings))
+        elif not self.busy:
+            self.start("my_jobs", dict(self.settings))
+
+    def show_my_jobs(self, response):
+        previous = getattr(self, "jobs_window", None)
+        if previous is not None and previous.winfo_exists():
+            previous.destroy()
+        dialog = self.jobs_window = tk.Toplevel(self.root)
+        dialog.title("My jobs — current HPC account")
+        dialog.geometry("1000x520")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+        summary = f"Current queue and last 7 days of accounting. Observed (UTC): {response['observed_at']}"
+        if response.get("unavailable"):
+            summary += (
+                "\nUnavailable: "
+                + ", ".join(response["unavailable"])
+                + ". This is an incomplete listing."
+            )
+        if response.get("truncated"):
+            summary += (
+                "\nListing limited to 200 jobs; use Slurm directly for older records."
+            )
+        if not response.get("jobs") and not response.get("unavailable"):
+            summary += "\nNo jobs reported in this window."
+        ttk.Label(dialog, text=summary, wraplength=940).grid(
+            row=0, column=0, sticky="w", padx=12, pady=12
+        )
+        columns = (
+            "job_id",
+            "name",
+            "state",
+            "elapsed",
+            "exit_code",
+            "start_time",
+            "reason",
+        )
+        table = ttk.Treeview(dialog, columns=columns, show="headings")
+        for key, title in zip(
+            columns,
+            (
+                "Job ID",
+                "Job name",
+                "State",
+                "Elapsed",
+                "Exit",
+                "Start (HPC time)",
+                "Reason",
+            ),
+        ):
+            table.heading(key, text=title)
+            table.column(key, width=130, minwidth=65)
+        for row in response.get("jobs", ()):
+            table.insert(
+                "", "end", values=[row.get(key) or "Unavailable" for key in columns]
+            )
+        table.grid(row=1, column=0, sticky="nsew", padx=(12, 0))
+        vertical = ttk.Scrollbar(dialog, orient="vertical", command=table.yview)
+        vertical.grid(row=1, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(dialog, orient="horizontal", command=table.xview)
+        horizontal.grid(row=2, column=0, sticky="ew", padx=12)
+        table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        ttk.Label(
+            dialog,
+            text="Read-only account view, including jobs submitted outside Inkly. Refresh to update; use saved handoffs for result return.",
+        ).grid(row=3, column=0, sticky="w", padx=12, pady=8)
+        ttk.Button(dialog, text="Refresh", command=self.my_jobs).grid(
+            row=4, column=0, sticky="e", padx=12, pady=(0, 12)
+        )
 
     def show_script(self):
         selected = self.table.selection()
