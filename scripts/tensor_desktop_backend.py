@@ -377,19 +377,21 @@ class DesktopController:
                     raise ValueError(
                         f"A result already exists and will not be overwritten: {output}"
                     )
-            elif (
-                response.get("state") not in picker.ACTIVE
-                and picker.state_name(response.get("state")) != "CANCELLED"
-                and not (
-                    response.get("state") == "COMPLETED"
-                    and response.get("exit_code") == "0:0"
-                )
+            elif picker.state_name(response.get("state")) not in (
+                picker.ACTIVE | self.ENDED
             ):
+                # Only a job that may or may not have run stops new submissions.
+                # Jobs that are running or have definitely ended (completed,
+                # failed, timed out, cancelled...) do not.
                 raise ValueError(
                     f"{item['path'].name} has an unresolved job state. Inspect it before submitting more jobs."
                 )
             item["response"] = response
             self.row(item)
+
+    # Slurm states that mean a job has definitely stopped, with or without a
+    # result. A row in one of these never blocks submitting other files.
+    ENDED = (picker.RERUNNABLE - {"PREPARED"}) | {"COMPLETED", "RETURNED"}
 
     def submit(self, review_id, confirmed=False, watch=True):
         if not confirmed or not self.review_id or review_id != self.review_id:
@@ -555,7 +557,19 @@ class DesktopController:
                             "to submit it as a new job.",
                         )
                     pending.remove(item)
+                elif picker.state_name(state) in self.ENDED:
+                    # Ended without a result: say so once and keep watching the
+                    # others. Inkly never resubmits it.
+                    self.emit(
+                        "message",
+                        f"{item['path'].name}: job {response.get('job_id', '')} ended as "
+                        f"{picker.state_name(state)} (exit {response.get('exit_code')}) "
+                        "without a returned result. Select the row and choose Job "
+                        "details to see why, or Run again to prepare it as a new job.",
+                    )
+                    pending.remove(item)
                 elif state not in picker.ACTIVE:
+                    # A job that may or may not have run: stop for inspection.
                     raise ValueError(
                         f"{item['path'].name}: {state} (exit {response.get('exit_code')}). Other jobs may continue. Keep receipts and inspect this job."
                     )

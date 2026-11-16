@@ -229,8 +229,13 @@ results; it signs in again if the connection has closed, and it never submits
 a prepared job.
 
 Previously submitted jobs are not submitted again. Already returned logs are
-verified and left unchanged. Unknown/failed states, changed resource previews
-and output collisions stop the workflow for inspection.
+verified and left unchanged. A job whose state is unknown or whose submission
+is uncertain, changed resource previews and output collisions stop the workflow
+for inspection. Jobs that are running or have ended (completed, failed, timed
+out, out of memory or cancelled) do not stop other files from being submitted,
+so a failure loaded with Load my jobs can stay in the list. While watching, a
+job that ended without a result is reported once in Activity, with a pointer
+to Job details, and the other jobs keep being watched.
 
 ## Cancel a pending job or run a file again
 

@@ -1265,6 +1265,64 @@ def test_cancelled_row_does_not_block_submitting_other_prepared_files(workflow):
     assert record_for(w, w.paths[0])["state"] == "CANCELLED by 1000"
 
 
+@pytest.mark.parametrize(
+    "state, exit_code",
+    [
+        ("FAILED", "1:0"),
+        ("TIMEOUT", "0:0"),
+        ("OUT_OF_MEMORY", "0:125"),
+        ("COMPLETED", "2:0"),
+        ("NODE_FAIL", "0:0"),
+    ],
+)
+def test_ended_rows_do_not_block_submitting_other_files(workflow, state, exit_code):
+    # Load my jobs brings recent failures into the list; they have stopped, so
+    # other prepared files can still be submitted beside them.
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], state, "1")
+    record_for(w, w.paths[0])["exit_code"] = exit_code
+    w.controller.preview(w.paths, SETTINGS)
+    assert w.controller.review()["count"] == 1
+    w.controller.submit(w.controller.review_id, True)
+    assert actions(w).count("submit") == 1
+    assert record_for(w, w.paths[0])["state"] == state
+
+
+def test_watch_reports_an_ended_job_and_keeps_watching_the_others(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], "TIMEOUT", "7")
+    recorded_job(w, w.paths[1], "RUNNING", "8")  # The fake HPC completes it.
+    w.controller.monitor()
+    assert rows_for(w, w.paths[0])[-1]["state"] == "TIMEOUT"
+    assert rows_for(w, w.paths[1])[-1]["state"] == "RETURNED"
+    ended = [m for m in messages(w) if "ended as TIMEOUT" in m]
+    assert len(ended) == 1 and "Job details" in ended[0]
+    assert "Check complete" in messages(w)[-1]
+    assert actions(w).count("fetch") == 1 and "submit" not in actions(w)
+
+
+def test_watch_still_stops_for_a_job_that_may_or_may_not_have_run(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], "UNKNOWN", "7")
+    with pytest.raises(ValueError, match="inspect this job"):
+        w.controller.monitor()
+
+
+@pytest.mark.parametrize("state", ["UNKNOWN", "SUBMISSION_UNKNOWN", "BOGUS"])
+def test_uncertain_rows_still_block_new_submissions(workflow, state):
+    # A job that may or may not have run is inspected before anything else.
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    recorded_job(w, w.paths[0], state, "1")
+    w.controller.preview(w.paths, SETTINGS)
+    with pytest.raises(ValueError, match="unresolved job state"):
+        w.controller.submit(w.controller.review_id, True)
+    assert "submit" not in actions(w)
+
+
 def test_run_again_archives_receipt_and_prepares_without_submitting(workflow):
     w = workflow
     w.controller.preview(w.paths, SETTINGS)
