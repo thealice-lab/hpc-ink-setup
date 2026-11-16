@@ -89,7 +89,7 @@ def workflow(tmp_path, monkeypatch):
                     raise ValueError("Unsupported operation")
                 return {
                     "bundle": bundle,
-                    "version": "0.4.2",
+                    "version": endpoint.get("version", "0.4.2"),
                     "capabilities": endpoint["capabilities"],
                 }
             if action == "cancel":
@@ -157,11 +157,18 @@ def record_for(workflow, path):
     return workflow.records[receipt["bundle"]]
 
 
-@pytest.mark.parametrize("probe", ["current", "old", "missing", "invalid"])
+@pytest.mark.parametrize(
+    "probe", ["current", "older-release", "no-cancel", "old", "missing", "invalid"]
+)
 def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
     c = workflow.controller
     before = {path: path.read_bytes() for path in workflow.paths}
-    if probe == "old":
+    if probe == "older-release":
+        # A compatible HPC copy from an earlier release is not a warning.
+        workflow.endpoint["version"] = "0.4.0"
+    elif probe == "no-cancel":
+        workflow.endpoint["capabilities"] = ["prepare", "submit", "status", "fetch"]
+    elif probe == "old":
         workflow.endpoint["capabilities"] = None
     elif probe == "missing":
         workflow.endpoint["capabilities"] = ["status"]
@@ -183,13 +190,19 @@ def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
     assert not list(workflow.paths[0].parent.glob("*.inkly.json"))
     assert before == {path: path.read_bytes() for path in workflow.paths}
     notice = [data for kind, data in workflow.events if kind == "notice"][-1]
-    assert (
-        "cannot report its version"
-        if probe == "old"
-        else "Missing required"
-        if probe == "missing"
-        else "Required handoff"
-    ) in notice
+    expected = {
+        "current": "supports what this Desktop",
+        "older-release": "Inkly (0.4.0) supports what this Desktop",
+        "no-cancel": "Not available until the HPC copy of Inkly is updated: Cancel job.",
+        "old": "cannot report its version",
+        "missing": "lacks operations this Desktop",
+    }[probe]
+    assert expected in notice
+    assert "differ" not in notice and "compatib" not in notice
+    if probe == "missing":
+        assert "prepare, submit, fetch" in notice
+    if probe in {"current", "older-release"}:
+        assert "Not available" not in notice
 
 
 def test_connection_does_not_consume_an_existing_preview(workflow):

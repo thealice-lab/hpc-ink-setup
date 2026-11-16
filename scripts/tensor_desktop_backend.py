@@ -165,6 +165,11 @@ class DesktopController:
             return {"job_id": int(job_id)}
         return {}
 
+    # Operations Test connection checks for. Optional ones only switch off a
+    # feature; Desktop still asks the endpoint before using each of them.
+    REQUIRED_OPERATIONS = ("prepare", "submit", "status", "fetch")
+    OPTIONAL_OPERATIONS = {"cancel": "Cancel job"}
+
     def test_connection(self, settings):
         """Check only the configured SSH endpoint handshake; no bundle or Slurm work."""
         settings = picker.validate_settings(dict(settings))
@@ -192,21 +197,32 @@ class DesktopController:
             raise ValueError("The HPC endpoint returned an invalid version handshake.")
         from inkly import __version__
 
-        required = {"prepare", "submit", "status", "fetch"}
-        missing = sorted(
-            required - {value for value in capabilities if isinstance(value, str)}
-        )
-        message = f"Connected to Inkly {version}. This Desktop is {__version__}."
+        # What matters is whether the HPC copy offers each operation this
+        # Desktop uses; release numbers may differ between compatible copies.
+        offered = {value for value in capabilities if isinstance(value, str)}
+        missing = [op for op in self.REQUIRED_OPERATIONS if op not in offered]
         if missing:
-            message += (
-                " Missing required operations: "
-                + ", ".join(missing)
-                + ". Ask the maintainer for a matching endpoint."
+            message = (
+                f"Connected, but the HPC copy of Inkly ({version}) lacks operations "
+                f"this Desktop ({__version__}) needs: {', '.join(missing)}. Ask the "
+                "maintainer to update the HPC copy of Inkly before submitting jobs."
             )
-        elif version != __version__:
-            message += " Core handoff operations are available, but versions differ; confirm compatibility with the maintainer."
         else:
-            message += " Required handoff operations are available."
+            message = (
+                f"Connected. The HPC copy of Inkly ({version}) supports what this "
+                f"Desktop ({__version__}) needs to preview, submit and return jobs."
+            )
+            absent = [
+                name
+                for op, name in self.OPTIONAL_OPERATIONS.items()
+                if op not in offered
+            ]
+            if absent:
+                message += (
+                    " Not available until the HPC copy of Inkly is updated: "
+                    + ", ".join(absent)
+                    + "."
+                )
         message += " No input was prepared and no Slurm command was run."
         self.emit("notice", message)
 
