@@ -75,7 +75,8 @@ def test_lists_only_recorded_jobs_for_this_account_newest_first(tmp_path, monkey
     }
     # Newest first: by Slurm submit time, else by when the handoff began.
     assert [row["bundle"][0] for row in response["jobs"]] == ["d", "c", "b", "a"]
-    assert "500" not in str(response) and "777" not in str(response)
+    # Other jobs on the account (500 in accounting, 777 in the queue) never appear.
+    assert {row["job_id"] for row in response["jobs"]} == {"42", "99", ""}
     sacct, squeue = calls
     uid = str(os.stat(tmp_path).st_uid)
     assert sacct[:3] == ["sacct", "--uid", uid] and sacct[-2:] == ["--jobs", "42,99"]
