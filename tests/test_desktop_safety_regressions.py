@@ -71,7 +71,7 @@ def test_ssh_startup_failure_unwinds_auth_and_cannot_submit_or_log_secrets(
     assert actions(w) == ["prepare", "prepare"]
     w.controller.execute("close")
     directory = Path(w.controller.journal.worker.config_loader().state.log_dir)
-    values = records(directory)
+    values = records(directory, worker=w.controller.journal.worker)
     assert any(value["event_type"] == "desktop_error" for value in values)
     assert "PRIVATE_AUTH_AND_RESEARCH_SENTINEL" not in json.dumps(values)
 
@@ -167,6 +167,6 @@ def test_broken_diagnostic_write_is_consumed_once_and_never_retries_request(tmp_
         assert "PRIVATE_SECRET" not in json.dumps(attempts)
     finally:
         journal.close()
-    values = records(tmp_path / "local")
+    values = records(tmp_path / "local", worker=journal.worker)
     assert any(value["event_type"] == "desktop_preview" for value in values)
     assert "PRIVATE_SECRET" not in json.dumps(values)

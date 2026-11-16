@@ -14,7 +14,13 @@ from inkly.core import desktop_diagnostics as desktop
 from inkly.core.diagnostics import DiagnosticSession, EventSink
 
 
-def records(directory):
+def records(directory, *, worker=None):
+    if worker is not None:
+        # Production close is deliberately bounded. Disk assertions need an
+        # explicit completion boundary, not an assumption about CI disk speed.
+        assert worker.stopped.is_set(), "Close the diagnostic worker before reading it"
+        worker.thread.join(timeout=10)
+        assert not worker.thread.is_alive(), "Diagnostic writer did not finish"
     return [
         json.loads(line)
         for path in Path(directory).glob("inkly-*.jsonl")
@@ -50,7 +56,7 @@ def test_local_journal_uses_existing_schema_and_excludes_sensitive_fields(tmp_pa
     )
     journal.emit("desktop_error", {"code": "PRIVATE_SENTINEL", "action": "preview"})
     journal.close()
-    values = records(tmp_path)
+    values = records(tmp_path, worker=journal.worker)
     assert {v["event_type"] for v in values} >= {
         "desktop_session_start",
         "desktop_preview",
@@ -168,7 +174,7 @@ def test_remote_revalidates_metadata_and_deduplicates_sequence(tmp_path):
     remote.accept([{"event_type": [], "payload": {}}])
     remote.close()
     journal.close()
-    values = records(tmp_path / "remote")
+    values = records(tmp_path / "remote", worker=remote.worker)
     assert sum(v["event_type"] == "desktop_session_start" for v in values) == 1
     assert "PRIVATE_SENTINEL" not in json.dumps(values)
 
@@ -190,13 +196,14 @@ def test_broken_config_recovers_for_later_events_without_replaying(tmp_path):
     remote.accept(journal.take())
     remote.close()
     journal.close()
-    values = records(tmp_path / "remote")
+    values = records(tmp_path / "remote", worker=remote.worker)
     assert [
         v["payload"]["count"] for v in values if v["event_type"] == "desktop_preview"
     ] == [3]
     assert not any(v["event_type"] == "desktop_session_start" for v in values)
     assert any(
-        v["event_type"] == "desktop_session_start" for v in records(tmp_path / "local")
+        v["event_type"] == "desktop_session_start"
+        for v in records(tmp_path / "local", worker=journal.worker)
     )
 
 
@@ -219,7 +226,10 @@ def test_local_failure_never_blocks_transport_and_later_writes_recover(
     failing[0] = False
     journal.emit("desktop_preview", {"count": 4})
     journal.close()
-    assert any(v["event_type"] == "desktop_preview" for v in records(tmp_path))
+    assert any(
+        v["event_type"] == "desktop_preview"
+        for v in records(tmp_path, worker=journal.worker)
+    )
 
 
 def test_stalled_sink_has_bounded_queue_and_does_not_block_producer(
@@ -243,6 +253,41 @@ def test_stalled_sink_has_bounded_queue_and_does_not_block_producer(
     release.set()
     worker.thread.join(2)
     assert not worker.thread.is_alive()
+
+
+def test_disk_assertions_wait_for_writer_after_bounded_close(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    append = EventSink.append
+
+    def delayed_append(sink, line):
+        if b'"event_type":"desktop_error"' in line:
+            entered.set()
+            assert release.wait(10), "Test did not release the delayed diagnostic write"
+        return append(sink, line)
+
+    monkeypatch.setattr(EventSink, "append", delayed_append)
+    journal = desktop.DesktopJournal(tmp_path)
+    try:
+        journal.emit(
+            "desktop_error",
+            {"action": "preview", "code": "unexpected", "secret": "PRIVATE_SENTINEL"},
+        )
+        assert entered.wait(5), "Diagnostic worker never reached the controlled write"
+        # The UI must not wait indefinitely for a stalled disk. Stopping the
+        # worker does not promise that its queued writes have finished.
+        journal.worker.close(timeout=0)
+        assert journal.worker.thread.is_alive()
+        assert not any(
+            value["event_type"] == "desktop_error" for value in records(tmp_path)
+        )
+        release.set()
+        values = records(tmp_path, worker=journal.worker)
+        assert any(value["event_type"] == "desktop_error" for value in values)
+        assert "PRIVATE_SENTINEL" not in json.dumps(values)
+    finally:
+        release.set()
+        journal.close()
+        journal.worker.thread.join(10)
 
 
 def test_rotation_preserves_other_sessions_active_files_and_limits_completed(tmp_path):
@@ -278,5 +323,5 @@ def test_unavailable_shared_storage_keeps_private_fallback(tmp_path):
     assert not shared.directory.exists()
     assert any(
         v["event_type"] == "desktop_session_start"
-        for v in records(tmp_path / "private")
+        for v in records(tmp_path / "private", worker=remote.worker)
     )
