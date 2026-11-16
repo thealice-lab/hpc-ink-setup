@@ -172,7 +172,10 @@ preview, confirmed submission and result monitoring in an application window.
 Open `InklyDesktop.exe` or double-click `Inkly Desktop.pyw` when running from source.
 Its job summary follows each file's latest status after submission. While it
 watches, you can add, preview and submit more inputs on the same connection,
-and Stop watching keeps the connection so watching can resume. Select
+and Stop watching keeps the connection so watching can resume. **Load my jobs**
+fills the list with pending, running and recently finished jobs without
+choosing files, and **Job history** lists older jobs with state, date and name
+filters; see [Load my jobs and Job history](docs/DESKTOP.md#load-my-jobs-and-job-history). Select
 rows to **Cancel job** (pending jobs only, also while Desktop is watching) or **Run again** (cancelled, failed or
 edited files, prepared as new jobs and never submitted without confirmation);
 see [Cancel a pending job or run a file again](docs/DESKTOP.md#cancel-a-pending-job-or-run-a-file-again).

@@ -72,25 +72,6 @@ update the helper's version, source commit and EXE SHA-256 (from the release's
 `tests/test_windows_desktop_download.py`. Do not commit ZIP/EXE binaries or
 treat this helper as an HPC deployment tool.
 
-### My jobs without input files
-
-Choose **My jobs** to list owned Inkly handoff receipts on the configured HPC
-without adding local input files or locating sidecar receipts. Recorded job IDs
-are checked against the current queue and seven days of accounting.
-The separate table shows job IDs, names, states, elapsed time, exit codes and
-available start/reason fields. It includes prepared and uncertain handoffs; jobs submitted outside Inkly are
-not included. **Refresh** updates it; the observation time is shown in UTC. The view
-is limited to 200 recent receipts. A recorded job absent from accounting stays
-UNKNOWN; this does not prove it was never submitted or has stopped.
-Missing scheduler access is reported as an incomplete listing.
-
-My jobs is read-only: it cannot submit, cancel, adopt or delete a job. Result
-return and other handoff operations still use the saved input-side receipts.
-Job names appear only in this view, not Activity or diagnostic events. While
-watching, the view uses the open connection if it matches the configured HPC;
-otherwise it explains that the connection differs. Older endpoints show an
-upgrade notice. This requires the HPC endpoint's `jobs` capability.
-
 ## First calculation
 
 Use **Test connection** beside Connection settings before adding inputs. It
@@ -199,8 +180,50 @@ new sign-in. If the watch does not end within 20 seconds, or you click Stop
 watching again, the app disconnects instead. Neither cancels Slurm jobs.
 Closing the app disconnects as well.
 
+### Load my jobs and Job history
+
+**Load my jobs**, in the top bar beside Job history, fills the list from the
+HPC instead of choosing files. It adds your pending and running Inkly jobs and jobs that
+ended in the last 3 days, then checks them with a normal preview, so each row
+shows the job's current state. Nothing is submitted. Choose **Check & return
+results** to watch them and download finished results.
+
+Desktop keeps a small list of which input file each job belongs to, in
+`%LOCALAPPDATA%\Inkly\desktop-jobs.json`, updated whenever it previews a file.
+Jobs whose file it finds on this computer are added from where they are.
+For other jobs, submitted from another computer or before Desktop kept this
+list, it asks once for a folder:
+- Each such job gets its own subfolder there, named after the input and the
+  start of its bundle ID, with an exact copy of the input taken from the HPC and
+  its receipt.
+- Its result is returned to `returned\` in that subfolder.
+- Desktop never overwrites a file.
+
+A file that Run again gave a newer job is not loaded twice; the older job stays
+in Job history.
+
+**Job history**, in the top bar, lists every recorded Inkly job for the
+configured connection, newest first, with its submission and end times shown
+in this computer's time:
+- **Show** filters by state. Finished and cancelled is the default; Completed;
+  Failed, timed out or out of memory; Cancelled; Pending or running; Needs
+  checking; Not submitted; All.
+- **Submitted** limits the period: the last 7, 30 or 90 days, or all time.
+- **File or job ID** matches part of a file name or a whole job ID.
+
+Select jobs and choose **Add selected to list** to work with them, for example
+to return an older result. **Change folder…** changes where copies are kept.
+
+The list comes from the handoff receipts on the HPC, and Slurm is asked only
+about the job IDs they record, so jobs submitted outside Inkly never appear. A
+job with no accounting record shows UNKNOWN; that does not prove it never ran.
+Both buttons work while watching, on the open connection, and need an updated
+HPC copy of Inkly. With an older copy, Desktop says so and Add files works as
+before.
+
 Keep the `*.inkly.json` receipts beside the original inputs. Reopen the app,
-add the same files and choose **Preview files** to read their saved handoffs.
+choose **Load my jobs**, or add the same files and choose **Preview files**, to
+read their saved handoffs.
 **Check & return results** watches existing jobs and downloads successful
 results; it signs in again if the connection has closed, and it never submits
 a prepared job.
