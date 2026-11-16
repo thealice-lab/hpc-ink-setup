@@ -120,6 +120,23 @@ structures and analysis stay under the researcher's control.
 
 ## Returning later
 
+### My jobs without input files
+
+Choose **My jobs** to read the configured HPC account's current queue and last
+seven days of Slurm accounting without adding input files or locating receipts.
+The separate table shows job IDs, names, states, elapsed time, exit codes and
+available start/reason fields. It includes this user's jobs submitted outside
+Inkly. **Refresh** updates it; the observation time is shown in UTC. The view
+is limited to 200 entries, keeping queued jobs ahead of accounting history.
+Missing scheduler access is reported as an incomplete listing.
+
+My jobs is read-only: it cannot submit, cancel, adopt or delete a job. Result
+return and other handoff operations still use the saved input-side receipts.
+Job names appear only in this view, not Activity or diagnostic events. While
+watching, the view uses the open connection if it matches the configured HPC;
+otherwise it explains that the connection differs. Older endpoints show an
+upgrade notice. This requires the HPC endpoint's `jobs` capability.
+
 **Stop watching** ends the watch after the check in progress and keeps the
 connection open, so **Check & return results** starts watching again without a
 new sign-in. If the watch does not end within 20 seconds, or you click Stop
