@@ -87,7 +87,9 @@ class DesktopApp:
         # Load my jobs runs in steps (find, copy, preview); the next step starts
         # once the current action is done, or at once while watching.
         self.after_done = None
-        self.load_found = False
+        # Load my jobs, between its steps: the connection and whether any
+        # job was added to the list (then it ends with one preview).
+        self.load_context = {"settings": None, "added": False}
         self.jobs_index = jobs.Index()
         self.history_window = None
         self.history_listing = None
@@ -386,6 +388,7 @@ class DesktopApp:
                 "rerun": "Preparing the selected files again (nothing is submitted)…",
                 "load_jobs": "Finding your recent jobs on the HPC…",
                 "restore_jobs": "Copying jobs that are not on this computer…",
+                "search_jobs": "Looking for your input files in the chosen folder…",
                 "history": "Reading your job history…",
             }[action]
         )
@@ -404,6 +407,8 @@ class DesktopApp:
                 self.jobs_found(data)
             elif kind == "jobs_restored":
                 self.jobs_restored(data)
+            elif kind == "jobs_searched":
+                self.jobs_searched(data)
             elif kind == "history":
                 self.show_history(data)
             elif kind == "row":
@@ -839,6 +844,11 @@ class DesktopApp:
         except (OSError, ValueError) as error:
             messagebox.showerror("Cannot add inputs", str(error), parent=self.root)
             return
+        try:
+            # Load my jobs looks for a job's files in folders used before.
+            self.jobs_index.remember_folders({path.parent for path in new})
+        except OSError:
+            pass
         for path in new:
             if path not in self.files:
                 self.files.append(path)
@@ -1079,25 +1089,17 @@ class DesktopApp:
                 + ", ".join(data["unavailable"])
                 + "); job states may show as UNKNOWN until the next check."
             )
-        if data["restore"]:
-            folder = self.copies_folder(len(data["restore"]))
-            if folder:
-                # Preview once, after the copies are made.
-                self.load_found = bool(paths)
-                arguments = (data["restore"], str(folder), data["settings"])
-                self.then(lambda: self.run_or_request("restore_jobs", *arguments))
-                return
-            self.log(
-                f"{len(data['restore'])} job(s) not on this computer were skipped; "
-                "no folder was chosen for their copies."
-            )
+        self.load_context = {"settings": data["settings"], "added": bool(paths)}
         if paths:
             self.log(
                 f"Loaded {len(paths)} job(s) from the HPC ({len(added)} new in the "
                 "list). Checking their current state; nothing is submitted."
             )
-            self.then(self.preview_files)
-        elif not data["restore"]:
+        if data["restore"]:
+            self.resolve_missing(data["restore"], searched=False, complete=True)
+        elif paths:
+            self.finish_load()
+        else:
             messagebox.showinfo(
                 "Inkly Desktop",
                 "No pending, running or recently finished jobs were found for this "
@@ -1107,33 +1109,117 @@ class DesktopApp:
                 parent=self.root,
             )
 
+    def jobs_searched(self, data):
+        paths = [Path(path) for path in data["paths"]]
+        if paths:
+            self.add_paths(paths)
+            self.load_context["added"] = True
+            self.log(
+                f"Found {len(paths)} input(s) under {data['root']}. Desktop will "
+                "look in those folders automatically next time."
+            )
+        if data["missing"]:
+            self.resolve_missing(
+                data["missing"], searched=True, complete=data["complete"]
+            )
+        else:
+            self.finish_load()
+
+    def resolve_missing(self, missing, searched, complete):
+        """Find their files, keep copies, or skip jobs not found here."""
+        while True:
+            choice = self.ask_missing(missing, searched, complete)
+            if choice == "find":
+                root = filedialog.askdirectory(
+                    parent=self.root,
+                    title="Choose a folder that contains these inputs",
+                    mustexist=True,
+                )
+                if not root:
+                    continue  # Back to the choice.
+                self.then(lambda: self.run_or_request("search_jobs", missing, root))
+                return
+            if choice == "copy":
+                folder = self.copies_folder(len(missing))
+                if not folder:
+                    continue
+                arguments = (missing, str(folder), self.load_context["settings"])
+                self.then(lambda: self.run_or_request("restore_jobs", *arguments))
+                return
+            break
+        self.log(f"{len(missing)} job(s) not found on this computer were skipped.")
+        self.finish_load()
+
+    def ask_missing(self, missing, searched, complete):
+        """Find files…, Make copies or Skip; returns "find", "copy" or "skip"."""
+        names = sorted({job["name"] for job in missing})
+        listed = ", ".join(names[:6])
+        if len(names) > 6:
+            listed += f" and {len(names) - 6} more"
+        if searched:
+            intro = f"{len(missing)} job(s) were still not found"
+            intro += "." if complete else " (the search stopped at its limit)."
+        else:
+            intro = (
+                f"{len(missing)} job(s) were not found in folders Inkly Desktop "
+                "has used."
+            )
+        text = (
+            f"{intro}\n\n{listed}\n\nIf their input files are on this computer, "
+            "choose Find files… and pick a folder that contains them; its "
+            "subfolders are searched too. Otherwise Desktop can keep a copy of each "
+            "input, and its returned result, in a folder for copies."
+        )
+        dialog = self.missing_dialog = tk.Toplevel(self.root)
+        dialog.title("Jobs not found on this computer")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        choice = {"value": "skip"}
+
+        def pick(value):
+            choice["value"] = value
+            dialog.destroy()
+
+        ttk.Label(
+            dialog, text=text, wraplength=480, justify="left", padding=(16, 16, 16, 8)
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        self.missing_buttons = {}
+        for column, (label, value) in enumerate(
+            (("Find files…", "find"), ("Make copies", "copy"), ("Skip", "skip"))
+        ):
+            button = ttk.Button(dialog, text=label, command=lambda v=value: pick(v))
+            button.grid(row=1, column=column, padx=8, pady=(0, 16))
+            self.missing_buttons[value] = button
+        dialog.protocol("WM_DELETE_WINDOW", lambda: pick("skip"))
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass  # Not viewable yet (main window hidden); still answerable.
+        self.missing_buttons["find"].focus_set()
+        self.root.wait_window(dialog)
+        return choice["value"]
+
+    def finish_load(self):
+        if self.load_context.get("added"):
+            self.then(self.preview_files)
+
     def jobs_restored(self, data):
-        found, self.load_found = self.load_found, False
         if data["paths"]:
             self.add_paths([Path(path) for path in data["paths"]])
-        if data["paths"] or found:
-            self.then(self.preview_files)
+            self.load_context["added"] = True
+        self.finish_load()
 
     def copies_folder(self, count):
         """The remembered folder for copies, or ask for one the first time."""
         folder = self.jobs_index.folder()
         if folder and folder.is_dir():
             return folder
-        messagebox.showinfo(
-            "Jobs not on this computer",
-            f"{count} job(s) were submitted from another computer, or before Inkly "
-            "Desktop kept a list of your files.\n\nChoose a folder where Desktop "
-            "will keep a copy of each input, in its own subfolder, together with its "
-            "returned results. Desktop remembers this folder; you can change it in "
-            "Job history.",
-            parent=self.root,
-        )
         return self.choose_copies_folder()
 
     def choose_copies_folder(self):
         chosen = filedialog.askdirectory(
             parent=self.root,
-            title="Choose a folder for jobs from the HPC",
+            title="Choose a folder for copies of jobs from the HPC",
             mustexist=False,
         )
         if not chosen:

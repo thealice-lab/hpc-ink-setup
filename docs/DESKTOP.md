@@ -188,16 +188,30 @@ ended in the last 3 days, then checks them with a normal preview, so each row
 shows the job's current state. Nothing is submitted. Choose **Check & return
 results** to watch them and download finished results.
 
-Desktop keeps a small list of which input file each job belongs to, in
-`%LOCALAPPDATA%\Inkly\desktop-jobs.json`, updated whenever it previews a file.
-Jobs whose file it finds on this computer are added from where they are.
-For other jobs, submitted from another computer or before Desktop kept this
-list, it asks once for a folder:
-- Each such job gets its own subfolder there, named after the input and the
-  start of its bundle ID, with an exact copy of the input taken from the HPC and
-  its receipt.
-- Its result is returned to `returned\` in that subfolder.
-- Desktop never overwrites a file.
+Desktop keeps a small list of which input file each job belongs to, and of
+the folders you add files from, in `%LOCALAPPDATA%\Inkly\desktop-jobs.json`.
+It is updated whenever you add or preview a file. Load my jobs finds a job's
+file in three ways, in this order:
+1. **Its list of files.** Files it has previewed are added from where they are.
+2. **Folders used before.** For other jobs, it looks beside your inputs in
+   folders you have added files from, for the `*.inkly.json` receipt that
+   records that job, and adds the input next to it.
+3. **Your choice.** For jobs still not found, for example ones submitted before
+   Desktop kept its list, it asks:
+   - **Find files…** searches a folder you pick and its subfolders (up to 8
+     levels; hidden, system and tool folders are skipped, and links are not
+     followed). Folders where inputs are found are remembered, so the next
+     Load my jobs finds them without asking.
+   - **Make copies** is for jobs whose files are not on this computer, such as
+     ones submitted from another computer. Desktop asks once for a folder for
+     copies. Each job gets its own subfolder there, named after the input and
+     the start of its bundle ID, with an exact copy of the input taken from the
+     HPC and its receipt. Its result is returned to `returned\` in that
+     subfolder.
+   - **Skip** leaves those jobs out this time.
+
+Desktop never overwrites a file, and the search reads only receipts named
+after the inputs it is looking for.
 
 A file that Run again gave a newer job is not loaded twice; the older job stays
 in Job history.

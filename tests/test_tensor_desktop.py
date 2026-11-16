@@ -387,6 +387,11 @@ def test_a_run_again_replacement_is_not_loaded_again(workflow):
     w.endpoint["capabilities"] += ["jobs", "input"]
     c.preview(w.paths[:1], SETTINGS)
     old = recorded(w, w.paths[0])
+    # As after Run again: the file's receipt now records a newer bundle.
+    receipt = w.paths[0].with_suffix(".gjf.inkly.json")
+    receipt.write_text(
+        json.dumps({**json.loads(receipt.read_text()), "bundle": "f" * 32})
+    )
     c.index.replaced(old)
     w.endpoint["jobs"] = [hpc_job(old, "CANCELLED by 1000", ended_days=1)]
     c.load_jobs(SETTINGS)
@@ -476,6 +481,58 @@ def test_bad_copies_are_reported_and_never_written(workflow, tmp_path, problem):
         assert not target.with_suffix(".gjf.inkly.json").exists()
     else:
         assert not list(folder.rglob("*.inkly.json"))
+
+
+def test_load_finds_unknown_jobs_beside_receipts_in_folders_used_before(
+    workflow, tmp_path
+):
+    w, c = workflow, workflow.controller
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    # Submitted before Desktop kept its list of files: only the receipt
+    # beside the input records the job.
+    old = tmp_path / "project" / "old.gjf"
+    old.parent.mkdir()
+    old.write_text("input")
+    old.with_suffix(".gjf.inkly.json").write_text(json.dumps({"bundle": "c" * 32}))
+    w.endpoint["jobs"] = [hpc_job("c" * 32, "PENDING", "old.gjf")]
+    c.load_jobs(SETTINGS)
+    assert found_event(w)["paths"] == [] and len(found_event(w)["restore"]) == 1
+    # Once a file from that folder has been added, the job is found there.
+    c.index.remember_folders([old.parent])
+    c.load_jobs(SETTINGS)
+    assert found_event(w)["paths"] == [str(old)] and found_event(w)["restore"] == []
+    assert c.index.locate("c" * 32) == ("found", old.resolve())
+
+
+def test_search_jobs_finds_inputs_in_a_chosen_folder_without_the_hpc(
+    workflow, tmp_path
+):
+    w, c = workflow, workflow.controller
+    root = tmp_path / "research"
+    old = root / "2026" / "batch" / "old.gjf"
+    old.parent.mkdir(parents=True)
+    old.write_text("input")
+    old.with_suffix(".gjf.inkly.json").write_text(json.dumps({"bundle": "c" * 32}))
+    missing = [
+        hpc_job("c" * 32, "PENDING", "old.gjf"),
+        hpc_job("d" * 32, "PENDING", "gone.gjf"),
+    ]
+    c.request("search_jobs", missing, str(root))
+    c.connect(SETTINGS)
+    before = len(w.connections)
+    c.handle_requests()  # Inside a watch, no connection is needed or checked.
+    searched = [data for kind, data in w.events if kind == "jobs_searched"][-1]
+    assert searched["paths"] == [str(old)] and searched["complete"]
+    assert [job["name"] for job in searched["missing"]] == ["gone.gjf"]
+    assert len(w.connections) == before and "jobs" not in actions(w)
+    # Next time the folder is checked automatically.
+    assert old.parent.resolve() in c.index.folders()
+    c.execute("close")
+    events = c.journal.take()
+    assert {"action": "search", "count": 1}.items() <= [
+        e["payload"] for e in events if e["event_type"] == "desktop_jobs"
+    ][-1].items()
+    assert "old.gjf" not in json.dumps(events) and "research" not in json.dumps(events)
 
 
 def test_job_history_lists_every_recorded_job(workflow):
@@ -2115,6 +2172,16 @@ def test_native_contact_never_obstructs_controls_at_common_scaling(
         app.close()
 
 
+def no_message_boxes(monkeypatch, gui):
+    """A message box nobody can click would hang the test: fail instead."""
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError(f"Unexpected message box: {args}")
+
+    for name in ("showinfo", "showerror", "showwarning", "askyesno", "askokcancel"):
+        monkeypatch.setattr(gui.messagebox, name, unexpected, raising=False)
+
+
 def pump(app, seconds=10):
     """Drain window events until Desktop is idle with nothing left to start."""
     import time as clock
@@ -2182,6 +2249,8 @@ def test_native_load_my_jobs_fills_the_list_without_adding_files(
     monkeypatch.setattr(
         gui.messagebox, "showinfo", lambda *args, **k: shown.append(args)
     )
+    prompts = []
+    monkeypatch.setattr(app, "ask_missing", lambda *a: prompts.append(a) or "copy")
     try:
         app.settings = dict(SETTINGS)
         # Earlier, this computer prepared sample_1; its job is now pending.
@@ -2199,15 +2268,16 @@ def test_native_load_my_jobs_fills_the_list_without_adding_files(
             "PENDING",
             "CONFIGURING",
         }
-        # The folder was asked for once, with an explanation, and is remembered.
-        assert len(asked) == 1 and shown[0][0] == "Jobs not on this computer"
+        # One prompt for the job not found here; the copies folder is remembered.
+        assert [(len(a[0]), a[1]) for a in prompts] == [(1, False)]
+        assert len(asked) == 1 and not shown
         assert app.jobs_index.folder() == copies.resolve()
         assert "prepare" not in actions(w)[1:] and "submit" not in actions(w)
 
         # Loading again finds both here: no question, no duplicate rows.
         app.load_button.invoke()
         pump(app)
-        assert len(asked) == 1 and len(app.files) == 2
+        assert len(asked) == 1 and len(prompts) == 1 and len(app.files) == 2
         assert len(w.connections) == 1
 
         # While watching, the request goes to the watch; otherwise it waits.
@@ -2249,6 +2319,7 @@ def test_native_job_history_filters_and_adds_selected_jobs(
     )
     w.controller.emit = lambda kind, data: app.events.put((kind, data))
     monkeypatch.setattr(gui.messagebox, "showinfo", lambda *a, **k: None)
+    monkeypatch.setattr(app, "ask_missing", lambda *a: "copy")
     app.jobs_index.set_folder(tmp_path / "copies")
     (tmp_path / "copies").mkdir()
     try:
@@ -2289,8 +2360,104 @@ def test_native_job_history_filters_and_adds_selected_jobs(
         assert app.files == [copy]
         assert status_of(app, copy).startswith("CANCELLED")
     finally:
+        app.busy, app.action = False, None
         app.close()
 
 
 def status_of(app, path):
     return app.rows[str(path)]["state"]
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" and not os.environ.get("DISPLAY"),
+    reason="Native Tk display required",
+)
+def test_native_find_files_adds_the_originals_instead_of_copies(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    w.controller.emit = lambda kind, data: app.events.put((kind, data))
+    # A job submitted before Desktop kept its list of files, in a project tree.
+    job = elsewhere_job(w, "c" * 32, "old.gjf")
+    original = tmp_path / "research" / "2026" / "old.gjf"
+    original.parent.mkdir(parents=True)
+    original.write_bytes(base64.b64decode(w.endpoint["inputs"]["c" * 32]["data"]))
+    original.with_suffix(".gjf.inkly.json").write_text(
+        json.dumps(
+            {
+                "host": SETTINGS["host"],
+                "ink_path": SETTINGS["ink_path"],
+                "bundle": "c" * 32,
+                "auth": SETTINGS["auth"],
+                "output": str(original.parent / "returned"),
+            }
+        )
+    )
+    w.endpoint["jobs"] = [job]
+    choices = ["find"]
+    prompts = []
+    monkeypatch.setattr(
+        app, "ask_missing", lambda *a: prompts.append(a) or choices.pop(0)
+    )
+    monkeypatch.setattr(
+        gui.filedialog, "askdirectory", lambda **k: str(tmp_path / "research")
+    )
+    no_message_boxes(monkeypatch, gui)
+    try:
+        app.settings = dict(SETTINGS)
+        app.load_button.invoke()
+        pump(app)
+        assert len(app.files) == 1 and app.files[0].resolve() == original.resolve()
+        assert app.rows[str(app.files[0])]["state"] == "CONFIGURING"
+        assert not list(tmp_path.glob("**/old-cccccccc"))  # No copy was made.
+        assert len(prompts) == 1
+        # Found automatically next time: no prompt and no duplicate row.
+        app.load_button.invoke()
+        pump(app)
+        assert len(app.files) == 1 and len(prompts) == 1
+    finally:
+        app.busy, app.action = False, None  # Never ask before closing a test.
+        app.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Real Tk dialog")
+@pytest.mark.parametrize("button", ["find", "copy", "skip"])
+def test_native_missing_jobs_prompt_returns_the_choice(
+    workflow, tmp_path, monkeypatch, button
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    no_message_boxes(monkeypatch, gui)
+    # If the button press never happens, close the prompt so a failure
+    # cannot leave the test waiting.
+    root.after(5000, lambda: app.missing_dialog.destroy())
+    try:
+        root.after(200, lambda: app.missing_buttons[button].invoke())
+        choice = app.ask_missing(
+            [{"name": f"job{i}.gjf", "bundle": "a" * 32} for i in range(8)],
+            searched=True,
+            complete=False,
+        )
+        assert choice == button
+    finally:
+        app.busy, app.action = False, None
+        app.close()
