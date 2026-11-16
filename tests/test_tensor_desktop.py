@@ -2705,9 +2705,9 @@ def test_native_partial_search_prompt_includes_the_result_and_repeat_count(
 
     guard = root.after(
         5000,
-        lambda: app.missing_dialog.destroy()
-        if app.missing_dialog.winfo_exists()
-        else None,
+        lambda: (
+            app.missing_dialog.destroy() if app.missing_dialog.winfo_exists() else None
+        ),
     )
     root.after(100, inspect)
     try:
