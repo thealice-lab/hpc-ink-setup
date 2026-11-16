@@ -87,7 +87,11 @@ def workflow(tmp_path, monkeypatch):
             if action == "version":
                 if endpoint["capabilities"] is None:
                     raise ValueError("Unsupported operation")
-                return {"bundle": bundle, "capabilities": endpoint["capabilities"]}
+                return {
+                    "bundle": bundle,
+                    "version": endpoint.get("version", "0.4.2"),
+                    "capabilities": endpoint["capabilities"],
+                }
             if action == "cancel":
                 assert request.get("confirm") is True
                 if records[bundle]["state"] != "PENDING":
@@ -251,6 +255,88 @@ def actions(workflow):
 def record_for(workflow, path):
     receipt = json.loads(path.with_suffix(".gjf.inkly.json").read_text())
     return workflow.records[receipt["bundle"]]
+
+
+@pytest.mark.parametrize(
+    "probe", ["current", "older-release", "no-cancel", "old", "missing", "invalid"]
+)
+def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
+    c = workflow.controller
+    before = {path: path.read_bytes() for path in workflow.paths}
+    if probe == "older-release":
+        # A compatible HPC copy from an earlier release is not a warning.
+        workflow.endpoint["version"] = "0.4.0"
+    elif probe == "no-cancel":
+        workflow.endpoint["capabilities"] = ["prepare", "submit", "status", "fetch"]
+    elif probe == "old":
+        workflow.endpoint["capabilities"] = None
+    elif probe == "missing":
+        workflow.endpoint["capabilities"] = ["status"]
+    elif probe == "invalid":
+        c.connect(SETTINGS)
+        c.session.exchange = lambda *a, **k: {
+            "version": "PRIVATE_BAD_HANDSHAKE\n",
+            "capabilities": [],
+        }
+        with pytest.raises(ValueError, match="invalid version handshake"):
+            c.test_connection(SETTINGS)
+        assert "PRIVATE_BAD_HANDSHAKE" not in str(workflow.events)
+        return
+    c.test_connection(SETTINGS)
+    c.test_connection(SETTINGS)
+    assert len(workflow.connections) == 1
+    assert actions(workflow) == ["version", "version"]
+    assert not c.items and c.review_id is None
+    assert not list(workflow.paths[0].parent.glob("*.inkly.json"))
+    assert before == {path: path.read_bytes() for path in workflow.paths}
+    notice = [data for kind, data in workflow.events if kind == "notice"][-1]
+    expected = {
+        "current": "supports what this Desktop",
+        "older-release": "Inkly (0.4.0) supports what this Desktop",
+        "no-cancel": "Not available until the HPC copy of Inkly is updated: Cancel job.",
+        "old": "cannot report its version",
+        "missing": "lacks operations this Desktop",
+    }[probe]
+    assert expected in notice
+    assert "differ" not in notice and "compatib" not in notice
+    if probe == "missing":
+        assert "prepare, submit, fetch" in notice
+    if probe in {"current", "older-release"}:
+        assert "Not available" not in notice
+
+
+def test_connection_does_not_consume_an_existing_preview(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    review = c.review_id
+    c.test_connection(SETTINGS)
+    assert c.review_id == review
+    assert len(workflow.connections) == 1
+    assert actions(workflow)[-1] == "version"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows Tk")
+def test_native_connection_button_needs_no_added_files(workflow, tmp_path):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    root = tk.Tk()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda *a, **k: workflow.controller,
+        settings_path=tmp_path / "settings.json",
+    )
+    try:
+        app.settings = dict(SETTINGS)
+        assert not app.files
+        app.buttons()
+        assert str(app.test_connection_button["state"]) == "normal"
+        app.test_connection()
+        assert app.action == "test_connection"
+        assert str(app.test_connection_button["state"]) == "disabled"
+    finally:
+        app.busy = False
+        app.close()
 
 
 def recorded_job(workflow, path, state, job_id="123"):
@@ -1296,7 +1382,7 @@ def test_native_cancel_and_run_again_follow_selected_rows(
         )
         app.events.put(("notice", "job 2406955 already completed"))
         app.drain()
-        assert shown == [("Cancel job", "job 2406955 already completed")]
+        assert shown == [("Inkly Desktop", "job 2406955 already completed")]
     finally:
         app.close()
 

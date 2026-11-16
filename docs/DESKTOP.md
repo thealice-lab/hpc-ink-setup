@@ -74,6 +74,17 @@ treat this helper as an HPC deployment tool.
 
 ## First calculation
 
+Use **Test connection** beside Connection settings before adding inputs. It
+signs in through the configured SSH connection and asks the Inkly endpoint for
+its version and supported handoff operations. A successful check keeps the
+connection open for Preview. It does not prepare a bundle or run a Slurm
+command. The result says whether the HPC copy of Inkly offers every operation
+this Desktop needs and names optional features, such as Cancel job, that stay
+unavailable until that copy is updated. An HPC copy from an earlier release is
+fine when it offers those operations. This checks access to the endpoint, not
+Gaussian runtime availability, scheduler capacity or whether a calculation will
+succeed.
+
 1. **Connection settings:** enter your own username/host, the HPC Inkly launcher
    provided by your maintainer, authentication method and maximum hours per new
    job. Settings stay in `%LOCALAPPDATA%\Inkly\tensor-picker.json`. Existing
