@@ -144,6 +144,11 @@ class DesktopController:
                 "name": response["name"],
                 "state": state or response.get("state", response["submission"]),
                 "job_id": response.get("job_id", ""),
+                "reason": response.get("reason"),
+                "start_time": response.get("start_time"),
+                "elapsed": response.get("elapsed"),
+                "exit_code": response.get("exit_code"),
+                "observed_at": response.get("observed_at"),
                 "resources": deepcopy(response["resources"]),
                 "stages": response["stages"],
                 "script": response.get("script", ""),
@@ -341,7 +346,7 @@ class DesktopController:
             self.monitor()
 
     # Operations the window may ask for while monitoring.
-    WATCH_REQUESTS = ("cancel_jobs", "preview", "submit", "rerun")
+    WATCH_REQUESTS = ("cancel_jobs", "preview", "submit", "rerun", "job_details")
 
     def request(self, action, *args):
         """Called from the window thread while monitoring: run this operation next.
@@ -383,7 +388,7 @@ class DesktopController:
                 )
                 continue
             try:
-                if action == "cancel_jobs":
+                if action in {"cancel_jobs", "job_details"}:
                     targets = [self.target_for(args[0], args[1], "resume")]
                 elif action == "rerun":
                     targets = [
@@ -412,7 +417,7 @@ class DesktopController:
             except ValueError as error:
                 self.emit("request_error", str(error))
                 continue
-            changed = changed or action != "cancel_jobs"
+            changed = changed or action not in {"cancel_jobs", "job_details"}
 
     def monitor(self):
         if not self.items or not self.items[0].get("receipt"):
@@ -483,6 +488,26 @@ class DesktopController:
             "Stopped watching. Submitted jobs continue on the HPC and the connection "
             "stays open; choose Check & return results to watch again.",
         )
+
+    def job_details(self, selected, settings):
+        """On-demand excerpts stay out of receipts, Activity and diagnostic events."""
+        paths = set(map(str, selected))
+        items = [item for item in self.items if str(item["path"]) in paths]
+        if len(items) != 1 or len(paths) != 1:
+            raise ValueError("Select one previewed row to inspect its job details.")
+        item = items[0]
+        self.connect(item["receipt"])
+        if self.endpoint_supports("job_details", item["receipt"]):
+            details = self.session.exchange(
+                {"action": "job_details"}, receipt=item["receipt"]
+            )
+        else:
+            details = {
+                **item["response"],
+                "logs": [],
+                "unavailable": "This HPC endpoint does not support job details. Ask the maintainer for a matching endpoint.",
+            }
+        self.emit("job_details", details)
 
     def endpoint_supports(self, operation, receipt):
         """Ask the HPC copy of Inkly; older copies answer "Unsupported operation"."""
@@ -698,6 +723,8 @@ class DesktopController:
                 self.unhandled_requests()
             elif action == "cancel_jobs":
                 self.cancel_jobs(*args)
+            elif action == "job_details":
+                self.job_details(*args)
             elif action == "rerun":
                 self.rerun(*args)
             elif action == "close":

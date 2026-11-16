@@ -303,6 +303,10 @@ class DesktopApp:
             activity_bar, text="Open results folder", command=self.open_results
         )
         self.results_button.pack(side="right")
+        self.details_button = ttk.Button(
+            activity_bar, text="Job details", command=self.job_details
+        )
+        self.details_button.pack(side="right", padx=8)
         self.activity = tk.Text(
             content,
             height=6,
@@ -349,6 +353,7 @@ class DesktopApp:
                 "preview": "Preparing preview…",
                 "submit": "Submitting approved jobs and watching results…",
                 "monitor": "Checking recorded jobs…",
+                "job_details": "Reading job details…",
                 "cancel_jobs": "Cancelling the selected pending jobs…",
                 "rerun": "Preparing the selected files again (nothing is submitted)…",
             }[action]
@@ -362,6 +367,8 @@ class DesktopApp:
             kind, data = self.events.get_nowait()
             if kind == "message":
                 self.log(data)
+            elif kind == "job_details":
+                self.show_job_details(data)
             elif kind == "row":
                 self.rows[data["path"]] = data
                 if self.table.exists(data["path"]):
@@ -563,6 +570,7 @@ class DesktopApp:
             "stop": self.stop_button,
             "script": self.script_button,
             "results": self.results_button,
+            "details": self.details_button,
             "status": self.status,
         }
         clipped = sorted(name for name, widget in controls.items() if not fits(widget))
@@ -619,6 +627,13 @@ class DesktopApp:
         )
         self.script_button.configure(
             state="normal" if self.table.selection() and self.rows else "disabled"
+        )
+        self.details_button.configure(
+            state="normal"
+            if len(self.table.selection()) == 1
+            and self.table.selection()[0] in self.rows
+            and ready
+            else "disabled"
         )
         self.results_button.configure(
             state="normal"
@@ -966,6 +981,29 @@ class DesktopApp:
             text="Stopping the connection. Submitted HPC jobs continue."
         )
         self.buttons()
+
+    def job_details(self):
+        chosen = list(self.table.selection())
+        if len(chosen) != 1 or chosen[0] not in self.rows:
+            return
+        if self.watching():
+            self.controller.request("job_details", chosen, dict(self.settings))
+        elif not self.busy:
+            self.start("job_details", chosen, dict(self.settings))
+
+    def show_job_details(self, details):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Job details — " + details["name"])
+        dialog.geometry("900x600")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        text = tk.Text(dialog, wrap="word", font=("Consolas", 10))
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(dialog, orient="vertical", command=text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scroll.set)
+        text.insert("1.0", status.job_details_text(details))
+        text.configure(state="disabled")
 
     def show_script(self):
         selected = self.table.selection()

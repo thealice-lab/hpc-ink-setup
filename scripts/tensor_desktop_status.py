@@ -133,3 +133,51 @@ def overview_text(review, rows, unconfirmed=(), submitting=False):
 
     summary = f"Current status of {len(rows)} file(s): {state_counts(rows)}."
     return summary + ("\n" + " ".join(notes) if notes else "")
+
+
+def job_details_text(details):
+    """User-requested output; never pass this text to the diagnostic journal."""
+    state = state_name(details.get("state", details.get("submission")))
+    lines = [
+        f"{details['name']} | Job {details.get('job_id') or 'not submitted'} | {state}"
+    ]
+    lines += [
+        f"Exit code: {details.get('exit_code') or 'Unavailable'}",
+        f"Elapsed run time: {details.get('elapsed') or 'Unavailable'}",
+        f"Observed (UTC): {details.get('observed_at') or 'Unavailable'}",
+    ]
+    if state == "PENDING":
+        lines += [
+            f"Pending reason: {details.get('reason') or 'Unavailable'}",
+            f"Estimated start (HPC local time): {details.get('start_time') or 'Unavailable'}",
+            "Slurm estimates can change. Elapsed run time does not include time waiting in the queue.",
+        ]
+    elif details.get("start_time"):
+        lines.append(f"Started (HPC local time): {details['start_time']}")
+    if details.get("unavailable"):
+        lines.append(details["unavailable"])
+    if state in {"FAILED", "TIMEOUT", "OUT_OF_MEMORY"}:
+        lines += [
+            "",
+            "Gaussian error line: "
+            + (details.get("gaussian_error") or "Not found in the available excerpt."),
+        ]
+        for log in details.get("logs", ()):
+            lines += [
+                "",
+                log["name"] + (" (excerpt truncated)" if log.get("truncated") else ""),
+            ]
+            lines.append(
+                log.get("text")
+                or (
+                    "Log is empty."
+                    if log.get("available")
+                    else "Log unavailable (missing, unreadable or unsafe file)."
+                )
+            )
+        lines += [
+            "",
+            "Excerpts may contain research data. They are shown here only, not saved to Activity or diagnostics.",
+            "A Gaussian error line may not explain a scheduler timeout or memory kill. No job was retried.",
+        ]
+    return "\n".join(lines)

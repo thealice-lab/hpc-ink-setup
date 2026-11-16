@@ -1651,3 +1651,102 @@ def test_native_contact_never_obstructs_controls_at_common_scaling(
             assert shown["table_height"] > 30, evidence
     finally:
         app.close()
+
+
+def test_job_details_stay_out_of_journal_activity_and_receipts(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    path = workflow.paths[0]
+    sidecar = path.with_suffix(".gjf.inkly.json")
+    before = sidecar.read_bytes()
+    workflow.endpoint["capabilities"].append("job_details")
+    original_exchange = c.session.exchange
+
+    def exchange(request, **kwargs):
+        if request["action"] == "job_details":
+            return {
+                "name": path.name,
+                "state": "FAILED",
+                "logs": [{"text": "PRIVATE_RESEARCH_EXCERPT"}],
+            }
+        return original_exchange(request, **kwargs)
+
+    c.session.exchange = exchange
+    audited = []
+    c.audit = lambda *args: audited.append(args)
+    c.job_details([str(path)], SETTINGS)
+    assert sidecar.read_bytes() == before
+    assert len(workflow.connections) == 1
+    assert workflow.events[-1][0] == "job_details"
+    assert "PRIVATE_RESEARCH_EXCERPT" in str(workflow.events[-1])
+    assert "PRIVATE_RESEARCH_EXCERPT" not in str(audited)
+    assert "PRIVATE_RESEARCH_EXCERPT" not in str(messages(workflow))
+    assert "submit" not in actions(workflow) and "cancel" not in actions(workflow)
+
+
+def test_job_details_old_endpoint_preserves_connection_and_preview(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    review = c.review_id
+    c.job_details([str(workflow.paths[0])], SETTINGS)
+    assert "does not support" in workflow.events[-1][1]["unavailable"]
+    assert c.review_id == review
+    assert len(workflow.connections) == 1
+
+
+def test_job_details_request_uses_watch_session_without_restarting_it(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    c.request("job_details", [str(workflow.paths[0])], SETTINGS)
+    assert c.handle_requests() is False
+    assert workflow.events[-1][0] == "job_details"
+    assert len(workflow.connections) == 1
+
+
+def test_job_details_wording_marks_missing_estimates_and_private_excerpts():
+    import tensor_desktop_status as wording
+
+    pending = wording.job_details_text(
+        {"name": "sample.gjf", "state": "PENDING", "reason": "Priority"}
+    )
+    assert "Estimated start (HPC local time): Unavailable" in pending
+    assert "Elapsed run time: Unavailable" in pending
+    assert "Pending reason: Priority" in pending
+    assert "estimates can change" in pending
+    failed = wording.job_details_text(
+        {
+            "name": "sample.gjf",
+            "state": "TIMEOUT",
+            "logs": [{"name": "sample.log", "available": False}],
+        }
+    )
+    assert "Log unavailable" in failed and "not saved to Activity" in failed
+
+
+def test_native_job_details_button_routes_read_only_watch_request(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    root = tk.Tk()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda *a, **k: workflow.controller,
+        settings_path=tmp_path / "settings.json",
+    )
+    try:
+        path = str(workflow.paths[0])
+        app.add_paths([path])
+        app.rows[path] = {"name": "sample.gjf", "state": "PENDING"}
+        app.table.selection_set(path)
+        app.busy = True
+        app.action = "monitor"
+        app.buttons()
+        assert str(app.details_button["state"]) == "normal"
+        app.job_details()
+        action, args = workflow.controller.requests.get_nowait()
+        assert action == "job_details" and args[0] == [path]
+    finally:
+        app.busy = False
+        app.close()
