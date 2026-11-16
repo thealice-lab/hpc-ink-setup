@@ -36,6 +36,7 @@ CAPABILITIES = (
     "version",
     "job_details",
     "jobs",
+    "input",
 )
 # Slurm accounting can lag scancel by a moment; re-read briefly, never retry it.
 CANCEL_STATUS_READS = 5
@@ -351,6 +352,20 @@ def handle(request, root=None):
             return receipt
         if action == "cancel":
             return _cancel(directory, receipt, request)
+        if action == "input":
+            # The researcher's own prepared input, unchanged, so Desktop on
+            # another computer can keep a copy beside the returned result.
+            data = _read(directory / receipt["name"], MAX_INPUT)
+            if hashlib.sha256(data).hexdigest() != receipt["sha256"]:
+                raise ValueError(
+                    "The prepared input changed on the HPC; it was not copied"
+                )
+            return {
+                "bundle": bundle,
+                "name": receipt["name"],
+                "sha256": receipt["sha256"],
+                "data": base64.b64encode(data).decode("ascii"),
+            }
         status = _state(directory, receipt)
         response = {**receipt, **status}
         if action == "status":

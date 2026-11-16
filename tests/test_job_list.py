@@ -1,5 +1,7 @@
 """Recorded Inkly handoffs and their Slurm states, without local input files."""
 
+import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -226,4 +228,37 @@ def test_jobs_operation_never_creates_storage_or_uses_a_payload_user(
     assert not root.exists()
     assert response["bundle"] == "a" * 32 and response["jobs"] == []
     capabilities = tensor.handle({"action": "version", "bundle": "a" * 32}, root)
-    assert "jobs" in capabilities["capabilities"]
+    assert {"jobs", "input"} <= set(capabilities["capabilities"])
+
+
+def test_input_copy_is_exact_and_refuses_a_changed_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKLY_CLUSTER_PROFILE_NAME", "cuttlefish")
+    root = tmp_path / "handoffs"
+    data = b"%nprocshared=2\n%mem=1GB\n# hf/sto-3g\n\nWater\n\n0 1\nH 0 0 0\n\n"
+    prepared = tensor.handle(
+        {
+            "action": "prepare",
+            "bundle": "a" * 32,
+            "name": "water.gjf",
+            "data": base64.b64encode(data).decode(),
+            "cpus": 2,
+            "memory_mib": 1024,
+            "hours": 1,
+        },
+        root,
+    )
+    before = snapshot(root)
+    copy = tensor.handle({"action": "input", "bundle": "a" * 32}, root)
+    assert copy["name"] == "water.gjf"
+    assert base64.b64decode(copy["data"]) == data
+    assert copy["sha256"] == hashlib.sha256(data).hexdigest() == prepared["sha256"]
+    after = snapshot(root)
+    # Reading the copy changes nothing but the bundle's own lock file.
+    assert {p: v for p, v in after.items() if "lock" not in p.name} == {
+        p: v for p, v in before.items() if "lock" not in p.name
+    }
+    (root / ("a" * 32) / "water.gjf").write_bytes(data + b"edited\n")
+    with pytest.raises(ValueError, match="changed on the HPC"):
+        tensor.handle({"action": "input", "bundle": "a" * 32}, root)
+    with pytest.raises(ValueError, match="Unknown bundle"):
+        tensor.handle({"action": "input", "bundle": "b" * 32}, root)
