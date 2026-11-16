@@ -346,7 +346,7 @@ class DesktopController:
             self.monitor()
 
     # Operations the window may ask for while monitoring.
-    WATCH_REQUESTS = ("cancel_jobs", "preview", "submit", "rerun", "job_details")
+    WATCH_REQUESTS = ("cancel_jobs", "preview", "submit", "rerun")
 
     def request(self, action, *args):
         """Called from the window thread while monitoring: run this operation next.
@@ -354,7 +354,7 @@ class DesktopController:
         The monitor loop runs it between checks on its open SSH session, so no
         new sign-in is needed, then keeps watching every submitted job.
         """
-        if action not in self.WATCH_REQUESTS:
+        if action not in self.WATCH_REQUESTS and action != "job_details":
             raise ValueError("That operation cannot run while watching.")
         self.requests.put((action, args))
         self.wake.set()
@@ -417,7 +417,7 @@ class DesktopController:
             except ValueError as error:
                 self.emit("request_error", str(error))
                 continue
-            changed = changed or action not in {"cancel_jobs", "job_details"}
+            changed = changed or action in {"preview", "submit", "rerun"}
 
     def monitor(self):
         if not self.items or not self.items[0].get("receipt"):
