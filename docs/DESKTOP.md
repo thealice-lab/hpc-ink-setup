@@ -184,7 +184,7 @@ Closing the app disconnects as well.
 
 **Load my jobs**, in the top bar beside Job history, fills the list from the
 HPC instead of choosing files. It adds your pending and running Inkly jobs and jobs that
-ended in the last 3 days, then checks them with a normal preview, so each row
+ended in the last 3 days, except cancelled jobs, then checks them with a normal preview, so each row
 shows the job's current state. Nothing is submitted. Choose **Check & return
 results** to watch them and download finished results.
 
@@ -192,7 +192,10 @@ Desktop keeps a small list of which input file each job belongs to, and of
 the folders you add files from, in `%LOCALAPPDATA%\Inkly\desktop-jobs.json`.
 It is updated whenever you add or preview a file. Load my jobs finds a job's
 file in three ways, in this order:
-1. **Its list of files.** Files it has previewed are added from where they are.
+1. **Its list of files.** Files it has previewed are located where they are.
+   Matching originals take preference over generated copies. For legacy copy
+   mappings that have never been checked for originals, Desktop offers a
+   one-time Find files / Use copies choice.
 2. **Folders used before.** For other jobs, it looks beside your inputs in
    folders you have added files from, for the `*.inkly.json` receipt that
    records that job, and adds the input next to it.
@@ -201,20 +204,32 @@ file in three ways, in this order:
    - **Find files…** searches a folder you pick and its subfolders (up to 8
      levels; hidden, system and tool folders are skipped, and links are not
      followed). Folders where inputs are found are remembered, so the next
-     Load my jobs finds them without asking.
-   - **Make copies** is for jobs whose files are not on this computer, such as
+     Load my jobs finds them without asking. The result names the searched
+     folder and gives found/missing counts, any switches from copies to
+     originals, and older handoffs left in History. If jobs remain missing,
+     the prompt groups repeated names by state, shows their count and
+     submission dates, and explains when a search limit was reached.
+   - **Use copies / Use or make copies** reuses existing copies, or is for jobs whose files are not on this computer, such as
      ones submitted from another computer. Desktop asks once for a folder for
      copies. Each job gets its own subfolder there, named after the input and
      the start of its bundle ID, with an exact copy of the input taken from the
      HPC and its receipt. Its result is returned to `returned\` in that
-     subfolder.
+     subfolder. Choosing copies, or searching once without finding an
+     original, is remembered so later loads do not ask again. Copies remain
+     on disk when a job is pointed at its original.
    - **Skip** leaves those jobs out this time.
 
-Desktop never overwrites a file, and the search reads only receipts named
-after the inputs it is looking for.
+Desktop never overwrites an input or receipt. Search reads only matching
+sidecars and, when checking whether an ended job was replaced, a bounded set
+of archived sidecars. It does not follow links. Generated copy subfolders
+are remembered as one copies root instead of crowding out project folders.
 
 A file that Run again gave a newer job is not loaded twice; the older job stays
-in Job history.
+in Job history. Discovery can also recognize a newer handoff using the known
+job dates and the original's archived receipt or an existing path mapping.
+A filename match alone never hides a job, and active or uncertain jobs are
+not hidden by this rule. Cancelled jobs remain explicitly selectable in
+Job history; they are simply excluded from default Load my jobs.
 
 **Job history**, in the top bar, lists every recorded Inkly job for the
 configured connection, newest first, with its submission and end times shown
@@ -226,7 +241,17 @@ in this computer's time:
 - **File or job ID** matches part of a file name or a whole job ID.
 
 Select jobs and choose **Add selected to list** to work with them, for example
-to return an older result. **Change folder…** changes where copies are kept.
+to return an older result. An explicit history selection may load an older
+job into its own copy, preserving its receipt and result location.
+
+The **Local file** column distinguishes originals, copies and missing or
+replaced mappings. **Find files…** is always available here: select jobs to
+locate, or leave the selection empty to search the currently shown jobs.
+Choose a project folder to re-point mappings even when Load my jobs already
+finds every job. A matching original replaces its visible copy row rather
+than adding the same bundle twice. Jobs not already in the main list are not
+added by this search. **Copies folder…** changes only where future copies
+are kept; it is separate from finding originals.
 
 The list comes from the handoff receipts on the HPC, and Slurm is asked only
 about the job IDs they record, so jobs submitted outside Inkly never appear. A
