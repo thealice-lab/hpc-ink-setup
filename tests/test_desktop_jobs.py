@@ -147,3 +147,116 @@ def test_local_time_shows_utc_times_on_this_computer():
     )
     assert shown == expected
     assert jobs.local_time(None) == "" and jobs.local_time("Unknown") == ""
+
+
+def handoff(folder, name, bundle):
+    """An input with its Desktop receipt, as Desktop leaves them."""
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    path.write_text("input")
+    jobs.receipt_for(path).write_text(json.dumps({"bundle": bundle}))
+    return path
+
+
+def recorded(name, bundle):
+    return {"name": name, "bundle": bundle}
+
+
+def test_remembered_folders_include_inputs_and_added_folders(tmp_path, monkeypatch):
+    # A list written by 0.5.0 has no saved folders: its inputs' folders count.
+    water = handoff(tmp_path / "a", "water.gjf", "a" * 32)
+    jobs.state_path().parent.mkdir(parents=True)
+    jobs.state_path().write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "folder": None,
+                "handoffs": {"a" * 32: {"input": str(water), "seen": "2026-11-15"}},
+            }
+        )
+    )
+    index = jobs.Index()
+    assert index.folders() == [tmp_path / "a"]
+    monkeypatch.setattr(jobs, "MAX_FOLDERS", 3)
+    index.remember_folders([tmp_path / "b", tmp_path / "c"])
+    index.remember_folders([tmp_path / "d"])
+    saved = json.loads(jobs.state_path().read_text())
+    assert len(saved["folders"]) == 3  # Bounded, newest kept.
+    assert index.folders()[0] == (tmp_path / "d").resolve()
+    assert len(index.folders()) == 3
+
+
+def test_jobs_are_found_beside_their_receipts_in_remembered_folders(tmp_path):
+    index = jobs.Index()
+    water = handoff(tmp_path / "project", "water.gjf", "a" * 32)
+    handoff(tmp_path / "project", "ethanol.gjf", "c" * 32)  # A newer job
+    (tmp_path / "project" / "lost.gjf.inkly.json").write_text(
+        json.dumps({"bundle": "d" * 32})
+    )  # Receipt without its input
+    found, missing = jobs.find_in_folders(
+        [
+            recorded("water.gjf", "a" * 32),
+            recorded("ethanol.gjf", "b" * 32),
+            recorded("lost.gjf", "d" * 32),
+            recorded("../water.gjf", "a" * 32),
+        ],
+        [tmp_path / "elsewhere", tmp_path / "project"],
+        index,
+    )
+    assert found == [water]
+    assert [job["name"] for job in missing] == [
+        "ethanol.gjf",
+        "lost.gjf",
+        "../water.gjf",
+    ]
+    assert index.locate("a" * 32) == ("found", water.resolve())
+
+
+def test_search_looks_through_subfolders_within_its_bounds(tmp_path, monkeypatch):
+    index = jobs.Index()
+    root = tmp_path / "research"
+    deep = handoff(root / "2026" / "november" / "batch", "water.gjf", "a" * 32)
+    handoff(root / ".hidden", "ethanol.gjf", "b" * 32)
+    handoff(root / "node_modules", "methanol.gjf", "c" * 32)
+    wanted = [
+        recorded("water.gjf", "a" * 32),
+        recorded("ethanol.gjf", "b" * 32),
+        recorded("methanol.gjf", "c" * 32),
+    ]
+    found, missing, complete = jobs.search(root, wanted, index)
+    assert found == [deep] and complete
+    assert [job["name"] for job in missing] == ["ethanol.gjf", "methanol.gjf"]
+    # Next time the folder is checked without searching.
+    assert deep.parent.resolve() in index.folders()
+    monkeypatch.setattr(jobs, "SEARCH_DEPTH", 2)
+    found, missing, complete = jobs.search(root, wanted[:1], jobs.Index())
+    assert found == [] and not complete  # Stopped at the depth limit.
+    monkeypatch.setattr(jobs, "SEARCH_DEPTH", 8)
+    monkeypatch.setattr(jobs, "SEARCH_ENTRIES", 2)
+    found, missing, complete = jobs.search(root, wanted[:1], jobs.Index())
+    assert found == [] and not complete  # Stopped at the entry limit.
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Symlinks need privileges")
+def test_search_never_follows_links_or_reads_other_files(tmp_path):
+    outside = handoff(tmp_path / "outside", "water.gjf", "a" * 32)
+    root = tmp_path / "research"
+    root.mkdir()
+    (root / "link").symlink_to(outside.parent, target_is_directory=True)
+    (root / "water.gjf.inkly.json").symlink_to(jobs.receipt_for(outside))
+    found, missing, complete = jobs.search(
+        root, [recorded("water.gjf", "a" * 32)], jobs.Index()
+    )
+    assert found == [] and len(missing) == 1
+
+
+def test_search_can_be_stopped(tmp_path):
+    handoff(tmp_path / "research" / "a", "water.gjf", "a" * 32)
+
+    def stop():
+        raise InterruptedError("stopped")
+
+    with pytest.raises(InterruptedError):
+        jobs.search(
+            tmp_path / "research", [recorded("water.gjf", "a" * 32)], jobs.Index(), stop
+        )
