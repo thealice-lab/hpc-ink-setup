@@ -3,6 +3,7 @@
 from contextlib import ExitStack
 from copy import deepcopy
 import hashlib
+from pathlib import Path
 import queue
 import shutil
 import threading
@@ -432,6 +433,7 @@ class DesktopController:
         "load_jobs",
         "restore_jobs",
         "history",
+        "search_jobs",
     )
 
     def request(self, action, *args):
@@ -653,6 +655,12 @@ class DesktopController:
                 replaced += 1  # Run again gave the file a newer job.
             else:
                 restore.append(job)
+        if restore:
+            # Not in the list of files: look beside inputs in folders used before.
+            extra, restore = jobs.find_in_folders(
+                restore, self.index.folders(), self.index
+            )
+            found += [str(path) for path in extra]
         self.audit("desktop_jobs", {"action": "load", "count": len(chosen)})
         self.emit(
             "jobs_found",
@@ -697,6 +705,26 @@ class DesktopController:
             self.emit("message", f"Copied {job['name']} from the HPC to {path.parent}")
         self.audit("desktop_jobs", {"action": "restore", "count": len(paths)})
         self.emit("jobs_restored", {"paths": paths})
+
+    def search_jobs(self, missing, root):
+        """Look through a folder the researcher chose for jobs not found yet.
+
+        Needs no HPC connection. Folders where inputs are found are remembered,
+        so the next Load my jobs finds them without asking.
+        """
+        found, missing, complete = jobs.search(
+            Path(root), missing, self.index, check=self.check_stop
+        )
+        self.audit("desktop_jobs", {"action": "search", "count": len(found)})
+        self.emit(
+            "jobs_searched",
+            {
+                "paths": [str(path) for path in found],
+                "missing": missing,
+                "complete": complete,
+                "root": str(root),
+            },
+        )
 
     def history(self, settings):
         """Every recorded handoff for the Job history window."""
@@ -932,7 +960,7 @@ class DesktopController:
                 self.job_details(*args)
             elif action == "rerun":
                 self.rerun(*args)
-            elif action in {"load_jobs", "restore_jobs", "history"}:
+            elif action in {"load_jobs", "restore_jobs", "history", "search_jobs"}:
                 getattr(self, action)(*args)
             elif action == "close":
                 # Record SSH closure while the journal can still accept events;
