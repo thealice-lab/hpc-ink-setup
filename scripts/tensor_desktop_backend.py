@@ -165,6 +165,51 @@ class DesktopController:
             return {"job_id": int(job_id)}
         return {}
 
+    def test_connection(self, settings):
+        """Check only the configured SSH endpoint handshake; no bundle or Slurm work."""
+        settings = picker.validate_settings(dict(settings))
+        self.connect(settings)
+        receipt = {**settings, "bundle": uuid.uuid4().hex}
+        try:
+            response = self.session.exchange({"action": "version"}, receipt=receipt)
+        except ValueError as error:
+            if str(error) != "Unsupported operation":
+                raise
+            self.emit(
+                "notice",
+                "SSH connected, but this HPC endpoint cannot report its version. Ask the maintainer for a matching Desktop endpoint.",
+            )
+            return
+        version = response.get("version")
+        capabilities = response.get("capabilities")
+        if (
+            not isinstance(version, str)
+            or not version
+            or len(version) > 80
+            or not all(c.isalnum() or c in ".+-" for c in version)
+            or not isinstance(capabilities, list)
+        ):
+            raise ValueError("The HPC endpoint returned an invalid version handshake.")
+        from inkly import __version__
+
+        required = {"prepare", "submit", "status", "fetch"}
+        missing = sorted(
+            required - {value for value in capabilities if isinstance(value, str)}
+        )
+        message = f"Connected to Inkly {version}. This Desktop is {__version__}."
+        if missing:
+            message += (
+                " Missing required operations: "
+                + ", ".join(missing)
+                + ". Ask the maintainer for a matching endpoint."
+            )
+        elif version != __version__:
+            message += " Core handoff operations are available, but versions differ; confirm compatibility with the maintainer."
+        else:
+            message += " Required handoff operations are available."
+        message += " No input was prepared and no Slurm command was run."
+        self.emit("notice", message)
+
     def preview(self, paths, settings, recover_bundles=None):
         self.check_stop()
         self.review_id = None
@@ -688,7 +733,9 @@ class DesktopController:
 
     def execute(self, action, *args):
         try:
-            if action == "preview":
+            if action == "test_connection":
+                self.test_connection(*args)
+            elif action == "preview":
                 self.preview(*args)
             elif action == "submit":
                 self.submit(*args)
