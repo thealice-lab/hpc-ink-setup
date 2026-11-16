@@ -166,6 +166,10 @@ class DesktopApp:
             tools, text="Connection settings", command=self.configure
         )
         self.settings_button.grid(row=0, column=1, rowspan=2)
+        self.test_connection_button = ttk.Button(
+            tools, text="Test connection", command=self.test_connection
+        )
+        self.test_connection_button.grid(row=0, column=2, rowspan=2, padx=(8, 0))
         ttk.Label(
             tools,
             text="1  Choose inputs     →     2  Preview resources     →     3  Submit and return results",
@@ -326,6 +330,10 @@ class DesktopApp:
         self.progress.pack(side="right")
         self.buttons()
 
+    def test_connection(self):
+        if not self.busy and self.settings_ready():
+            self.start("test_connection", dict(self.settings))
+
     def connection_text(self):
         return f"HPC: {self.settings['host'] or 'Set up your connection'}   •   New jobs: up to {self.settings['hours']} hour(s) each"
 
@@ -346,6 +354,7 @@ class DesktopApp:
         self.controller.paused.clear()
         self.status.configure(
             text={
+                "test_connection": "Testing the configured connection...",
                 "preview": "Preparing preview…",
                 "submit": "Submitting approved jobs and watching results…",
                 "monitor": "Checking recorded jobs…",
@@ -551,6 +560,7 @@ class DesktopApp:
 
         controls = {
             "settings": self.settings_button,
+            "test_connection": self.test_connection_button,
             "add": self.add_button,
             "folder": self.folder_button,
             "remove": self.remove_button,
@@ -596,7 +606,12 @@ class DesktopApp:
         ready = not self.busy or self.watching()
         for widget in (self.add_button, self.folder_button):
             widget.configure(state="normal" if ready else "disabled")
-        for widget in (self.remove_button, self.clear_button, self.settings_button):
+        for widget in (
+            self.remove_button,
+            self.clear_button,
+            self.settings_button,
+            self.test_connection_button,
+        ):
             widget.configure(state="disabled" if self.busy else "normal")
         self.preview_button.configure(
             state="normal" if self.files and ready else "disabled"
