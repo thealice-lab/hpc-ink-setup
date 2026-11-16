@@ -1,155 +1,211 @@
-"""Current-account scheduler listing without bundles or local input files."""
+"""Recorded Inkly handoffs and their Slurm states, without local input files."""
 
+import json
 import os
 import subprocess
+import time
 
 import pytest
 
 from inkly.gaussian import job_list, tensor
 
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="Owned HPC receipts")
+DAY = 24 * 3600
 
-def test_listing_scopes_both_commands_to_authenticated_uid_and_merges_queue(
+
+def handoff(root, bundle, job=None, submission="SUBMITTED", name="sample.gjf", age=0):
+    directory = root / bundle
+    directory.mkdir(parents=True, mode=0o700)
+    os.chmod(root, 0o700)
+    (directory / name).write_bytes(b"%mem=1GB\n# hf/sto-3g\n\nx\n\n0 1\nH 0 0 0\n\n")
+    record = {"bundle": bundle, "name": name, "submission": submission}
+    if job:
+        record["job_id"] = job
+    (directory / "receipt.json").write_text(json.dumps(record))
+    moment = time.time() - age
+    os.utime(directory / name, (moment, moment))
+    return directory
+
+
+def scheduler_for(accounting="", queue="", calls=None):
+    def scheduler(args, directory):
+        if calls is not None:
+            calls.append(args)
+        text = accounting if args[0] == "sacct" else queue
+        return subprocess.CompletedProcess(args, 0, text, "")
+
+    return scheduler
+
+
+def snapshot(root):
+    return {
+        path: (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_lists_only_recorded_jobs_for_this_account_newest_first(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_list.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    root = tmp_path / "handoffs"
+    handoff(root, "a" * 32, "42", age=3 * DAY)
+    handoff(root, "b" * 32, None, "SUBMISSION_UNKNOWN", age=2 * DAY)
+    handoff(root, "c" * 32, "99", age=1 * DAY)
+    handoff(root, "d" * 32, None, "PREPARED", age=10)
+    before = snapshot(root)
+    calls = []
+    response = job_list.list_jobs(
+        scheduler_for(
+            "42|COMPLETED|0:0|2026-11-12T10:00:00|2026-11-12T10:05:00|00:05:00\n"
+            "500|COMPLETED|0:0|2026-11-12T10:00:00|2026-11-12T10:05:00|00:01:00\n",
+            "777|RUNNING|None|2026-11-15T09:00:00|1:00\n",
+            calls,
+        ),
+        tmp_path,
+        root,
+    )
+    states = {row["bundle"][0]: row["state"] for row in response["jobs"]}
+    assert states == {
+        "a": "COMPLETED",
+        "b": "SUBMISSION_UNKNOWN",
+        "c": "UNKNOWN",  # Accounting has no record; not proof it never ran.
+        "d": "PREPARED",
+    }
+    # Newest first: by Slurm submit time, else by when the handoff began.
+    assert [row["bundle"][0] for row in response["jobs"]] == ["d", "c", "b", "a"]
+    assert "500" not in str(response) and "777" not in str(response)
+    sacct, squeue = calls
+    uid = str(os.stat(tmp_path).st_uid)
+    assert sacct[:3] == ["sacct", "--uid", uid] and sacct[-2:] == ["--jobs", "42,99"]
+    assert squeue[:4] == ["squeue", "--noheader", "--user", uid]
+    assert "--jobs" not in squeue  # One finished ID would make squeue fail.
+    assert not response["unavailable"] and not response["truncated"]
+    assert before == snapshot(root)
+
+
+def test_old_jobs_keep_their_state_beyond_a_week(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_list.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    root = tmp_path / "handoffs"
+    handoff(root, "a" * 32, "42", age=40 * DAY)
+    calls = []
+    response = job_list.list_jobs(
+        scheduler_for("42|CANCELLED by 1|0:0|Unknown|Unknown|00:00:00\n", "", calls),
+        tmp_path,
+        root,
+    )
+    assert response["jobs"][0]["state"] == "CANCELLED by 1"
+    since = calls[0][calls[0].index("--starttime") + 1]
+    oldest = time.strftime("%Y-%m-%d", time.localtime(time.time() - 41 * DAY))
+    assert since <= oldest  # From before the oldest recorded handoff.
+
+
+def test_queue_is_current_for_live_jobs_but_never_overrides_a_final_state(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(job_list.os, "getuid", lambda: 1234, raising=False)
-    calls = []
+    monkeypatch.setattr(job_list.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    root = tmp_path / "handoffs"
+    handoff(root, "a" * 32, "41")
+    handoff(root, "b" * 32, "42")
+    handoff(root, "c" * 32, "43")
+    response = job_list.list_jobs(
+        scheduler_for(
+            "41|PENDING|0:0|2026-11-15T10:00:00|Unknown|00:00:00\n"
+            "42|COMPLETED|0:0|2026-11-15T10:00:00|2026-11-15T10:09:00|00:09:00\n",
+            "41|PENDING|Priority|2026-11-16T08:00:00|0:00\n"
+            "42|RUNNING|None|2026-11-15T10:01:00|8:00\n"
+            "43|RUNNING|None|2026-11-15T10:01:00|3:00\n",
+        ),
+        tmp_path,
+        root,
+    )
+    rows = {row["job_id"]: row for row in response["jobs"]}
+    assert rows["41"]["state"] == "PENDING" and rows["41"]["reason"] == "Priority"
+    assert rows["41"]["start_at"]  # Slurm's estimate, as UTC
+    assert rows["42"]["state"] == "COMPLETED" and rows["42"]["ended_at"]
+    assert rows["43"]["state"] == "RUNNING"  # Not in accounting yet
 
-    def scheduler(args, directory):
-        calls.append(args)
-        if args[0] == "sacct":
-            return subprocess.CompletedProcess(
-                args,
-                0,
-                "42|sample|PENDING|00:00|0:0\n43|finished|COMPLETED|00:02|0:0\n42.batch|step|RUNNING|00:01|0:0\n",
-                "",
-            )
-        return subprocess.CompletedProcess(
-            args, 0, "42|sample|RUNNING|00:01|2026-11-15T12:00:00|None\n", ""
+
+def test_slurm_times_are_returned_in_utc(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_list.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        root = tmp_path / "handoffs"
+        handoff(root, "a" * 32, "42")
+        response = job_list.list_jobs(
+            scheduler_for(
+                "42|COMPLETED|0:0|2026-11-15T10:00:00|2026-11-15T10:30:00|00:30:00\n"
+            ),
+            tmp_path,
+            root,
         )
-
-    result = job_list.list_jobs(scheduler, tmp_path)
-    assert [row["job_id"] for row in result["jobs"]] == ["43", "42"]
-    assert result["jobs"][1]["state"] == "RUNNING"
-    assert not result["unavailable"]
-    assert result["history_days"] == 7
-    assert all("1234" in call for call in calls)
-    assert "--uid" in calls[0] and "now-7days" in calls[0]
-    assert "--user" in calls[1]
-    assert len(calls) == 2
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
+    job = response["jobs"][0]
+    assert job["submitted_at"] == "2026-11-15T15:00:00+00:00"
+    assert job["ended_at"] == "2026-11-15T15:30:00+00:00"
 
 
+@pytest.mark.parametrize("source", ["accounting", "queue"])
 @pytest.mark.parametrize("failure", ["returncode", "missing", "timeout"])
-def test_partial_failures_are_explicit_not_an_empty_success(
-    tmp_path, monkeypatch, failure
+def test_unavailable_sources_are_reported_not_hidden(
+    tmp_path, monkeypatch, source, failure
 ):
-    monkeypatch.setattr(job_list.os, "getuid", lambda: 1234, raising=False)
+    monkeypatch.setattr(job_list.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    root = tmp_path / "handoffs"
+    handoff(root, "a" * 32, "42")
+    command = "sacct" if source == "accounting" else "squeue"
 
     def scheduler(args, directory):
-        if args[0] == "sacct":
+        if args[0] == command:
             if failure == "missing":
                 raise FileNotFoundError("PRIVATE_PATH")
             if failure == "timeout":
                 raise subprocess.TimeoutExpired(args, 30)
             return subprocess.CompletedProcess(args, 1, "", "PRIVATE_STDERR")
-        return subprocess.CompletedProcess(
-            args, 0, "42|queued|PENDING|0:00|N/A|Priority\n", ""
-        )
-
-    result = job_list.list_jobs(scheduler, tmp_path)
-    assert result["unavailable"] == ["accounting"]
-    assert result["jobs"][0]["job_id"] == "42"
-    assert "PRIVATE_" not in str(result)
-
-
-def test_limits_keep_queue_jobs_before_recent_accounting(tmp_path, monkeypatch):
-    monkeypatch.setattr(job_list.os, "getuid", lambda: 1234, raising=False)
-    monkeypatch.setattr(job_list, "MAX_JOBS", 3)
-
-    def scheduler(args, directory):
-        text = "".join(f"{n}|completed|COMPLETED|00:01|0:0\n" for n in range(100, 106))
-        if args[0] == "squeue":
-            text = "1|older pending|PENDING|0:00|N/A|Priority\n"
-        return subprocess.CompletedProcess(args, 0, text, "")
-
-    result = job_list.list_jobs(scheduler, tmp_path)
-    assert result["truncated"]
-    assert {row["job_id"] for row in result["jobs"]} == {"1", "104", "105"}
-
-
-@pytest.mark.skipif(os.name != "posix", reason="Owned HPC receipts")
-def test_receipt_catalog_ignores_unrelated_jobs_and_preserves_uncertainty(tmp_path):
-    import json
-
-    root = tmp_path / "handoffs"
-    for bundle, job, submission in [
-        ("a" * 32, "42", "SUBMITTED"),
-        ("b" * 32, None, "SUBMISSION_UNKNOWN"),
-        ("c" * 32, "99", "SUBMITTED"),
-    ]:
-        directory = root / bundle
-        directory.mkdir(parents=True)
-        (directory / "receipt.json").write_text(
-            json.dumps(
-                {
-                    "bundle": bundle,
-                    "name": "sample.gjf",
-                    "job_id": job,
-                    "submission": submission,
-                }
-            )
-        )
-    before = {
-        p: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns)
-        for p in root.glob("*/receipt.json")
-    }
-    calls = []
-
-    def scheduler(args, _):
-        calls.append(args)
-        if args[0] == "sacct":
-            return subprocess.CompletedProcess(
-                args,
-                0,
-                "42|sample|COMPLETED|00:01|0:0\n500|OUTSIDE_JOB|COMPLETED|00:02|0:0\n",
-                "",
-            )
         return subprocess.CompletedProcess(args, 0, "", "")
 
     response = job_list.list_jobs(scheduler, tmp_path, root)
-    assert len(response["jobs"]) == 3
-    states = {row["bundle"]: row["state"] for row in response["jobs"]}
-    assert states == {
-        "a" * 32: "COMPLETED",
-        "b" * 32: "SUBMISSION_UNKNOWN",
-        "c" * 32: "UNKNOWN",
-    }
-    assert "OUTSIDE_JOB" not in str(response)
-    assert all(call[-2:] == ["--jobs", "42,99"] for call in calls)
-    assert before == {
-        p: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns)
-        for p in root.glob("*/receipt.json")
-    }
+    assert response["unavailable"] == [source]
+    assert response["jobs"][0]["state"] == "UNKNOWN"
+    assert "PRIVATE_" not in str(response)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="Owned HPC receipts")
-def test_receipt_catalog_skips_links_and_malformed_files(tmp_path):
-    import json
-
+def test_newest_handoffs_are_kept_within_the_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_list.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    monkeypatch.setattr(job_list, "MAX_JOBS", 2)
     root = tmp_path / "handoffs"
-    directory = root / ("a" * 32)
-    directory.mkdir(parents=True)
+    for index, letter in enumerate("abcd"):
+        handoff(root, letter * 32, None, "PREPARED", age=index * DAY)
+    response = job_list.list_jobs(scheduler_for(), tmp_path, root)
+    assert response["truncated"]
+    assert [row["bundle"][0] for row in response["jobs"]] == ["a", "b"]
+
+
+def test_links_malformed_and_foreign_receipts_are_skipped(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_list.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    root = tmp_path / "handoffs"
+    directory = handoff(root, "a" * 32, None, "PREPARED")
     outside = tmp_path / "private.json"
     outside.write_text(
         json.dumps(
             {"bundle": directory.name, "name": "PRIVATE.gjf", "submission": "PREPARED"}
         )
     )
+    (directory / "receipt.json").unlink()
     (directory / "receipt.json").symlink_to(outside)
-    linked = root / ("b" * 32)
-    linked.symlink_to(directory, target_is_directory=True)
-    broken = root / ("c" * 32)
-    broken.mkdir()
+    (root / ("b" * 32)).symlink_to(directory, target_is_directory=True)
+    broken = handoff(root, "c" * 32)
     (broken / "receipt.json").write_text("not JSON")
+    renamed = handoff(root, "d" * 32)
+    (renamed / "receipt.json").write_text(
+        json.dumps({"bundle": "e" * 32, "name": "x.gjf", "submission": "PREPARED"})
+    )
+    unsafe = handoff(root, "f" * 32)
+    (unsafe / "receipt.json").write_text(
+        json.dumps({"bundle": "f" * 32, "name": "../x.gjf", "submission": "PREPARED"})
+    )
     response = job_list.list_jobs(
         lambda *_: pytest.fail("No valid recorded jobs"), tmp_path, root
     )
@@ -157,22 +213,17 @@ def test_receipt_catalog_skips_links_and_malformed_files(tmp_path):
     assert "PRIVATE" not in str(response)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="HPC endpoint")
-def test_jobs_operation_never_creates_bundle_or_uses_payload_user(
+def test_jobs_operation_never_creates_storage_or_uses_a_payload_user(
     tmp_path, monkeypatch
 ):
-    calls = []
-
-    def scheduler(args, directory):
-        calls.append(args)
-        return subprocess.CompletedProcess(args, 0, "", "")
-
-    monkeypatch.setattr(tensor, "_scheduler", scheduler)
+    monkeypatch.setattr(
+        tensor, "_scheduler", lambda *a: pytest.fail("No recorded jobs to check")
+    )
     root = tmp_path / "must-not-create"
     response = tensor.handle(
         {"action": "jobs", "bundle": "a" * 32, "user": "somebody-else"}, root
     )
     assert not root.exists()
     assert response["bundle"] == "a" * 32 and response["jobs"] == []
-    assert not calls
-    assert "somebody-else" not in str(calls)
+    capabilities = tensor.handle({"action": "version", "bundle": "a" * 32}, root)
+    assert "jobs" in capabilities["capabilities"]
