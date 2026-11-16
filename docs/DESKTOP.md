@@ -13,23 +13,23 @@ automatic updates are not part of this change.
 ## Download and open Inkly Desktop
 
 The EXE is **not committed to Git**. The helper pins the
-[Inkly Desktop 0.4.2 (preview)](https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.4.2)
+[Inkly Desktop 0.5.0 (preview)](https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.5.0)
 release, built by GitHub Actions from commit
-`ff62de961bcbb513fa87bf3b57f3c7c364693dc3`. It never silently selects a newer
+`28fef743d097d758829341edfcf3a86f0d2f0354`. It never silently selects a newer
 build. Do not substitute another EXE or bypass a hash failure.
 
 1. In this checkout, double-click **Get-InklyDesktop-Test.cmd** at the repository
    root. Windows PowerShell 5.1 is required. Python and administrator rights
    are not needed, and the helper does not change persistent execution policy
    or install Windows components.
-2. It downloads `InklyDesktop-0.4.2-windows.zip` from the release. Release
+2. It downloads `InklyDesktop-0.5.0-windows.zip` from the release. Release
    downloads are public: no GitHub sign-in, and they do not expire. If the
    download is blocked (for example by a proxy), the helper opens the release
    page instead: download the ZIP there, return to the helper and press Enter,
    or paste the ZIP's full path. Enter **Q** to cancel. The helper never
    collects credentials and never chooses another build.
 3. It extracts only `InklyDesktop.exe`, verifies its SHA-256, and places it at
-   `%LOCALAPPDATA%\Inkly\DesktopBuilds\0.4.2\InklyDesktop.exe`. This is
+   `%LOCALAPPDATA%\Inkly\DesktopBuilds\0.5.0\InklyDesktop.exe`. This is
    separate from the checkout and other builds. It preserves existing settings
    and refuses to replace an unverified EXE already at that path.
 4. It runs a fresh **local-only** smoke test of the real window, bundled sign-in
@@ -43,7 +43,7 @@ The helper checks the **EXE** against this exact SHA-256, also listed in the
 release's `SHA256SUMS.txt`:
 
 ```text
-7B33C69C109F97E2D1FE1EBAC9E17199A4F6F9AA471F360B6292F614A5C22352
+C3CC529CE8909A443E20D9D4D02E13C3A0F62EF23E0E1BF69F96416B52370C55
 ```
 
 Anyone can also confirm that GitHub Actions built it from this repository with
@@ -55,7 +55,7 @@ revision and keep them beside one another. The `.cmd` supports both layouts.
 For an already downloaded ZIP, or a local check without launching the full GUI:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\get_inklydesktop_test.ps1 -ArtifactZip 'C:\path\to\InklyDesktop-0.4.2-windows.zip' -NoLaunch
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\get_inklydesktop_test.ps1 -ArtifactZip 'C:\path\to\InklyDesktop-0.5.0-windows.zip' -NoLaunch
 ```
 
 A ZIP with the wrong contents stops verification, and a bad existing cached EXE
