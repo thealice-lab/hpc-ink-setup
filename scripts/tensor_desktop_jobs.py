@@ -11,6 +11,7 @@ never talks to the HPC.
 """
 
 import base64
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -22,7 +23,7 @@ import threading
 
 import tensor_picker as picker
 
-# Load my jobs adds active jobs and jobs that ended within this many days.
+# Load adds active jobs and recent ended jobs, excluding cancelled handoffs.
 RECENT_DAYS = 3
 MAX_REMEMBERED = 5000
 # Folders checked automatically for a job's receipt; newest kept.
@@ -39,6 +40,7 @@ SEARCH_SKIP = {
     "system volume information",
 }
 MAX_RECEIPT = 64 * 1024
+MAX_ARCHIVES = 64
 MAX_INPUT = 5 * 1024 * 1024
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.(?:gjf|com)", re.I)
 BUNDLE = re.compile(r"[0-9a-f]{32}")
@@ -80,6 +82,80 @@ def receipt_for(path):
     return path.with_suffix(path.suffix + ".inkly.json")
 
 
+def is_copy(path, bundle):
+    """Recognize the generated layout, including legacy lists without a root."""
+    path = Path(path)
+    return (
+        bool(BUNDLE.fullmatch(str(bundle)))
+        and path.parent.name == f"{path.stem}-{str(bundle)[:8]}"
+    )
+
+
+def _folders(data):
+    copies = {}
+    for bundle, entry in data["handoffs"].items():
+        if isinstance(entry, dict) and isinstance(entry.get("input"), str):
+            path = Path(entry["input"])
+            if is_copy(path, bundle):
+                copies[str(path.parent)] = str(path.parent.parent)
+    seen = {}
+    for folder, stamp in data["folders"].items():
+        folder = copies.get(folder, folder)
+        seen[folder] = max(str(stamp), seen.get(folder, ""))
+    return seen
+
+
+def search_summary(
+    root, found, missing, replaced=0, originals=0, complete=True, copies=0
+):
+    text = f"Found {found} job(s) in {root}; {missing} still not found."
+    if replaced:
+        text += f"\n{replaced} older job(s) were left in Job history because their files have newer handoffs."
+    if originals:
+        text += f"\nSwitched {originals} job(s) from copies to originals."
+    if copies:
+        text += f"\nKept {copies} existing copy/copies where no original was found."
+    if not complete:
+        text += (
+            "\nThe search reached its limit; other folders may not have been checked."
+        )
+    return text
+
+
+def missing_text(missing, summary=None):
+    """Describe job instances, keeping repeated names and dates understandable."""
+    groups = defaultdict(list)
+    for job in missing:
+        groups[(job["name"], picker.state_name(job.get("state")))].append(job)
+    lines = []
+    for (name, state), values in sorted(groups.items()):
+        dates = sorted(
+            {
+                local_time(job.get("submitted_at") or job.get("prepared_at"))
+                for job in values
+            }
+            - {""}
+        )
+        date = (
+            " to ".join([dates[0], dates[-1]])
+            if len(dates) > 1
+            else dates[0]
+            if dates
+            else "unavailable"
+        )
+        repeated = f" \u00d7{len(values)}" if len(values) > 1 else ""
+        lines.append(f"{name}{repeated} — {state}; submitted {date}")
+    if len(lines) > 8:
+        lines = lines[:8] + [f"...and {len(groups) - 8} more file/state groups."]
+    copies = sum(bool(job.get("local_copy")) for job in missing)
+    intro = summary or (
+        f"{len(missing)} job(s) still need original-file locations. {copies} already have local copies."
+        if copies
+        else f"{len(missing)} job(s) were not found in folders Inkly Desktop has used."
+    )
+    return intro + "\n\n" + "\n".join(lines)
+
+
 class Index:
     """Bundle → input file on this computer, plus the folder for copies."""
 
@@ -101,6 +177,8 @@ class Index:
         with _lock:
             data = self._read()
             change(data)
+            # Compact legacy copy subfolders without losing project folders.
+            data["folders"] = _folders(data)
             handoffs = data["handoffs"]
             if len(handoffs) > MAX_REMEMBERED:
                 newest = sorted(
@@ -126,7 +204,7 @@ class Index:
             finally:
                 Path(name).unlink(missing_ok=True)
 
-    def remember(self, path, bundle):
+    def remember(self, path, bundle, original_checked=None):
         if not BUNDLE.fullmatch(str(bundle)):
             return
         resolved = Path(path).resolve()
@@ -134,8 +212,25 @@ class Index:
         entry = {"input": str(resolved), "seen": now}
 
         def change(data):
+            previous = data["handoffs"].get(bundle, {})
+            if not isinstance(previous, dict):
+                previous = {}
+            if is_copy(resolved, bundle):
+                if previous.get("replaced"):
+                    entry["replaced"] = True
+                entry["original_checked"] = (
+                    original_checked
+                    if original_checked is not None
+                    else bool(
+                        previous.get("original_checked")
+                        and previous.get("input") == str(resolved)
+                    )
+                )
             data["handoffs"][bundle] = entry
-            data["folders"][str(resolved.parent)] = now
+            parent = (
+                resolved.parent.parent if is_copy(resolved, bundle) else resolved.parent
+            )
+            data["folders"][str(parent)] = now
 
         self._update(change)
 
@@ -155,19 +250,27 @@ class Index:
         """Remembered folders, newest first, including those of known inputs."""
         with _lock:
             data = self._read()
-        seen = dict(data["folders"])
-        for entry in data["handoffs"].values():
+        seen = _folders(data)
+        for bundle, entry in data["handoffs"].items():
             if isinstance(entry, dict) and isinstance(entry.get("input"), str):
-                parent = str(Path(entry["input"]).parent)
+                path = Path(entry["input"])
+                parent = str(
+                    path.parent.parent if is_copy(path, bundle) else path.parent
+                )
                 seen.setdefault(parent, str(entry.get("seen", "")))
         ordered = sorted(seen, key=lambda key: str(seen[key]), reverse=True)
         return [Path(folder) for folder in ordered[:MAX_FOLDERS]]
 
-    def replaced(self, bundle):
+    def replaced(self, bundle, path=None):
         """Run again gave this file a new bundle; the old job stays in history."""
 
         def change(data):
             entry = data["handoffs"].get(bundle)
+            if entry is None and path is not None:
+                entry = data["handoffs"][bundle] = {
+                    "input": str(path),
+                    "seen": datetime.now(timezone.utc).isoformat(),
+                }
             if isinstance(entry, dict):
                 entry["replaced"] = True
 
@@ -189,16 +292,36 @@ class Index:
         if not isinstance(entry, dict) or not isinstance(entry.get("input"), str):
             return None, None
         path = Path(entry["input"])
-        try:
-            saved = json.loads(receipt_for(path).read_text(encoding="utf-8"))
-        except (OSError, ValueError, UnicodeError):
-            return None, None  # Moved or deleted: not on this computer any more.
-        if not isinstance(saved, dict) or not path.is_file():
+        saved = _read_receipt(receipt_for(path))
+        if not saved or path.is_symlink() or not path.is_file():
+            return None, None
+        if not isinstance(saved.get("bundle"), str) or not BUNDLE.fullmatch(
+            saved["bundle"]
+        ):
             return None, None
         if saved.get("bundle") != bundle or entry.get("replaced"):
             # The file now belongs to a newer job.
             return "replaced", path
         return "found", path
+
+    def is_replaced(self, bundle):
+        with _lock:
+            entry = self._read()["handoffs"].get(bundle, {})
+        return bool(isinstance(entry, dict) and entry.get("replaced"))
+
+    def original_checked(self, bundle):
+        with _lock:
+            entry = self._read()["handoffs"].get(bundle, {})
+        return bool(isinstance(entry, dict) and entry.get("original_checked"))
+
+    def mapped(self, bundle):
+        with _lock:
+            entry = self._read()["handoffs"].get(bundle)
+        return (
+            Path(entry["input"])
+            if isinstance(entry, dict) and isinstance(entry.get("input"), str)
+            else None
+        )
 
 
 def moment(value):
@@ -220,7 +343,7 @@ def local_time(value):
 
 
 def load_set(jobs, now=None, days=RECENT_DAYS):
-    """Active jobs and jobs that ended within `days`; never unsubmitted ones."""
+    """Active work and recent ended jobs; cancelled/unsubmitted stay in History."""
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(days=days)
     chosen = []
@@ -228,6 +351,8 @@ def load_set(jobs, now=None, days=RECENT_DAYS):
         if job.get("submission") == "PREPARED":
             continue
         state = picker.state_name(job.get("state"))
+        if state == "CANCELLED":
+            continue  # Explicitly selectable in Job history, never default Load.
         latest = moment(job.get("ended_at")) or when(job)
         # Live jobs however old; anything else (including an uncertain
         # submission) only if it is recent, so old ones stay in Job history.
@@ -310,101 +435,255 @@ def restore(folder, job, copy, connection, index):
             json.dump(receipt, out)
             out.flush()
             os.fsync(out.fileno())
-    index.remember(path, job["bundle"])
+    index.remember(path, job["bundle"], original_checked=True)
     return path
 
 
-def _matches(receipt_path, job):
-    """The input beside this receipt, if the receipt records this job."""
+def _read_receipt(path):
     try:
-        if receipt_path.stat().st_size > MAX_RECEIPT:
+        if path.is_symlink() or path.stat().st_size > MAX_RECEIPT:
             return None
-        saved = json.loads(receipt_path.read_text(encoding="utf-8"))
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        return saved if isinstance(saved, dict) else None
     except (OSError, ValueError, UnicodeError):
         return None
-    path = receipt_path.with_name(job["name"])
-    if not isinstance(saved, dict) or saved.get("bundle") != job["bundle"]:
-        return None
-    return path if path.is_file() else None
 
 
-def _searchable(job):
-    return NAME.fullmatch(job.get("name", "")) and BUNDLE.fullmatch(
-        job.get("bundle", "")
+def _connection_matches(saved, connection):
+    # Legacy receipts may contain just a bundle. Present connection fields must
+    # agree; a same-name file from another endpoint is never a replacement.
+    return not connection or all(
+        key not in saved or saved[key] == connection.get(key)
+        for key in ("host", "ink_path", "auth")
     )
 
 
-def find_in_folders(jobs, folders, index):
-    """Split jobs into inputs found in these folders and jobs still missing.
+def _matches(receipt_path, job, connection=None):
+    saved = _read_receipt(receipt_path)
+    path = receipt_path.with_name(job["name"])
+    if (
+        not saved
+        or saved.get("bundle") != job["bundle"]
+        or not _connection_matches(saved, connection)
+    ):
+        return None
+    return path if not path.is_symlink() and path.is_file() else None
 
-    Only `<input>.inkly.json` beside each input is read, so this is quick.
-    Found inputs are remembered for next time.
-    """
-    found, missing = [], []
-    for job in jobs:
-        match = None
-        if _searchable(job):
-            for folder in folders:
-                match = _matches(Path(folder) / f"{job['name']}.inkly.json", job)
-                if match:
+
+def _searchable(job):
+    return (
+        isinstance(job.get("name"), str)
+        and isinstance(job.get("bundle"), str)
+        and NAME.fullmatch(job["name"])
+        and BUNDLE.fullmatch(job["bundle"])
+    )
+
+
+def _archived_bundle(path, bundle, connection):
+    try:
+        with os.scandir(path.parent) as entries:
+            archives = 0
+            for number, entry in enumerate(entries):
+                if number >= SEARCH_ENTRIES or archives >= MAX_ARCHIVES:
                     break
-        if match:
-            index.remember(match, job["bundle"])
-            found.append(match)
-        else:
-            missing.append(job)
-    return found, missing
+                if entry.name.startswith(
+                    path.name + ".inkly.json."
+                ) and entry.name.endswith(".bak"):
+                    archives += 1
+                    saved = _read_receipt(Path(entry.path))
+                    if (
+                        saved
+                        and saved.get("bundle") == bundle
+                        and _connection_matches(saved, connection)
+                    ):
+                        return True
+    except OSError:
+        pass
+    return False
 
 
-def search(root, jobs, index, check=lambda: None):
-    """Look through `root` and its subfolders for these jobs' receipts.
+class _Discovery:
+    def __init__(self, jobs, index, connection, all_jobs, include_replaced):
+        self.jobs, self.index = jobs, index
+        self.connection = connection
+        self.known = {
+            job["bundle"]: job for job in (all_jobs or jobs) if _searchable(job)
+        }
+        self.include_replaced = include_replaced
+        self.searched = False
+        self.wanted = defaultdict(list)
+        self.best, self.replaced = {}, {}
+        for job in jobs:
+            if _searchable(job):
+                self.wanted[f"{job['name']}.inkly.json".lower()].append(job)
 
-    Bounded by SEARCH_DEPTH and SEARCH_ENTRIES; never follows links or enters
-    hidden, system or tool folders, and reads only receipts named after a
-    wanted input. Returns (found paths, jobs still missing, complete), where
-    complete is False if a bound stopped the search early.
-    """
-    wanted = {}
-    for job in jobs:
-        if _searchable(job):
-            wanted.setdefault(f"{job['name']}.inkly.json".lower(), []).append(job)
-    found, matched = [], set()
+    def consider(self, receipt_path):
+        targets = self.wanted.get(receipt_path.name.lower(), ())
+        if not targets:
+            return
+        saved = _read_receipt(receipt_path)
+        if not saved or not _connection_matches(saved, self.connection):
+            return
+        if not isinstance(saved.get("bundle"), str) or not BUNDLE.fullmatch(
+            saved["bundle"]
+        ):
+            return
+        for job in targets:
+            path = receipt_path.with_name(job["name"])
+            if path.is_symlink() or not path.is_file():
+                continue
+            if saved.get("bundle") == job["bundle"]:
+                previous = self.best.get(job["bundle"])
+
+                def rank(p):
+                    return is_copy(p, job["bundle"]), str(p).casefold()
+
+                if previous is None or rank(path) < rank(previous):
+                    self.best[job["bundle"]] = path
+                continue
+            newer = self.known.get(saved.get("bundle"))
+            # Never suppress active/uncertain work or infer identity from a name.
+            if self.include_replaced or picker.state_name(job.get("state")) not in (
+                {"COMPLETED", "RETURNED", "CANCELLED"} | FAILED
+            ):
+                continue
+            if (
+                not newer
+                or newer["name"] != job["name"]
+                or is_copy(path, newer["bundle"])
+            ):
+                continue
+            old_time, new_time = when(job), when(newer)
+            if not old_time or not new_time or new_time <= old_time:
+                continue
+            mapped = self.index.mapped(job["bundle"])
+            if mapped == path or _archived_bundle(path, job["bundle"], self.connection):
+                self.replaced[job["bundle"]] = path
+
+    def finish(self, report):
+        found, missing, moves = [], [], []
+        found_count = copies = 0
+        for job in self.jobs:
+            if not _searchable(job):
+                missing.append(job)
+                continue
+            bundle = job.get("bundle")
+            if self.searched and bundle not in self.best and job.get("local_copy"):
+                local = Path(job["local_copy"])
+                if is_copy(local, bundle) and _matches(
+                    receipt_for(local), job, self.connection
+                ):
+                    self.best[bundle] = local
+                    if bundle not in self.replaced:
+                        copies += 1
+            elif bundle in self.best and bundle not in self.replaced:
+                found_count += 1
+            if bundle in self.replaced:
+                self.index.replaced(bundle, self.replaced[bundle])
+            elif bundle in self.best:
+                path = self.best[bundle]
+                previous = self.index.mapped(bundle)
+                # Finding only a copy cannot displace a still-valid original.
+                if (
+                    previous
+                    and not is_copy(previous, bundle)
+                    and is_copy(path, bundle)
+                    and _matches(receipt_for(previous), job, self.connection)
+                ):
+                    path = previous
+                if previous and previous.resolve() != path.resolve():
+                    moves.append(
+                        {
+                            "bundle": bundle,
+                            "old": str(previous),
+                            "new": str(path),
+                            "original": is_copy(previous, bundle)
+                            and not is_copy(path, bundle),
+                        }
+                    )
+                self.index.remember(
+                    path,
+                    bundle,
+                    original_checked=True
+                    if self.searched and is_copy(path, bundle)
+                    else None,
+                )
+                found.append(path)
+            else:
+                missing.append(job)
+        if report is not None:
+            report.update(
+                replaced=len(self.replaced),
+                moves=moves,
+                found_count=found_count,
+                copies=copies,
+            )
+        return list(dict.fromkeys(found)), missing
+
+
+def find_in_folders(
+    jobs,
+    folders,
+    index,
+    *,
+    report=None,
+    connection=None,
+    all_jobs=None,
+    include_replaced=False,
+):
+    """Check exact sidecars in remembered folders; prefer originals to copies."""
+    discovery = _Discovery(jobs, index, connection, all_jobs, include_replaced)
+    for folder in dict.fromkeys(map(Path, folders)):
+        for name in discovery.wanted:
+            # Use the original case on case-sensitive filesystems.
+            for job in discovery.wanted[name]:
+                discovery.consider(folder / f"{job['name']}.inkly.json")
+    return discovery.finish(report)
+
+
+def search(
+    root,
+    jobs,
+    index,
+    check=lambda: None,
+    *,
+    report=None,
+    connection=None,
+    all_jobs=None,
+    include_replaced=False,
+):
+    """Bounded receipt search; scan past copies so originals can win."""
+    discovery = _Discovery(jobs, index, connection, all_jobs, include_replaced)
+    discovery.searched = True
     entries, complete = 0, True
     pending = [(Path(root), 0)]
-    while pending and len(matched) < len(jobs):
+    while pending:
         folder, depth = pending.pop()
         check()
+        if folder.is_symlink():
+            continue
         try:
             with os.scandir(folder) as listing:
-                items = list(listing)
+                for entry in listing:
+                    entries += 1
+                    if entries > SEARCH_ENTRIES:
+                        found, missing = discovery.finish(report)
+                        return found, missing, False
+                    if entries % 64 == 0:
+                        check()
+                    if entry.is_dir(follow_symlinks=False):
+                        if (
+                            entry.name.startswith((".", "$"))
+                            or entry.name.lower() in SEARCH_SKIP
+                        ):
+                            continue
+                        if depth >= SEARCH_DEPTH:
+                            complete = False
+                            continue
+                        pending.append((Path(entry.path), depth + 1))
+                    elif entry.is_file(follow_symlinks=False):
+                        discovery.consider(Path(entry.path))
         except OSError:
             continue
-        for entry in items:
-            entries += 1
-            if entries > SEARCH_ENTRIES:
-                missing = [job for job in jobs if job["bundle"] not in matched]
-                return found, missing, False
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    if entry.name.startswith((".", "$")):
-                        continue
-                    if entry.name.lower() in SEARCH_SKIP:
-                        continue
-                    if depth >= SEARCH_DEPTH:
-                        complete = False
-                        continue
-                    pending.append((Path(entry.path), depth + 1))
-                    continue
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-            except OSError:
-                continue
-            for job in wanted.get(entry.name.lower(), []):
-                if job["bundle"] in matched:
-                    continue
-                path = _matches(Path(entry.path), job)
-                if path:
-                    matched.add(job["bundle"])
-                    index.remember(path, job["bundle"])
-                    found.append(path)
-    return found, [job for job in jobs if job["bundle"] not in matched], complete
+    found, missing = discovery.finish(report)
+    return found, missing, complete
