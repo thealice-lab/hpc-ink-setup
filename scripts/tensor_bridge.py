@@ -24,7 +24,41 @@ class MissingBundleError(ValueError):
     """The HPC no longer has the bundle referenced by a saved receipt."""
 
 
-def _ssh_args(receipt, ssh, session=False):
+SETUP_PREFIX = b"INKLY-SETUP "
+# Windows allows 32,767 characters per command line; keep room for ssh options.
+SETUP_COMMAND_LIMIT = 30000
+# Progress lines keep the setup alive; the first one also waits for sign-in.
+SETUP_IDLE_SECONDS = 300
+SETUP_TOTAL_SECONDS = 1200
+
+
+def setup_command(
+    script, *, commit, version, repository, mode="auto", shared_logging=True
+):
+    """Remote command that runs the setup script, then the session, on one login."""
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("HPC setup needs a full 40-character commit")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("HPC setup needs a release version such as 0.6.0")
+    if mode not in {"auto", "repair"}:
+        raise ValueError("Unknown HPC setup mode")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/@+-]*", repository):
+        raise ValueError("Unsupported repository address for HPC setup")
+    payload = base64.b64encode(script).decode("ascii")
+    # Only base64 and the values checked above go inside the single quotes, so
+    # bash, sh, zsh, csh and tcsh login shells all pass the command on unchanged.
+    # eval keeps SSH's stdin attached for the session that follows.
+    command = (
+        f"/bin/bash -c 'C={commit}; V={version}; R={repository}; M={mode}; "
+        f"S={1 if shared_logging else 0}; P={payload}; "
+        'eval "$(printf %s "$P" | base64 -d)"\''
+    )
+    if len(command) > SETUP_COMMAND_LIMIT:
+        raise ValueError("The HPC setup script is too large to send in one command")
+    return command
+
+
+def _ssh_args(receipt, ssh, session=False, remote=None):
     host = receipt["host"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", host):
         raise ValueError("Use an OpenSSH host alias or user@host")
@@ -34,6 +68,8 @@ def _ssh_args(receipt, ssh, session=False):
     command = (
         '"$HOME"/' + shlex.quote(ink[2:]) if ink.startswith("~/") else shlex.quote(ink)
     ) + (" tensor --session" if session else " tensor")
+    if remote is not None:
+        command = remote  # The setup script ends by starting this same session.
     options = []
     if receipt.get("auth") == "keyboard-interactive":
         options = [
@@ -101,11 +137,11 @@ def exchange(receipt, request, ssh):
 class Session:
     """Use one authenticated SSH connection for preview, decision and monitoring."""
 
-    def __init__(self, receipt, ssh):
+    def __init__(self, receipt, ssh, remote=None):
         self.receipt = receipt
         self.diagnostics = None
         self.process = subprocess.Popen(
-            _ssh_args(receipt, ssh, session=True),
+            _ssh_args(receipt, ssh, session=True, remote=remote),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -163,26 +199,80 @@ class Session:
         finally:
             deadline.cancel()
         if raw is None:
-            self.error_reader.join(timeout=1)
-            error = self.error_tail.lower()
-            if b"could not resolve hostname" in error:
-                raise ValueError(
-                    "Cannot resolve SSH host; check the network/VPN and resume"
-                )
-            if b"permission denied" in error:
-                raise ValueError(
-                    "SSH authentication denied; complete the local sign-in and resume"
-                )
-            if b"host key verification failed" in error:
-                raise ValueError(
-                    "SSH host key is not trusted; verify it through the established site procedure"
-                )
-            raise ValueError(
+            raise self._closed(
                 "SSH closed; check login and matching HPC version, then resume"
             )
         if len(raw) > 96 * 1024 * 1024:
             raise ValueError("Response exceeds transfer limit")
         return _response(raw, receipt)
+
+    def _closed(self, default):
+        """Explain a closed connection without echoing the remote's own text."""
+        self.error_reader.join(timeout=1)
+        error = self.error_tail.lower()
+        if b"could not resolve hostname" in error:
+            return ValueError(
+                "Cannot resolve SSH host; check the network/VPN and resume"
+            )
+        if b"permission denied" in error:
+            return ValueError(
+                "SSH authentication denied; complete the local sign-in and resume"
+            )
+        if b"host key verification failed" in error:
+            return ValueError(
+                "SSH host key is not trusted; verify it through the established site procedure"
+            )
+        return ValueError(default)
+
+    def run_setup(self, progress):
+        """Read setup progress until "done"; the stream then speaks the session protocol.
+
+        Lines before the first progress line (a login banner) are ignored.
+        Returns the final frame, or raises with the setup's own plain message.
+        """
+        started = time.monotonic()
+        seen = False
+        while True:
+            left = SETUP_TOTAL_SECONDS - (time.monotonic() - started)
+            try:
+                if left <= 0:
+                    raise queue.Empty
+                raw = self.responses.get(timeout=min(SETUP_IDLE_SECONDS, left))
+            except queue.Empty:
+                self.process.kill()
+                raise ValueError(
+                    "HPC setup stopped responding and was disconnected. Running "
+                    "setup again is safe."
+                ) from None
+            if raw is None:
+                raise self._closed(
+                    "SSH closed before HPC setup finished. Running setup again is safe."
+                )
+            if not raw.startswith(SETUP_PREFIX):
+                if not seen:
+                    continue
+                self.process.kill()
+                raise ValueError(
+                    "Unexpected output from the HPC setup; it was stopped."
+                )
+            seen = True
+            try:
+                frame = json.loads(raw[len(SETUP_PREFIX) :])
+            except (ValueError, UnicodeError):
+                frame = None
+            if not isinstance(frame, dict):
+                self.process.kill()
+                raise ValueError("Invalid progress from the HPC setup; it was stopped.")
+            if frame.get("done") is True:
+                if frame.get("ok") is True:
+                    return frame
+                error = frame.get("error")
+                raise ValueError(
+                    error[:600]
+                    if isinstance(error, str) and error
+                    else "HPC setup failed"
+                )
+            progress(frame)
 
     def _diagnostic_batch(self):
         try:

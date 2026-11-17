@@ -22,6 +22,7 @@ if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tensor_desktop_jobs as jobs
+import tensor_desktop_setup as hpc_setup
 import tensor_desktop_status as status
 import tensor_picker as picker
 from tensor_desktop_backend import DesktopController
@@ -1626,6 +1627,7 @@ def main(argv=None):
                     "ssh": bool(checked and checked.returncode == 0),
                     "askpass": bool(bundled_askpass()),
                     "frozen": bool(getattr(sys, "frozen", False)),
+                    "setup": hpc_setup.ready(),
                     **app.layout_report(),
                 }
             ),
