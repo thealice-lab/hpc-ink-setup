@@ -373,3 +373,158 @@ def test_interrupt_keeps_receipt_and_does_not_submit(guided, monkeypatch):
     assert bridge.main(["run", str(source), "--host", "cluster"]) == 130
     assert source.with_suffix(".gjf.inkly.json").exists()
     assert [c["action"] for c in calls] == ["prepare"]
+
+
+SETUP_SCRIPT = (
+    Path(__file__).resolve().parents[1] / "scripts/desktop_hpc_setup.sh"
+).read_bytes()
+
+
+def setup_remote(**overrides):
+    values = {
+        "commit": "a" * 40,
+        "version": "0.6.0",
+        "repository": "https://github.com/thealice-lab/hpc-ink-setup.git",
+        **overrides,
+    }
+    return bridge.setup_command(SETUP_SCRIPT, **values)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"commit": "a" * 39},
+        {"commit": "A" * 40},
+        {"version": "0.6"},
+        {"version": "0.6.0; rm"},
+        {"mode": "force"},
+        {"repository": "https://x/y.git'; touch z"},
+        {"repository": "$(id)"},
+    ],
+)
+def test_setup_command_refuses_values_that_are_not_shell_safe(overrides):
+    with pytest.raises(ValueError):
+        setup_remote(**overrides)
+
+
+def test_setup_command_is_one_single_quoted_word_for_any_login_shell():
+    command = setup_remote(mode="repair", shared_logging=False)
+    assert command.startswith("/bin/bash -c '") and command.endswith("'")
+    assert command.count("'") == 2 and "\n" not in command
+    assert " M=repair; S=0; " in command
+    assert len(command) < bridge.SETUP_COMMAND_LIMIT
+
+
+def test_setup_command_refuses_a_script_too_large_for_windows():
+    with pytest.raises(ValueError, match="too large"):
+        bridge.setup_command(
+            b"#" * 25000,
+            commit="a" * 40,
+            version="0.6.0",
+            repository="https://github.com/o/r.git",
+        )
+
+
+def test_setup_command_survives_windows_argument_parsing():
+    """ssh.exe parses its command line as this child does (list2cmdline on Windows)."""
+    receipt = {"host": "alice@cluster", "ink_path": "~/.inkly/bin/ink"}
+    remote = setup_remote()
+    args = bridge._ssh_args(receipt, sys.executable, session=True, remote=remote)
+    assert args[-2:] == ["alice@cluster", remote]
+    echo = "import json, sys; sys.stdout.write(json.dumps(sys.argv[1:]))"
+    result = subprocess.run(
+        [sys.executable, "-c", echo, *args[1:]],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == args[1:]
+
+
+def fake_remote(monkeypatch, peer):
+    popen = subprocess.Popen
+    monkeypatch.setattr(
+        bridge.subprocess,
+        "Popen",
+        lambda args, **kwargs: popen([sys.executable, "-u", "-c", peer], **kwargs),
+    )
+    return {"host": "cluster", "ink_path": "~/.inkly/bin/ink", "bundle": "a" * 32}
+
+
+SETUP_PEER = r"""
+import json, sys
+print("Welcome to the cluster")
+for frame in FRAMES:
+    print("INKLY-SETUP " + json.dumps(frame), flush=True)
+for line in sys.stdin.buffer:
+    print(json.dumps({"ok": True, **json.loads(line)}), flush=True)
+"""
+
+
+def test_run_setup_skips_the_banner_reports_progress_then_hands_over(monkeypatch):
+    frames = [
+        {"stage": "preflight", "line": "bash 5.1"},
+        {"stage": "install", "line": "Installing Inkly"},
+        {"done": True, "ok": True, "version": "0.6.0", "commit": "a" * 40},
+    ]
+    receipt = fake_remote(monkeypatch, f"FRAMES = {frames!r}\n" + SETUP_PEER)
+    seen = []
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        done = session.run_setup(seen.append)
+        assert session.exchange({"action": "version"})["action"] == "version"
+    assert seen == frames[:2]
+    assert done == frames[2]
+
+
+def test_run_setup_raises_the_setup_scripts_own_message(monkeypatch):
+    frames = [
+        {"stage": "code", "line": "Updating"},
+        {"done": True, "ok": False, "stage": "code", "error": "has local changes"},
+    ]
+    receipt = fake_remote(monkeypatch, f"FRAMES = {frames!r}\n" + SETUP_PEER)
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        with pytest.raises(ValueError, match="^has local changes$"):
+            session.run_setup(lambda frame: None)
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        (
+            "print('INKLY-SETUP {\"stage\": \"code\"}'); print('stray')",
+            "Unexpected output",
+        ),
+        ("print('INKLY-SETUP [1, 2]')", "Invalid progress"),
+        ("print('INKLY-SETUP not json')", "Invalid progress"),
+        (
+            'print(\'INKLY-SETUP {"stage": "code"}\')',
+            "closed before HPC setup finished",
+        ),
+    ],
+)
+def test_run_setup_stops_on_broken_progress(monkeypatch, body, message):
+    receipt = fake_remote(monkeypatch, body + "\nimport time; time.sleep(0.5)")
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        with pytest.raises(ValueError, match=message):
+            session.run_setup(lambda frame: None)
+
+
+def test_run_setup_gives_up_when_the_hpc_goes_quiet(monkeypatch):
+    monkeypatch.setattr(bridge, "SETUP_IDLE_SECONDS", 0.5)
+    receipt = fake_remote(monkeypatch, "import time; time.sleep(30)")
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        with pytest.raises(ValueError, match="stopped responding"):
+            session.run_setup(lambda frame: None)
+    assert session.process.returncode is not None
+
+
+def test_run_setup_explains_a_failed_sign_in(monkeypatch):
+    receipt = fake_remote(
+        monkeypatch,
+        "import sys; sys.stderr.write('Permission denied private-marker'); sys.exit(255)",
+    )
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        with pytest.raises(ValueError, match="authentication denied") as error:
+            session.run_setup(lambda frame: None)
+    assert "private-marker" not in str(error.value)

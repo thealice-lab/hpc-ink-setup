@@ -2,12 +2,12 @@
 GitHub and a stub setup.sh. No network, Slurm, Gaussian or real installer."""
 
 import base64
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 
 import pytest
 
@@ -17,6 +17,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/desktop_hpc_setup.sh"
+spec = importlib.util.spec_from_file_location(
+    "tensor_bridge", Path(__file__).resolve().parents[1] / "scripts/tensor_bridge.py"
+)
+bridge = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bridge)
 GIT = ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid"]
 
 # Stands in for the repository's setup.sh: noisy on stdout and stderr, then it
@@ -107,13 +112,25 @@ def home(tmp_path):
     return path
 
 
-def command(**values):
-    """The same shape of remote command Desktop sends; values are shell-safe."""
+def raw_command(**values):
+    """The command shape without Desktop's checks, to test the script's own."""
     payload = base64.b64encode(SCRIPT.read_bytes()).decode()
     assignments = "; ".join(f"{key}={value}" for key, value in values.items())
     return (
         f"/bin/bash -c '{assignments}; P={payload}; "
         'eval "$(printf %s "$P" | base64 -d)"\''
+    )
+
+
+def command(*, C, V, R, M, S):
+    """Exactly the remote command Desktop sends."""
+    return bridge.setup_command(
+        SCRIPT.read_bytes(),
+        commit=C,
+        version=V,
+        repository=R,
+        mode=M,
+        shared_logging=bool(S),
     )
 
 
@@ -476,7 +493,7 @@ def test_an_unreachable_package_index_is_reported_first(remote, home):
 )
 def test_invalid_values_from_desktop_are_refused(home, values):
     result = subprocess.run(
-        ["bash", "-c", command(R="file:///nowhere", **values)],
+        ["bash", "-c", raw_command(R="file:///nowhere", **values)],
         capture_output=True,
         text=True,
         env={"HOME": str(home), "PATH": os.environ["PATH"]},
@@ -501,16 +518,42 @@ def test_the_remote_command_works_from_other_login_shells(remote, home, shell):
 
 def test_the_script_stays_well_inside_the_windows_command_line_limit():
     # Windows allows 32,767 characters per command line; base64 adds a third.
-    assert (
-        len(
-            command(
-                C="a" * 40,
-                V="10.10.10",
-                R="https://github.com/o/r.git",
-                M="repair",
-                S=1,
-            )
-        )
-        < 24000
+    longest = command(
+        C="a" * 40, V="10.10.10", R="https://github.com/o/r.git", M="repair", S=1
     )
-    assert sys.version_info >= (3, 9)
+    assert len(longest) < 20000
+
+
+def test_desktop_bridge_runs_setup_then_the_session_on_one_connection(
+    remote, home, monkeypatch
+):
+    """The bridge's own command, through a login shell standing in for sshd."""
+    commit = remote("0.6.0")
+    popen = subprocess.Popen
+    started = []
+
+    def ssh(args, **kwargs):
+        started.append(args)
+        env = {
+            "HOME": str(home),
+            "PATH": os.environ["PATH"],
+            "INKLY_SETUP_PYPI": (home.parent / "pypi.html").as_uri(),
+        }
+        # Login banners arrive before the remote command starts.
+        wrapped = "echo 'Welcome to the cluster'; " + args[-1]
+        return popen(["sh", "-c", wrapped], env=env, **kwargs)
+
+    monkeypatch.setattr(bridge.subprocess, "Popen", ssh)
+    receipt = {"host": "cluster", "ink_path": "~/.inkly/bin/ink", "auth": None}
+    remote_command = command(C=commit, V="0.6.0", R=remote.url, M="auto", S=1)
+    progress = []
+    with bridge.Session(receipt, "ssh", remote=remote_command) as session:
+        done = session.run_setup(progress.append)
+        reply = session.exchange(
+            {"action": "version"}, receipt={**receipt, "bundle": "f" * 32}
+        )
+    assert len(started) == 1 and started[0][-1] == remote_command
+    assert done["ok"] and done["version"] == "0.6.0" and done["commit"] == commit
+    assert reply["version"] == "0.6.0"
+    assert any(frame.get("stage") == "install" for frame in progress)
+    assert session.process.returncode == 0
