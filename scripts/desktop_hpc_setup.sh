@@ -40,7 +40,13 @@ fail() {
     frame "{\"done\":true,\"ok\":false,\"stage\":$(json "$STAGE"),\"error\":$(json "$message")}"
     exit 1
 }
-cleanup() { if [ -n "$tmp" ] && [ -d "$tmp" ]; then rm -rf -- "$tmp"; fi; }
+# Only the main shell cleans up: bash also runs this trap in a subshell that
+# fails, for example on an unset variable inside a pipeline, and there the
+# first test of an "&&" list can be ignored. Return first, then test.
+cleanup() {
+    if [ "$BASHPID" != "$$" ]; then return 0; fi
+    if [ -n "$tmp" ] && [ -d "$tmp" ]; then rm -rf -- "$tmp"; fi
+}
 trap cleanup EXIT
 newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; }
 version_in() { sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' | head -n 1; }

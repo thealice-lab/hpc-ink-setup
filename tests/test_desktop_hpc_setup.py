@@ -557,3 +557,21 @@ def test_desktop_bridge_runs_setup_then_the_session_on_one_connection(
     assert reply["version"] == "0.6.0"
     assert any(frame.get("stage") == "install" for frame in progress)
     assert session.process.returncode == 0
+
+
+def test_only_the_main_shell_removes_the_temporary_download(tmp_path):
+    """bash runs EXIT traps in failing subshells too; those must not clean up."""
+    text = SCRIPT.read_text()
+    start = text.index("cleanup() {")
+    cleanup = text[start : text.index("trap cleanup EXIT", start)]
+    folder = tmp_path / "download"
+    folder.mkdir()
+    probe = (
+        f"set -uo pipefail\ntmp={folder}\n{cleanup}trap cleanup EXIT\n"
+        'printf x | env -i X="$UNSET_VARIABLE" true\n'
+        f"[ -d {folder} ] && echo kept\n"
+    )
+    result = subprocess.run(["bash", "-c", probe], capture_output=True, text=True)
+    assert "unbound variable" in result.stderr
+    assert result.stdout.strip() == "kept"
+    assert not folder.exists()  # The main shell's exit removed it.
