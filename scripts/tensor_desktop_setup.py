@@ -24,9 +24,19 @@ def _bundled(name):
 
 def script():
     try:
-        return _bundled(SCRIPT_NAME).read_bytes()
+        data = _bundled(SCRIPT_NAME).read_bytes()
     except OSError:
         raise ValueError("This Desktop is missing its HPC setup script.") from None
+    # bash on the HPC needs LF line endings, whatever a Windows checkout used.
+    return data.replace(b"\r\n", b"\n")
+
+
+def ready():
+    """For the packaged smoke test: the script and its release commit are bundled."""
+    try:
+        return bool(script()) and bool(target())
+    except Exception:
+        return False
 
 
 def build_info():

@@ -2891,3 +2891,33 @@ def test_setup_target_of_a_source_run_is_the_committed_head():
     if f'"{__version__}"' not in committed:
         pytest.skip("the version change is not committed yet")
     assert backend.setup.target() == {"version": __version__, "commit": head}
+
+
+def test_packaged_setup_script_keeps_lf_endings_and_smoke_reports_it(
+    tmp_path, monkeypatch
+):
+    from inkly import __version__
+
+    setup = backend.setup
+    monkeypatch.setattr(setup.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(setup.sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert setup.ready() is False
+    (tmp_path / "desktop_hpc_setup.sh").write_bytes(b"set -u\r\necho ok\r\n")
+    assert setup.script() == b"set -u\necho ok\n"
+    assert setup.ready() is False  # No recorded commit yet.
+    (tmp_path / "desktop_build.json").write_text(
+        json.dumps({"version": __version__, "commit": "e" * 40})
+    )
+    assert setup.ready() is True
+
+
+def test_desktop_build_bundles_the_setup_script_and_its_commit():
+    root = Path(__file__).resolve().parents[1]
+    build = (root / "scripts/windows/build_desktop.ps1").read_text()
+    assert '--add-data "$setupScript;."' in build
+    assert '--add-data "$buildInfo;."' in build
+    assert "desktop_build.json" in build and "rev-parse HEAD" in build
+    for workflow in ("lint.yml", "release-desktop.yml"):
+        text = (root / ".github/workflows" / workflow).read_text()
+        assert "assert result['setup'], result" in text
+    assert b"\r" not in (root / "scripts/desktop_hpc_setup.sh").read_bytes()

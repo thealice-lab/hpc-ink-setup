@@ -89,6 +89,8 @@ jobs:
           assert result['window'] == 'Inkly Desktop' and result['width'] >= 940, result
           assert result['contact'] == 'Questions or issues? Contact: rrv9177@uncw.edu', result
           assert result['contact_visible'] and result['controls_visible'], result
+          # HPC setup: the script and the source commit are inside the app.
+          assert result['setup'], result
 
       - name: Package ZIP, SHA-256 sums and release notes
         shell: pwsh
