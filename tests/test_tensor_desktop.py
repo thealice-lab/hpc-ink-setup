@@ -393,7 +393,7 @@ def test_a_run_again_replacement_is_not_loaded_again(workflow):
         json.dumps({**json.loads(receipt.read_text()), "bundle": "f" * 32})
     )
     c.index.replaced(old)
-    w.endpoint["jobs"] = [hpc_job(old, "CANCELLED by 1000", ended_days=1)]
+    w.endpoint["jobs"] = [hpc_job(old, "FAILED", ended_days=1)]
     c.load_jobs(SETTINGS)
     found = found_event(w)
     assert found["paths"] == [] and found["restore"] == [] and found["replaced"] == 1
@@ -2459,5 +2459,265 @@ def test_native_missing_jobs_prompt_returns_the_choice(
         )
         assert choice == button
     finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+def legacy_copy_scenario(workflow, tmp_path):
+    """Synthetic 19-job history with copies, reruns and a cancelled-only file."""
+    from datetime import datetime, timedelta, timezone
+    import tensor_desktop_jobs as job_files
+
+    w = workflow
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    copies, project = tmp_path / "copies", tmp_path / "project"
+    project.mkdir()
+    families = [
+        ("cancelled_1.gjf", ["CANCELLED"] * 6),
+        ("compound_1.gjf", ["FAILED", "FAILED", "COMPLETED"]),
+        ("compound_2.gjf", ["FAILED", "CONFIGURING"]),
+        ("single_1.gjf", ["COMPLETED"]),
+        ("single_2.gjf", ["COMPLETED"]),
+    ] + [(f"series_{number}.gjf", ["COMPLETED"]) for number in range(6)]
+    listing, originals = [], []
+    serial = 0
+    for name, states in families:
+        runs = []
+        for state in states:
+            serial += 1
+            bundle = f"{serial:08x}" + "0" * 24
+            item = elsewhere_job(w, bundle, name, state)
+            stamp = (
+                datetime.now(timezone.utc) - timedelta(minutes=40 - serial)
+            ).isoformat()
+            item.update(
+                prepared_at=stamp,
+                submitted_at=stamp,
+                ended_at=stamp if state != "CONFIGURING" else None,
+            )
+            listing.append(item)
+            runs.append(item)
+            job_files.restore(
+                copies,
+                item,
+                {**w.endpoint["inputs"][bundle], "bundle": bundle},
+                SETTINGS,
+                w.controller.index,
+            )
+        if name == "cancelled_1.gjf" or name == "single_2.gjf":
+            continue  # One file is cancelled-only; one really has only a copy.
+        newest = runs[-1]
+        path = project / name
+        path.write_bytes(
+            base64.b64decode(w.endpoint["inputs"][newest["bundle"]]["data"])
+        )
+        saved = {
+            **SETTINGS,
+            "bundle": newest["bundle"],
+            "output": str(project / "returned"),
+        }
+        job_files.receipt_for(path).write_text(json.dumps(saved))
+        for older in runs[:-1]:
+            path.with_name(
+                path.name + ".inkly.json.rerun-" + older["bundle"] + ".bak"
+            ).write_text(json.dumps({**saved, "bundle": older["bundle"]}))
+        originals.append(path)
+    w.controller.index.set_folder(copies)
+    legacy = json.loads(w.controller.index.path.read_text())
+    for entry in legacy["handoffs"].values():
+        entry.pop("original_checked", None)  # 0.5.0 did not record this choice.
+    w.controller.index.path.write_text(json.dumps(legacy))
+    w.endpoint["jobs"] = listing
+    return project, copies, originals
+
+
+def test_legacy_copy_load_needs_one_original_search_then_loads_quietly(
+    workflow, tmp_path
+):
+    w, c = workflow, workflow.controller
+    project, copies, originals = legacy_copy_scenario(w, tmp_path)
+    assert len(w.endpoint["jobs"]) == 19
+    c.load_jobs(SETTINGS)
+    first = found_event(w)
+    assert not first["paths"]
+    assert len(first["restore"]) == 13 and first["cancelled"] == 6
+    assert all(job.get("local_copy") for job in first["restore"])
+    context = {"settings": SETTINGS, "jobs": first["jobs"], "from_history": False}
+    c.search_jobs(first["restore"], str(project), context)
+    result = [data for kind, data in w.events if kind == "jobs_searched"][-1]
+    assert len(result["paths"]) == 10 and not result["missing"]
+    assert len({Path(path).name for path in result["paths"]}) == 10
+    assert result["replaced"] == 3
+    assert result["found_count"] == 9 and result["copies"] == 1
+    assert sum(move["original"] for move in result["moves"]) == 9
+    assert {str(path) for path in originals} <= set(result["paths"])
+    c.load_jobs(SETTINGS)
+    next_load = found_event(w)
+    assert len(next_load["paths"]) == 10 and not next_load["restore"]
+    assert set(c.index.folders()) == {copies.resolve(), project.resolve()}
+    assert "submit" not in actions(w) and "cancel" not in actions(w)
+
+
+def test_cancelled_jobs_stay_selectable_from_history_only(workflow):
+    w, c = workflow, workflow.controller
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    item = elsewhere_job(w, "c" * 32, "cancelled.gjf", "CANCELLED")
+    item["ended_at"] = hpc_job("c" * 32, "CANCELLED", ended_days=1)["ended_at"]
+    w.endpoint["jobs"] = [item]
+    c.load_jobs(SETTINGS)
+    assert found_event(w)["cancelled"] == 1 and not found_event(w)["restore"]
+    c.load_jobs(SETTINGS, [item["bundle"]])
+    assert found_event(w)["restore"] == [item]
+
+
+@native_display
+def test_native_legacy_copy_load_searches_once_and_keeps_each_file_once(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    w = workflow
+    project, copies, originals = legacy_copy_scenario(w, tmp_path)
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "settings.json",
+    )
+    w.controller.emit = lambda kind, data: app.events.put((kind, data))
+    prompts = []
+    no_message_boxes(monkeypatch, gui)
+    monkeypatch.setattr(
+        app, "ask_missing", lambda *args: prompts.append(args) or "find"
+    )
+    monkeypatch.setattr(gui.filedialog, "askdirectory", lambda **kw: str(project))
+    try:
+        app.settings = dict(SETTINGS)
+        app.load_my_jobs()
+        pump(app)
+        assert len(prompts) == 1
+        assert len(app.files) == len(set(path.name for path in app.files)) == 10
+        assert set(originals) <= set(app.files)
+        app.load_my_jobs()
+        pump(app)
+        assert len(app.files) == 10 and len(prompts) == 1
+        assert len(app.table.get_children()) == 10
+        assert "submit" not in actions(w) and "cancel" not in actions(w)
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+@native_display
+def test_native_history_can_repoint_a_loaded_copy_without_new_rows(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+    import tensor_desktop_jobs as job_files
+
+    w = workflow
+    w.endpoint["capabilities"] += ["jobs", "input"]
+    item = elsewhere_job(w, "c" * 32, "compound.gjf")
+    project = tmp_path / "originals"
+    project.mkdir()
+    copy = job_files.restore(
+        tmp_path / "copies",
+        item,
+        {**w.endpoint["inputs"][item["bundle"]], "bundle": item["bundle"]},
+        SETTINGS,
+        w.controller.index,
+    )
+    # Accepting the copy suppresses default prompts, but never disables Locate.
+    w.controller.index.remember(copy, item["bundle"], original_checked=True)
+    original = project / item["name"]
+    original.write_bytes(copy.read_bytes())
+    job_files.receipt_for(original).write_text(
+        json.dumps(
+            {**SETTINGS, "bundle": item["bundle"], "output": str(project / "returned")}
+        )
+    )
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: w.controller,
+        settings_path=tmp_path / "settings.json",
+    )
+    w.controller.emit = lambda kind, data: app.events.put((kind, data))
+    no_message_boxes(monkeypatch, gui)
+    summaries = []
+    monkeypatch.setattr(
+        gui.messagebox, "showinfo", lambda *args, **kw: summaries.append(args)
+    )
+    monkeypatch.setattr(gui.filedialog, "askdirectory", lambda **kw: str(project))
+    try:
+        app.settings = dict(SETTINGS)
+        app.add_paths([copy])
+        w.endpoint["jobs"] = [item]
+        app.show_history(
+            {"jobs": [item], "observed_at": item["submitted_at"], "settings": SETTINGS}
+        )
+        app.history_state.set("All")
+        app.history_period.set("All time")
+        app.refresh_history()
+        app.history_table.selection_set(item["bundle"])
+        assert app.history_table.item(item["bundle"])["values"][-1] == "Copy"
+        app.find_history_files()
+        pump(app)
+        assert app.files == [original] and len(app.table.get_children()) == 1
+        assert app.history_table.item(item["bundle"])["values"][-1] == "Original"
+        assert "Switched 1" in summaries[-1][1] and str(project) in summaries[-1][1]
+        assert (
+            copy.is_file() and "submit" not in actions(w) and "cancel" not in actions(w)
+        )
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+@native_display
+def test_native_partial_search_prompt_includes_the_result_and_repeat_count(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "settings.json",
+    )
+    no_message_boxes(monkeypatch, gui)
+    app.load_context["search_summary"] = (
+        "Found 3 job(s) in chosen project; 2 still not found."
+    )
+    seen = []
+
+    def inspect():
+        label = app.missing_dialog.grid_slaves(row=0)[0]
+        seen.append(label.cget("text"))
+        app.missing_buttons["skip"].invoke()
+
+    guard = root.after(
+        5000,
+        lambda: (
+            app.missing_dialog.destroy() if app.missing_dialog.winfo_exists() else None
+        ),
+    )
+    root.after(100, inspect)
+    try:
+        item = hpc_job("a" * 32, "FAILED", "compound.gjf")
+        assert (
+            app.ask_missing([item, {**item, "bundle": "b" * 32}], True, True) == "skip"
+        )
+        assert "Found 3 job(s) in chosen project; 2 still not found." in seen[0]
+        assert "compound.gjf \u00d72" in seen[0] and "FAILED; submitted" in seen[0]
+    finally:
+        root.after_cancel(guard)
         app.busy, app.action = False, None
         app.close()

@@ -53,11 +53,12 @@ def test_load_set_is_active_jobs_and_jobs_that_ended_recently():
         "PENDING",
         "RUNNING",
         "COMPLETED",
-        "CANCELLED by 7",
         "SUBMISSION_UNKNOWN",
         "UNKNOWN",
     ]
-    assert len(jobs.load_set(listing, NOW, days=30)) == 9  # Not the 60-day-old one
+    assert (
+        len(jobs.load_set(listing, NOW, days=30)) == 8
+    )  # No cancelled or 60-day-old job
 
 
 def test_history_filters_by_state_period_and_name_or_job_id():
@@ -260,3 +261,154 @@ def test_search_can_be_stopped(tmp_path):
         jobs.search(
             tmp_path / "research", [recorded("water.gjf", "a" * 32)], jobs.Index(), stop
         )
+
+
+def test_missing_prompt_reports_folder_counts_states_dates_and_repeats():
+    missing = [
+        job("FAILED", days=1, name="compound.gjf"),
+        job("FAILED", days=2, name="compound.gjf"),
+        job("RUNNING", days=1, name="compound.gjf"),
+    ]
+    summary = jobs.search_summary(
+        "chosen project", 3, 3, replaced=2, originals=1, complete=False
+    )
+    text = jobs.missing_text(missing, summary)
+    assert "Found 3 job(s) in chosen project; 3 still not found" in text
+    assert "compound.gjf \u00d72" in text
+    assert "FAILED; submitted" in text and "RUNNING; submitted" in text
+    assert "older job(s)" in text and "Switched 1" in text and "limit" in text
+
+
+def test_search_prefers_original_and_switches_an_existing_copy(tmp_path):
+    index = jobs.Index()
+    bundle = "a" * 32
+    copies = tmp_path / "research" / "copies"
+    copy = handoff(copies / "water-aaaaaaaa", "water.gjf", bundle)
+    original = handoff(tmp_path / "research" / "originals", "water.gjf", bundle)
+    index.set_folder(copies)
+    index.remember(copy, bundle)
+    report = {}
+    found, missing, _ = jobs.search(
+        tmp_path / "research", [recorded("water.gjf", bundle)], index, report=report
+    )
+    assert found == [original] and not missing
+    assert index.locate(bundle) == ("found", original.resolve())
+    assert report["moves"] == [
+        {
+            "bundle": bundle,
+            "old": str(copy.resolve()),
+            "new": str(original),
+            "original": True,
+        }
+    ]
+    assert copy.is_file()  # Re-pointing never deletes user files or copies.
+
+
+def test_legacy_copy_folders_are_compacted_even_without_saved_copy_root(tmp_path):
+    index = jobs.Index()
+    copies = tmp_path / "copies"
+    first = handoff(copies / "water-aaaaaaaa", "water.gjf", "a" * 32)
+    second = handoff(copies / "ethanol-bbbbbbbb", "ethanol.gjf", "b" * 32)
+    project = tmp_path / "project"
+    index.path.parent.mkdir(parents=True)
+    index.path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "folder": None,
+                "folders": {
+                    str(first.parent): "2026-11-16",
+                    str(second.parent): "2026-11-16",
+                    str(project): "2026-11-16",
+                },
+                "handoffs": {
+                    "a" * 32: {"input": str(first)},
+                    "b" * 32: {"input": str(second)},
+                },
+            }
+        )
+    )
+    assert set(index.folders()) == {copies, project}
+    index.remember(second, "b" * 32)
+    assert set(json.loads(index.path.read_text())["folders"]) == {
+        str(copies),
+        str(project),
+    }
+
+
+@pytest.mark.parametrize(
+    "state", ["FAILED", "COMPLETED", "RUNNING", "UNKNOWN", "SUBMISSION_UNKNOWN"]
+)
+def test_newer_receipt_needs_lineage_and_never_hides_live_or_uncertain_work(
+    tmp_path, state
+):
+    index = jobs.Index()
+    old, new = "a" * 32, "b" * 32
+    copy = handoff(tmp_path / "copies" / "water-aaaaaaaa", "water.gjf", old)
+    original = handoff(tmp_path / "project", "water.gjf", new)
+    index.remember(copy, old)
+    older = {**job(state, days=2, name="water.gjf"), "bundle": old}
+    newer = {**job("PREPARED", days=1, name="water.gjf"), "bundle": new}
+    report = {}
+    # A different project with the same name is insufficient, even with newer dates.
+    jobs.search(tmp_path, [older], index, all_jobs=[older, newer], report=report)
+    assert report["replaced"] == 0
+    jobs.receipt_for(original).with_name(
+        original.name + ".inkly.json.rerun-old.bak"
+    ).write_text(json.dumps({"bundle": old}))
+    report = {}
+    found, missing, _ = jobs.search(
+        tmp_path, [older], index, all_jobs=[older, newer], report=report
+    )
+    ended = state in {"FAILED", "COMPLETED"}
+    assert report["replaced"] == int(ended)
+    assert found == ([] if ended else [copy])
+    assert not missing
+    if ended:
+        assert index.locate(old)[0] == "replaced"
+        # Explicit History selections can still recover that older handoff.
+        assert jobs.search(
+            tmp_path, [older], index, all_jobs=[older, newer], include_replaced=True
+        )[0] == [copy]
+
+
+def test_copy_fallback_is_remembered_after_one_search_with_accurate_counts(tmp_path):
+    index = jobs.Index()
+    copy = handoff(tmp_path / "copies" / "water-aaaaaaaa", "water.gjf", "a" * 32)
+    index.remember(copy, "a" * 32)
+    root = tmp_path / "project"
+    root.mkdir()
+    report = {}
+    target = {**recorded("water.gjf", "a" * 32), "local_copy": str(copy)}
+    found, missing, _ = jobs.search(root, [target], index, report=report)
+    assert found == [copy] and not missing
+    assert report["found_count"] == 0 and report["copies"] == 1
+    assert index.original_checked("a" * 32)
+    index.remember(copy, "a" * 32)
+    assert index.original_checked("a" * 32)  # Normal preview does not reset this.
+
+
+def test_cross_endpoint_receipt_does_not_displace_a_copy(tmp_path):
+    index = jobs.Index()
+    copy = handoff(tmp_path / "copies" / "water-aaaaaaaa", "water.gjf", "a" * 32)
+    original = handoff(tmp_path / "project", "water.gjf", "a" * 32)
+    jobs.receipt_for(original).write_text(
+        json.dumps({"bundle": "a" * 32, "host": "different.example"})
+    )
+    index.remember(copy, "a" * 32)
+    found, missing, _ = jobs.search(
+        tmp_path,
+        [recorded("water.gjf", "a" * 32)],
+        index,
+        connection={"host": "expected.example"},
+    )
+    assert found == [copy] and not missing
+
+
+def test_finding_only_a_copy_keeps_a_valid_known_original(tmp_path):
+    index = jobs.Index()
+    original = handoff(tmp_path / "project", "water.gjf", "a" * 32)
+    copy = handoff(tmp_path / "copies" / "water-aaaaaaaa", "water.gjf", "a" * 32)
+    index.remember(original, "a" * 32)
+    jobs.search(copy.parent, [recorded("water.gjf", "a" * 32)], index)
+    assert index.locate("a" * 32) == ("found", original.resolve())

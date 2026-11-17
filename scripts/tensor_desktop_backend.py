@@ -630,47 +630,74 @@ class DesktopController:
         return self.session.exchange({"action": "jobs"}, receipt=receipt)
 
     def load_jobs(self, settings, bundles=None):
-        """Find jobs to put in the list without Add files.
-
-        Without `bundles`: pending and running jobs, and jobs that ended in the
-        last few days. With `bundles` (from Job history): exactly those jobs.
-        Files found on this computer are added as they are; the window asks
-        where to keep a copy of the others.
-        """
+        """Resolve default recent work, or explicit History selections."""
         settings = picker.validate_settings(dict(settings))
         listing = self.listing(settings, "Load my jobs")
         if listing is None:
             return
-        if bundles is None:
-            chosen = jobs.load_set(listing["jobs"])
-        else:
-            wanted = set(bundles)
-            chosen = [job for job in listing["jobs"] if job["bundle"] in wanted]
-        found, restore, replaced = [], [], 0
+        all_jobs = listing["jobs"]
+        from_history = bundles is not None
+        chosen = (
+            jobs.load_set(all_jobs)
+            if not from_history
+            else [job for job in all_jobs if job["bundle"] in set(bundles)]
+        )
+        folders = self.index.folders()
+        replaced, candidates = 0, []
         for job in chosen:
             kind, path = self.index.locate(job["bundle"])
-            if kind == "found":
-                found.append(str(path))
-            elif kind == "replaced" and bundles is None:
-                replaced += 1  # Run again gave the file a newer job.
-            else:
-                restore.append(job)
-        if restore:
-            # Not in the list of files: look beside inputs in folders used before.
-            extra, restore = jobs.find_in_folders(
-                restore, self.index.folders(), self.index
-            )
-            found += [str(path) for path in extra]
+            if (
+                kind == "replaced"
+                and self.index.is_replaced(job["bundle"])
+                and not from_history
+                and picker.state_name(job.get("state"))
+                not in (set(picker.ACTIVE) | {"UNKNOWN", "SUBMISSION_UNKNOWN"})
+            ):
+                replaced += 1
+                continue
+            candidates.append(job)
+            if path is not None:
+                folders.append(path.parent)
+        report = {}
+        found, restore = jobs.find_in_folders(
+            candidates,
+            folders,
+            self.index,
+            report=report,
+            connection=settings,
+            all_jobs=all_jobs,
+            include_replaced=from_history,
+        )
+        # Legacy copy mappings get one chance to locate originals. Once the
+        # researcher searches or accepts the copies, future loads are quiet.
+        for job in candidates:
+            kind, path = self.index.locate(job["bundle"])
+            if (
+                kind == "found"
+                and jobs.is_copy(path, job["bundle"])
+                and not self.index.original_checked(job["bundle"])
+            ):
+                if path in found:
+                    found.remove(path)
+                    restore.append({**job, "local_copy": str(path)})
         self.audit("desktop_jobs", {"action": "load", "count": len(chosen)})
         self.emit(
             "jobs_found",
             {
-                "paths": found,
+                "paths": [str(path) for path in found],
                 "restore": restore,
-                "replaced": replaced,
+                "replaced": replaced + report.get("replaced", 0),
+                "moves": report.get("moves", []),
+                "cancelled": sum(
+                    picker.state_name(job.get("state")) == "CANCELLED"
+                    for job in all_jobs
+                )
+                if not from_history
+                else 0,
                 "settings": settings,
+                "jobs": all_jobs,
                 "unavailable": listing.get("unavailable", []),
-                "from_history": bundles is not None,
+                "from_history": from_history,
             },
         )
 
@@ -706,14 +733,19 @@ class DesktopController:
         self.audit("desktop_jobs", {"action": "restore", "count": len(paths)})
         self.emit("jobs_restored", {"paths": paths})
 
-    def search_jobs(self, missing, root):
-        """Look through a folder the researcher chose for jobs not found yet.
-
-        Needs no HPC connection. Folders where inputs are found are remembered,
-        so the next Load my jobs finds them without asking.
-        """
+    def search_jobs(self, missing, root, context=None):
+        """Search local receipts only; never opens or changes an HPC connection."""
+        context = context or {}
+        report = {}
         found, missing, complete = jobs.search(
-            Path(root), missing, self.index, check=self.check_stop
+            Path(root),
+            missing,
+            self.index,
+            check=self.check_stop,
+            report=report,
+            connection=context.get("settings"),
+            all_jobs=context.get("jobs"),
+            include_replaced=context.get("from_history", False),
         )
         self.audit("desktop_jobs", {"action": "search", "count": len(found)})
         self.emit(
@@ -723,6 +755,11 @@ class DesktopController:
                 "missing": missing,
                 "complete": complete,
                 "root": str(root),
+                "replaced": report.get("replaced", 0),
+                "found_count": report.get("found_count", len(found)),
+                "copies": report.get("copies", 0),
+                "moves": report.get("moves", []),
+                "context": context,
             },
         )
 
@@ -733,7 +770,7 @@ class DesktopController:
         if listing is None:
             return
         self.audit("desktop_jobs", {"action": "history", "count": len(listing["jobs"])})
-        self.emit("history", listing)
+        self.emit("history", {**listing, "settings": settings})
 
     def endpoint_supports(self, operation, receipt):
         """Ask the HPC copy of Inkly; older copies answer "Unsupported operation"."""
