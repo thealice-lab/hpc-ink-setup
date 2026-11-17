@@ -78,6 +78,22 @@ DESKTOP_FIELDS = {
         "count": int,
     },
     "desktop_stop": {},
+    # Setting up Inkly on the HPC: stage, outcome and duration only, never paths.
+    "desktop_setup": {
+        "stage": {
+            "start",
+            "preflight",
+            "lock",
+            "code",
+            "install",
+            "verify",
+            "session",
+            "done",
+        },
+        "outcome": {"ok", "unchanged", "failed"},
+        "mode": {"auto", "repair"},
+        "seconds": int,
+    },
     "desktop_error": {
         "action": {
             "test_connection",
@@ -91,6 +107,7 @@ DESKTOP_FIELDS = {
             "restore_jobs",
             "history",
             "search_jobs",
+            "setup_hpc",
             "close",
         },
         "code": {"interrupted", "permission", "io", "validation", "unexpected"},

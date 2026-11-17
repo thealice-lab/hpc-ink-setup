@@ -7,10 +7,12 @@ from pathlib import Path
 import queue
 import shutil
 import threading
+import time
 import uuid
 
 import tensor_bridge as bridge
 import tensor_desktop_jobs as jobs
+import tensor_desktop_setup as setup
 import tensor_picker as picker
 from inkly.core.desktop_diagnostics import DesktopJournal
 
@@ -243,6 +245,129 @@ class DesktopController:
                     + "."
                 )
         message += " No input was prepared and no Slurm command was run."
+        self.emit("notice", message)
+
+    SETUP_STAGES = {"preflight", "lock", "code", "install", "verify"}
+
+    def setup_hpc(self, settings, mode="auto", shared_logging=True):
+        """Install or update full Inkly on the HPC, then continue as a session.
+
+        One sign-in: the bundled script runs the repository's own setup.sh for
+        this Desktop's release and hands the same connection to the installed
+        launcher. It runs no Slurm command and deletes nothing.
+        """
+        settings = picker.validate_settings(dict(settings))
+        release = setup.target()
+        remote = bridge.setup_command(
+            setup.script(),
+            commit=release["commit"],
+            version=release["version"],
+            repository=setup.REPOSITORY,
+            mode=mode,
+            shared_logging=shared_logging,
+        )
+        ssh = shutil.which("ssh")
+        if not ssh:
+            raise ValueError(
+                "Windows OpenSSH Client is missing. Install it through your institution's software setup."
+            )
+        connection = {**settings, "ink_path": setup.LAUNCHER}
+        self.close()
+        self.audit("desktop_setup", {"stage": "start", "mode": mode})
+        started = time.monotonic()
+        stage = "preflight"
+
+        def progress(frame):
+            nonlocal stage
+            if frame.get("stage") in self.SETUP_STAGES:
+                stage = frame["stage"]
+            if isinstance(frame.get("line"), str):
+                self.emit(
+                    "setup_progress", {"stage": stage, "line": frame["line"][:400]}
+                )
+
+        self.emit(
+            "message",
+            f"Setting up Inkly {release['version']} on the HPC. Complete the separate "
+            "SSH sign-in dialog if prompted; this can take a few minutes.",
+        )
+        stack = ExitStack()
+        try:
+            stack.enter_context(picker.authentication(connection, self.askpass))
+            session = stack.enter_context(
+                bridge.Session(connection, ssh, remote=remote)
+            )
+            done = session.run_setup(progress)
+            stage = "session"
+            response = session.exchange(
+                {"action": "version"},
+                receipt={**connection, "bundle": uuid.uuid4().hex},
+            )
+            if response.get("version") != release["version"]:
+                raise ValueError(
+                    f"After setup the HPC reported Inkly {response.get('version')}, "
+                    f"not {release['version']}."
+                )
+        except BaseException:
+            self.audit(
+                "desktop_setup",
+                {
+                    "stage": stage,
+                    "outcome": "failed",
+                    "seconds": int(time.monotonic() - started),
+                },
+            )
+            stack.close()
+            raise
+        changed = done.get("changed") is True
+        self.audit(
+            "desktop_setup",
+            {
+                "stage": "done",
+                "outcome": "ok" if changed else "unchanged",
+                "seconds": int(time.monotonic() - started),
+            },
+        )
+        capabilities = [
+            value
+            for value in response.get("capabilities", [])
+            if isinstance(value, str)
+        ]
+        if settings["ink_path"] == setup.LAUNCHER:
+            # Desktop already uses this launcher: keep the signed-in session.
+            session.diagnostics = self.journal
+            self.stack, self.session = stack, session
+            self.target = tuple(
+                connection.get(key) for key in ("host", "ink_path", "auth")
+            )
+        else:
+            stack.close()
+        self.emit(
+            "setup_result",
+            {
+                "version": release["version"],
+                "commit": release["commit"],
+                "changed": changed,
+                "capabilities": capabilities,
+                "launcher": setup.LAUNCHER,
+            },
+        )
+        if changed:
+            message = (
+                f"Inkly {release['version']} is installed on the HPC (commit "
+                f"{release['commit'][:12]}). In an HPC terminal, `ink` works after a new login."
+            )
+        else:
+            message = (
+                f"Inkly {release['version']} on the HPC is already up to date; nothing "
+                "was changed."
+            )
+        if settings["ink_path"] != setup.LAUNCHER:
+            message += (
+                f" This Desktop still uses {settings['ink_path']}; set the HPC launcher "
+                f"to {setup.LAUNCHER} in Connection settings to use the new copy."
+            )
+        message += " No Slurm command was run and nothing was deleted."
         self.emit("notice", message)
 
     def preview(self, paths, settings, recover_bundles=None):
@@ -983,6 +1108,8 @@ class DesktopController:
         try:
             if action == "test_connection":
                 self.test_connection(*args)
+            elif action == "setup_hpc":
+                self.setup_hpc(*args)
             elif action == "preview":
                 self.preview(*args)
             elif action == "submit":
@@ -1031,6 +1158,8 @@ class DesktopController:
             self.emit(
                 "error",
                 str(error)
+                if action == "setup_hpc"
+                else str(error)
                 + "\nKeep the receipts beside your inputs. Preview the same files to check their recorded jobs before retrying.",
             )
         finally:

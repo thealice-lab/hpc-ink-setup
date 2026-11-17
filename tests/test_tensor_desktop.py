@@ -2721,3 +2721,173 @@ def test_native_partial_search_prompt_includes_the_result_and_repeat_count(
         root.after_cancel(guard)
         app.busy, app.action = False, None
         app.close()
+
+
+RELEASE = {"version": "0.6.0", "commit": "c" * 40}
+
+
+@pytest.fixture
+def hpc_setup(monkeypatch):
+    """A controller whose SSH session runs the setup, then answers version."""
+    state = SimpleNamespace(sessions=[], events=[], failure=None, version="0.6.0")
+    state.done = {"done": True, "ok": True, "changed": True, "commit": "c" * 40}
+
+    class SetupSession:
+        def __init__(self, connection, ssh, remote=None):
+            self.connection, self.remote, self.closed = connection, remote, False
+            self.diagnostics = None
+            self.process = SimpleNamespace(terminate=lambda: None)
+            state.sessions.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.closed = True
+
+        def run_setup(self, progress):
+            progress({"stage": "preflight", "line": "bash 5.1.8"})
+            progress({"stage": "install", "line": "Installing Inkly"})
+            if state.failure:
+                raise ValueError(state.failure)
+            return state.done
+
+        def exchange(self, request, *, receipt=None):
+            assert request == {"action": "version"}
+            return {
+                "bundle": receipt["bundle"],
+                "version": state.version,
+                "capabilities": ["prepare", "submit", "version"],
+            }
+
+    monkeypatch.setattr(backend.bridge, "Session", SetupSession)
+    monkeypatch.setattr(backend.shutil, "which", lambda name: "ssh.exe")
+    monkeypatch.setattr(backend.setup, "target", lambda: dict(RELEASE))
+    state.controller = backend.DesktopController(
+        lambda *event: state.events.append(event), interval=0
+    )
+    yield state
+    state.controller.close()
+    state.controller.journal.close()
+
+
+def setup_events(state, kind):
+    return [data for event, data in state.events if event == kind]
+
+
+def test_setup_hpc_installs_this_release_over_one_sign_in(hpc_setup):
+    c = hpc_setup.controller
+    c.execute("setup_hpc", SETTINGS)
+    [session] = hpc_setup.sessions
+    assert session.connection["ink_path"] == "~/.inkly/bin/ink"
+    payload = session.remote.split(" P=", 1)[1].split(";", 1)[0]
+    assert base64.b64decode(payload) == backend.setup.script()
+    assert f"'C={'c' * 40}; V=0.6.0; " in session.remote
+    assert " M=auto; S=1; " in session.remote
+    assert setup_events(hpc_setup, "setup_progress") == [
+        {"stage": "preflight", "line": "bash 5.1.8"},
+        {"stage": "install", "line": "Installing Inkly"},
+    ]
+    [result] = setup_events(hpc_setup, "setup_result")
+    assert result["changed"] is True and result["version"] == "0.6.0"
+    [notice] = setup_events(hpc_setup, "notice")
+    assert "Inkly 0.6.0 is installed" in notice and "No Slurm command" in notice
+    # Desktop already uses ~/.inkly/bin/ink, so the signed-in session is kept.
+    assert c.session is session and not session.closed
+    assert not setup_events(hpc_setup, "error")
+    c.execute("close")
+    common = {"client_session", "sequence", "occurred_at"}
+    records = [
+        {k: v for k, v in e["payload"].items() if k not in common}
+        for e in c.journal.take()
+        if e["event_type"] == "desktop_setup"
+    ]
+    assert records[0] == {"stage": "start", "mode": "auto"}
+    assert records[1]["stage"] == "done" and records[1]["outcome"] == "ok"
+    assert set(records[1]) == {"stage", "outcome", "seconds"}
+
+
+def test_setup_hpc_for_another_launcher_explains_the_switch(hpc_setup):
+    c = hpc_setup.controller
+    hpc_setup.done = {**hpc_setup.done, "changed": False}
+    settings = {**SETTINGS, "ink_path": "~/inkly-desktop-endpoint/ink"}
+    c.execute("setup_hpc", settings, "repair", False)
+    [session] = hpc_setup.sessions
+    assert " M=repair; S=0; " in session.remote
+    assert session.closed and c.session is None
+    [notice] = setup_events(hpc_setup, "notice")
+    assert "already up to date" in notice
+    assert "still uses ~/inkly-desktop-endpoint/ink" in notice
+
+
+def test_setup_hpc_failure_shows_only_the_setups_message(hpc_setup):
+    c = hpc_setup.controller
+    hpc_setup.failure = "~/.inkly/src/hpc-ink-setup has local changes."
+    c.execute("setup_hpc", SETTINGS)
+    assert setup_events(hpc_setup, "error") == [
+        "~/.inkly/src/hpc-ink-setup has local changes."
+    ]
+    assert hpc_setup.sessions[0].closed and c.session is None
+    assert not setup_events(hpc_setup, "setup_result")
+    c.execute("close")
+    records = c.journal.take()
+    failed = [e["payload"] for e in records if e["event_type"] == "desktop_setup"][-1]
+    assert failed["outcome"] == "failed" and failed["stage"] == "install"
+    assert "src" not in json.dumps(records)
+    assert any(
+        e["payload"].get("action") == "setup_hpc"
+        for e in records
+        if e["event_type"] == "desktop_error"
+    )
+
+
+def test_setup_hpc_checks_the_version_after_the_handover(hpc_setup):
+    hpc_setup.version = "0.5.1"
+    hpc_setup.controller.execute("setup_hpc", SETTINGS)
+    [error] = setup_events(hpc_setup, "error")
+    assert "reported Inkly 0.5.1, not 0.6.0" in error
+
+
+def test_setup_target_of_a_build_is_the_recorded_commit(tmp_path, monkeypatch):
+    from inkly import __version__
+
+    setup = backend.setup
+    monkeypatch.setattr(setup.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(setup.sys, "_MEIPASS", str(tmp_path), raising=False)
+    with pytest.raises(ValueError, match="does not record which release"):
+        setup.target()
+    info = tmp_path / "desktop_build.json"
+    info.write_text(json.dumps({"version": __version__, "commit": "d" * 40}))
+    assert setup.target() == {"version": __version__, "commit": "d" * 40}
+    info.write_text(json.dumps({"version": "0.0.1", "commit": "d" * 40}))
+    with pytest.raises(ValueError, match="differs from this Desktop"):
+        setup.target()
+    info.write_text(json.dumps({"version": __version__, "commit": "d" * 7}))
+    with pytest.raises(ValueError, match="which commit"):
+        setup.target()
+
+
+def test_setup_target_of_a_source_run_is_the_committed_head():
+    import subprocess
+
+    from inkly import __version__
+
+    repo = Path(backend.setup.__file__).resolve().parents[1]
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        committed = subprocess.run(
+            ["git", "-C", str(repo), "show", "HEAD:inkly/__init__.py"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        pytest.skip("not a Git checkout")
+    if f'"{__version__}"' not in committed:
+        pytest.skip("the version change is not committed yet")
+    assert backend.setup.target() == {"version": __version__, "commit": head}
