@@ -24,6 +24,14 @@ class MissingBundleError(ValueError):
     """The HPC no longer has the bundle referenced by a saved receipt."""
 
 
+class MissingLauncherError(ValueError):
+    """The configured Inkly launcher is missing or broken on the HPC."""
+
+
+class HostKeyError(ValueError):
+    """This computer does not trust the HPC's SSH host key yet."""
+
+
 SETUP_PREFIX = b"INKLY-SETUP "
 # Windows allows 32,767 characters per command line; keep room for ssh options.
 SETUP_COMMAND_LIMIT = 30000
@@ -210,6 +218,20 @@ class Session:
         """Explain a closed connection without echoing the remote's own text."""
         self.error_reader.join(timeout=1)
         error = self.error_tail.lower()
+        ink = self.receipt.get("ink_path", "")
+        path = (ink[2:] if ink.startswith("~/") else ink).lower().encode()
+        # bash: ".../ink: No such file or directory"; csh: ".../ink: Command not
+        # found."; a deleted Python environment: ".../ink: ...: bad interpreter".
+        missing = path and (
+            path + b": no such file or directory" in error
+            or path + b": command not found" in error
+            or (path + b": " in error and b"bad interpreter" in error)
+        )
+        if missing:
+            return MissingLauncherError(
+                f"Inkly is not installed at {ink} on the HPC, or that copy is "
+                "incomplete. Use Set up Inkly on the HPC in Connection settings."
+            )
         if b"could not resolve hostname" in error:
             return ValueError(
                 "Cannot resolve SSH host; check the network/VPN and resume"
@@ -219,7 +241,7 @@ class Session:
                 "SSH authentication denied; complete the local sign-in and resume"
             )
         if b"host key verification failed" in error:
-            return ValueError(
+            return HostKeyError(
                 "SSH host key is not trusted; verify it through the established site procedure"
             )
         return ValueError(default)

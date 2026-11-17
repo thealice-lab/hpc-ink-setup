@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,47 @@ import tensor_desktop_setup as hpc_setup
 import tensor_desktop_status as status
 import tensor_picker as picker
 from tensor_desktop_backend import DesktopController
+
+
+# pip's upgrade advice is noise for researchers; setup's own log keeps it.
+PIP_NOTICES = (
+    "WARNING: You are using pip version",
+    "You should consider upgrading via",
+)
+
+SHARED_LOGGING_NOTICE = (
+    "In a new install, Inkly's default configuration shares your Inkly chats "
+    "with your lab's Unix group in a folder on scratch, to help improve Inkly. "
+    "Chats may contain personal details, cluster information and unpublished "
+    "work, so never enter passwords, credentials, tokens or private keys. You "
+    "can change this later in ~/.inkly/config.toml. An existing config.toml is "
+    "kept as it is, and this choice does not change it."
+)
+
+
+def setup_summary(host, mode, release):
+    """Exactly what Set up, Update or Repair does on the HPC."""
+    return (
+        f"Inkly Desktop will sign in to {host} once and install Inkly "
+        f"{release['version']} (commit {release['commit'][:12]}) from "
+        + hpc_setup.REPOSITORY.removeprefix("https://").removesuffix(".git")
+        + ", the same as a manual install:\n\n"
+        "  •  Download that commit into ~/.inkly/src/hpc-ink-setup and run its setup.sh.\n"
+        "  •  Create or reuse ~/.inkly: the Python environment (venv), Inkly itself "
+        "(lib), the ink launcher (bin), and your settings and history.\n"
+        "  •  Install Python packages from PyPI, and the Gaussian docs scraper in "
+        "~/.inkly/src/gaussian-docs-scraper.\n"
+        "  •  Add ~/.inkly/bin to PATH in ~/.bashrc if it is not there, so ink "
+        "works in an HPC terminal after a new login.\n\n"
+        + (
+            "Repair runs setup.sh again even if Inkly is already up to date.\n\n"
+            if mode == "repair"
+            else "If Inkly is already up to date, nothing is changed.\n\n"
+        )
+        + "No Slurm commands are run and nothing is deleted. It never downgrades "
+        "and never overwrites your own changes. It usually takes under a minute; "
+        "if it stops, running it again is safe."
+    )
 
 
 def bundled_askpass():
@@ -94,6 +136,13 @@ class DesktopApp:
         self.jobs_index = jobs.Index()
         self.history_window = None
         self.history_listing = None
+        # Inkly on the HPC: what Test connection last found, and the offers
+        # (set up, switch the launcher, first sign-in) shown once idle.
+        self.hpc_state = None
+        self.setup_window = None
+        self.setup_offer = None
+        self.setup_done = None
+        self.host_untrusted = False
         self.events = queue.Queue()
         self.commands = queue.Queue()
         self.controller = controller_factory(
@@ -391,6 +440,7 @@ class DesktopApp:
                 "restore_jobs": "Copying jobs that are not on this computer…",
                 "search_jobs": "Looking for your input files in the chosen folder…",
                 "history": "Reading your job history…",
+                "setup_hpc": "Setting up Inkly on the HPC (one sign-in; usually under a minute)…",
             }[action]
         )
         self.progress.start(12)
@@ -442,6 +492,25 @@ class DesktopApp:
                 self.log(
                     f"Using {data['host']} with {data['ink_path']}. Saved handoffs retain their original connection and settings."
                 )
+            elif kind == "hpc_install":
+                self.hpc_state = data
+                if data.get("offer"):
+                    self.setup_offer = data
+            elif kind == "host_untrusted":
+                self.host_untrusted = True
+            elif kind == "setup_progress":
+                if not data["line"].startswith(PIP_NOTICES):
+                    self.log("HPC setup: " + data["line"])
+            elif kind == "setup_result":
+                self.setup_done = data
+                if self.settings["ink_path"] == data["launcher"]:
+                    self.hpc_state = {
+                        "state": "current",
+                        "version": data["version"],
+                        "desktop": data["version"],
+                        "launcher": data["launcher"],
+                        "offer": False,
+                    }
             elif kind == "request_error":
                 # Something asked for during the watch was not done; watching continues.
                 self.log(data)
@@ -460,7 +529,16 @@ class DesktopApp:
                 self.status.configure(
                     text="Stopped. See the message below; recorded jobs are preserved."
                 )
-                messagebox.showerror("Handoff stopped", data, parent=self.root)
+                if self.setup_offer or self.host_untrusted:
+                    pass  # The offer that follows explains what happened.
+                elif self.action == "setup_hpc":
+                    messagebox.showerror(
+                        "HPC setup stopped",
+                        data + "\n\nNothing was deleted. Running setup again is safe.",
+                        parent=self.root,
+                    )
+                else:
+                    messagebox.showerror("Handoff stopped", data, parent=self.root)
             elif kind == "done":
                 if self.stop_deadline:
                     self.root.after_cancel(self.stop_deadline)
@@ -520,6 +598,17 @@ class DesktopApp:
                     text="Recovery declined. Saved inputs and receipts are unchanged."
                 )
                 self.buttons()
+        if not self.busy and not self.closed:
+            if self.setup_done:
+                result, self.setup_done = self.setup_done, None
+                self.offer_launcher(result)
+            elif self.host_untrusted:
+                self.host_untrusted = False
+                self.setup_offer = None
+                self.offer_first_sign_in()
+            elif self.setup_offer:
+                offer, self.setup_offer = self.setup_offer, None
+                self.offer_setup(offer)
         if time.monotonic() >= self.next_collection:
             gc.collect()
             self.next_collection = time.monotonic() + GC_INTERVAL_SECONDS
@@ -959,15 +1048,265 @@ class DesktopApp:
                 messagebox.showerror(
                     "Check connection settings", str(error), parent=dialog
                 )
-                return
+                return False
+            if any(settings[key] != self.settings[key] for key in ("host", "ink_path")):
+                self.hpc_state = None  # Found for the old host or launcher.
             self.settings = settings
             self.connection.configure(text=self.connection_text())
             self.invalidate()
             dialog.destroy()
+            return True
+
+        def then(step):
+            # Setup and the first sign-in use the settings shown here.
+            return lambda: step() if save() else None
+
+        hpc = ttk.LabelFrame(frame, text="Inkly on the HPC", padding=12)
+        hpc.grid(row=6, column=0, columnspan=2, sticky="we", pady=(0, 16))
+        ttk.Label(hpc, text=self.hpc_status_text(), wraplength=510).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10)
+        )
+        state = (self.hpc_state or {}).get("state")
+        self.setup_button = ttk.Button(
+            hpc,
+            text="Update Inkly on the HPC…"
+            if state == "outdated"
+            else "Set up Inkly on the HPC…",
+            command=then(lambda: self.setup_hpc("auto")),
+            state="disabled" if state == "current" or self.busy else "normal",
+        )
+        self.setup_button.grid(row=1, column=0, sticky="w")
+        self.repair_button = ttk.Button(
+            hpc,
+            text="Repair…",
+            command=then(lambda: self.setup_hpc("repair")),
+            state="disabled" if self.busy else "normal",
+        )
+        self.repair_button.grid(row=1, column=1, sticky="w", padx=8)
+        self.first_sign_in_button = ttk.Button(
+            hpc,
+            text="First sign-in…",
+            command=then(self.first_sign_in),
+        )
+        self.first_sign_in_button.grid(row=1, column=2, sticky="w")
+        ttk.Label(
+            hpc,
+            text="Set up installs or updates full Inkly in ~/.inkly on your HPC account, "
+            "the same as a manual install. First sign-in lets OpenSSH ask you to "
+            "trust the HPC's host key on this computer.",
+            wraplength=510,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         ttk.Button(
             frame, text="Save settings", command=save, style="Accent.TButton"
-        ).grid(row=6, column=1, sticky="e")
+        ).grid(row=7, column=1, sticky="e")
+
+    def hpc_status_text(self):
+        state = self.hpc_state or {}
+        if state.get("state") == "missing":
+            return (
+                f"Not installed at {state.get('launcher')}, or that copy is incomplete."
+            )
+        if state.get("state") == "outdated":
+            found = state.get("version") or "an older release"
+            return (
+                f"The HPC copy is {found}; this Desktop is {state.get('desktop')}. "
+                "Update installs this Desktop's release."
+            )
+        if state.get("state") == "current":
+            return f"Inkly {state.get('version')} on the HPC is ready for this Desktop."
+        return (
+            "Use Test connection to check the HPC copy of Inkly, or set it up now "
+            "if this account does not have it yet."
+        )
+
+    def setup_hpc(self, mode="auto"):
+        """Confirm, then install or update full Inkly on the HPC (one sign-in)."""
+        if self.busy or not self.settings_ready():
+            return
+        try:
+            release = hpc_setup.target()
+        except ValueError as error:
+            messagebox.showerror("Cannot set up the HPC", str(error), parent=self.root)
+            return
+        shared = self.confirm_setup(mode, release)
+        if shared is None:
+            self.log("HPC setup cancelled; nothing was changed on the HPC.")
+            return
+        self.log(
+            f"Setting up Inkly {release['version']} on {self.settings['host']} "
+            f"(commit {release['commit'][:12]}, {mode})."
+        )
+        self.start("setup_hpc", dict(self.settings), mode, shared)
+
+    def setup_dialog(self, mode, release):
+        """The confirmation window; returns it with its result holder."""
+        verb = (
+            "Repair"
+            if mode == "repair"
+            else "Update"
+            if (self.hpc_state or {}).get("state") == "outdated"
+            else "Set up"
+        )
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"{verb} Inkly on the HPC")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=22)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text=setup_summary(self.settings["host"], mode, release),
+            wraplength=600,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        sharing = ttk.LabelFrame(frame, text="Shared logging", padding=12)
+        sharing.grid(row=1, column=0, columnspan=2, sticky="we", pady=16)
+        ttk.Label(sharing, text=SHARED_LOGGING_NOTICE, wraplength=570).grid(
+            row=0, column=0, sticky="w"
+        )
+        shared = tk.BooleanVar(value=True)  # The configuration's default.
+        ttk.Checkbutton(
+            sharing,
+            text="Share my Inkly chats with the lab (new installs only)",
+            variable=shared,
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        result = {"shared": None}
+
+        def choose(value):
+            result["shared"] = shared.get() if value else None
+            dialog.destroy()
+
+        buttons = {
+            "start": ttk.Button(
+                frame,
+                text=verb,
+                command=lambda: choose(True),
+                style="Accent.TButton",
+            ),
+            "cancel": ttk.Button(frame, text="Cancel", command=lambda: choose(False)),
+        }
+        buttons["cancel"].grid(row=2, column=0, sticky="w")
+        buttons["start"].grid(row=2, column=1, sticky="e")
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+        return dialog, buttons, shared, result
+
+    def confirm_setup(self, mode, release):
+        """True or False for shared logging, or None when cancelled."""
+        dialog, buttons, _, result = self.setup_dialog(mode, release)
+        self.setup_window = dialog
+        dialog.grab_set()
+        buttons["start"].focus_set()
+        self.root.wait_window(dialog)
+        self.setup_window = None
+        return result["shared"]
+
+    def offer_setup(self, offer):
+        missing = offer.get("state") == "missing"
+        if missing:
+            found = (
+                f"Inkly is not installed at {offer.get('launcher')} on the HPC, or "
+                "that copy is incomplete."
+            )
+        else:
+            found = (
+                f"The HPC copy of Inkly ({offer.get('version') or 'an older release'}) "
+                f"cannot do everything this Desktop ({offer.get('desktop')}) needs."
+            )
+        if messagebox.askyesno(
+            "Set up Inkly on the HPC" if missing else "Update Inkly on the HPC",
+            found
+            + "\n\nInkly Desktop can install this Desktop's release in ~/.inkly on "
+            "your HPC account now: one sign-in, usually under a minute, no Slurm "
+            "commands, nothing deleted. You will see exactly what it does first.\n\n"
+            + ("Set it up now?" if missing else "Update it now?"),
+            parent=self.root,
+        ):
+            self.setup_hpc("auto")
+
+    def offer_launcher(self, result):
+        """After setup: use the new copy for new jobs, if Desktop uses another one."""
+        launcher = result["launcher"]
+        if self.settings["ink_path"] == launcher:
+            return
+        if not messagebox.askyesno(
+            "Use the new HPC copy?",
+            f"Inkly {result['version']} is now installed at {launcher}. This Desktop "
+            f"still uses {self.settings['ink_path']}.\n\nUse {launcher} for new jobs? "
+            "Saved jobs keep the launcher recorded in their receipts.",
+            parent=self.root,
+        ):
+            self.log(f"New jobs keep using {self.settings['ink_path']}.")
+            return
+        settings = {**self.settings, "ink_path": launcher}
+        try:
+            picker.save_settings(self.path, settings)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            messagebox.showerror(
+                "Check connection settings", str(error), parent=self.root
+            )
+            return
+        self.settings = settings
+        self.hpc_state = {
+            "state": "current",
+            "version": result["version"],
+            "desktop": result["version"],
+            "launcher": launcher,
+            "offer": False,
+        }
+        self.connection.configure(text=self.connection_text())
+        self.invalidate()
+        self.log(f"New jobs now use {launcher}. Saved jobs keep their own launcher.")
+
+    def offer_first_sign_in(self):
+        if messagebox.askyesno(
+            "Trust the HPC on this computer?",
+            f"This computer does not trust the SSH host key of {self.settings['host']} "
+            "yet, so Inkly Desktop stopped before signing in.\n\nOpen a first sign-in "
+            "window now? OpenSSH shows the host's key fingerprint and asks whether to "
+            "trust it. Type yes only if it matches the fingerprint your HPC site "
+            "publishes, then sign in once. Inkly Desktop uses that trust afterwards.",
+            parent=self.root,
+        ):
+            self.first_sign_in()
+
+    def first_sign_in(self):
+        """Open plain OpenSSH in a console, so it can ask to trust the host key."""
+        host = self.settings["host"]
+        ssh = shutil.which("ssh")
+        if (
+            os.name != "nt"
+            or not ssh
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", host)
+        ):
+            messagebox.showinfo(
+                "First sign-in",
+                f"Open a terminal and run:\n\n    ssh {host} exit\n\nThen use Test connection.",
+                parent=self.root,
+            )
+            return
+        options = ["-o", "StrictHostKeyChecking=ask"]
+        if self.settings["auth"] == "keyboard-interactive":
+            options += [
+                "-o",
+                "PreferredAuthentications=keyboard-interactive",
+                "-o",
+                "PubkeyAuthentication=no",
+            ]
+        # Prompts appear in the console itself, not in Inkly's sign-in dialog.
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("SSH_ASKPASS")
+        }
+        subprocess.Popen(
+            ["cmd.exe", "/c", ssh, *options, host, "exit", "&", "pause"],
+            env=environment,
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
+        self.log(
+            "A first sign-in window opened. When it says the connection closed, use "
+            "Test connection."
+        )
 
     def preview_files(self):
         if (self.busy and not self.watching()) or not self.settings_ready():

@@ -301,20 +301,35 @@ def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
     assert not c.items and c.review_id is None
     assert not list(workflow.paths[0].parent.glob("*.inkly.json"))
     assert before == {path: path.read_bytes() for path in workflow.paths}
+    install = [data for kind, data in workflow.events if kind == "hpc_install"][-1]
+    if probe in {"old", "missing"}:
+        # An unusable copy is not a notice: the window offers to update it.
+        assert not [kind for kind, _ in workflow.events if kind == "notice"]
+        assert install["state"] == "outdated" and install["offer"] is True
+        message = [data for kind, data in workflow.events if kind == "message"][-1]
+        expected = {
+            "old": "too old to report its version",
+            "missing": "lacks operations this Desktop",
+        }[probe]
+        assert expected in message and "No Slurm command was run" in message
+        if probe == "missing":
+            assert "prepare, submit, fetch" in message
+        return
     notice = [data for kind, data in workflow.events if kind == "notice"][-1]
     expected = {
         "current": "supports what this Desktop",
         "older-release": "Inkly (0.4.0) supports what this Desktop",
-        "no-cancel": "Not available until the HPC copy of Inkly is updated: Cancel job.",
-        "old": "cannot report its version",
-        "missing": "lacks operations this Desktop",
+        "no-cancel": "Not available until Inkly on the HPC is updated (Connection settings): Cancel job.",
     }[probe]
     assert expected in notice
     assert "differ" not in notice and "compatib" not in notice
-    if probe == "missing":
-        assert "prepare, submit, fetch" in notice
+    assert install["offer"] is False and install["version"] == workflow.endpoint.get(
+        "version", "0.4.2"
+    )
     if probe in {"current", "older-release"}:
         assert "Not available" not in notice
+    # An earlier compatible release is not a warning; the update is mentioned.
+    assert ("can be installed on the HPC" in notice) == (install["state"] == "outdated")
 
 
 def recorded(workflow, path):
@@ -551,8 +566,10 @@ def test_job_history_lists_every_recorded_job(workflow):
 def test_job_lists_explain_an_older_hpc_copy(workflow, operation):
     w, c = workflow, workflow.controller
     getattr(c, operation)(SETTINGS)
-    notice = [data for kind, data in w.events if kind == "notice"][-1]
-    assert "needs an updated HPC copy of Inkly" in notice
+    message = [data for kind, data in w.events if kind == "message"][-1]
+    assert "needs an updated HPC copy of Inkly" in message
+    offer = [data for kind, data in w.events if kind == "hpc_install"][-1]
+    assert offer["state"] == "outdated" and offer["offer"] is True
     assert not [kind for kind, _ in w.events if kind in {"jobs_found", "history"}]
     assert "jobs" not in actions(w)
 
@@ -2817,7 +2834,10 @@ def test_setup_hpc_for_another_launcher_explains_the_switch(hpc_setup):
     assert session.closed and c.session is None
     [notice] = setup_events(hpc_setup, "notice")
     assert "already up to date" in notice
-    assert "still uses ~/inkly-desktop-endpoint/ink" in notice
+    [result] = setup_events(hpc_setup, "setup_result")
+    # The window offers the switch; saved receipts keep their own launcher.
+    assert result["previous"] == "~/inkly-desktop-endpoint/ink"
+    assert result["launcher"] == "~/.inkly/bin/ink"
 
 
 def test_setup_hpc_failure_shows_only_the_setups_message(hpc_setup):
@@ -2921,3 +2941,405 @@ def test_desktop_build_bundles_the_setup_script_and_its_commit():
         text = (root / ".github/workflows" / workflow).read_text()
         assert "assert result['setup'], result" in text
     assert b"\r" not in (root / "scripts/desktop_hpc_setup.sh").read_bytes()
+
+
+def test_connection_offers_setup_when_inkly_is_missing_on_the_hpc(workflow):
+    c = workflow.controller
+    c.connect(SETTINGS)
+
+    def missing(*args, **kwargs):
+        raise backend.bridge.MissingLauncherError("Inkly is not installed")
+
+    c.session.exchange = missing
+    c.test_connection(SETTINGS)
+    [install] = [data for kind, data in workflow.events if kind == "hpc_install"]
+    assert install["state"] == "missing" and install["offer"] is True
+    assert install["launcher"] == SETTINGS["ink_path"]
+    assert c.session is None  # The remote side closed; the next action signs in again.
+    assert not [kind for kind, _ in workflow.events if kind in {"notice", "error"}]
+    message = [data for kind, data in workflow.events if kind == "message"][-1]
+    assert "not installed at ~/.inkly/bin/ink" in message
+
+
+@pytest.mark.parametrize(
+    "error, action, expected",
+    [
+        ("MissingLauncherError", "preview", "hpc_install"),
+        ("HostKeyError", "preview", "host_untrusted"),
+        ("HostKeyError", "setup_hpc", "host_untrusted"),
+        ("MissingLauncherError", "setup_hpc", None),
+    ],
+)
+def test_failed_actions_offer_the_fix_before_the_error(
+    workflow, monkeypatch, error, action, expected
+):
+    c = workflow.controller
+    failure = getattr(backend.bridge, error)("stopped")
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(c, action, fail)
+    c.execute(action, workflow.paths if action == "preview" else SETTINGS, SETTINGS)
+    kinds = [kind for kind, _ in workflow.events]
+    offers = [k for k in kinds if k in {"hpc_install", "host_untrusted"}]
+    assert offers == ([expected] if expected else [])
+    if expected:
+        assert kinds.index(expected) < kinds.index("error")
+    if expected == "hpc_install":
+        [install] = [d for k, d in workflow.events if k == "hpc_install"]
+        assert install["state"] == "missing" and install["offer"] is True
+
+
+@pytest.mark.parametrize(
+    "version, than, older",
+    [
+        ("0.5.0", "0.6.0", True),
+        ("0.10.0", "0.9.1", False),
+        ("0.6.0", "0.6.0", False),
+        ("0.6.0+local", "0.6.1", True),
+        ("garbage", "0.6.0", False),
+    ],
+)
+def test_release_versions_compare_by_number(version, than, older):
+    assert backend.DesktopController.older(version, than) is older
+
+
+GUI_RELEASE = {"version": "0.6.0", "commit": "f" * 40}
+
+
+def setup_window(workflow, tmp_path, monkeypatch):
+    """A Desktop window whose message boxes fail fast and whose dialogs never wait."""
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    no_message_boxes(monkeypatch, gui)
+    # A grab on a window that is not shown fails in real Tk.
+    monkeypatch.setattr(gui.tk.Toplevel, "grab_set", lambda self: None)
+    monkeypatch.setattr(gui.hpc_setup, "target", lambda: dict(GUI_RELEASE))
+    app.settings = dict(SETTINGS)
+    return gui, app
+
+
+def activity(app):
+    return app.activity.get("1.0", "end")
+
+
+@native_display
+def test_native_connection_settings_offer_set_up_update_and_repair(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    started = []
+    monkeypatch.setattr(app, "setup_hpc", lambda mode: started.append(mode))
+    try:
+        cases = [
+            (None, "Set up Inkly on the HPC…", True, "Use Test connection"),
+            (
+                {"state": "missing", "launcher": "~/.inkly/bin/ink"},
+                "Set up Inkly on the HPC…",
+                True,
+                "Not installed at ~/.inkly/bin/ink",
+            ),
+            (
+                {"state": "outdated", "version": "0.5.0", "desktop": "0.6.0"},
+                "Update Inkly on the HPC…",
+                True,
+                "The HPC copy is 0.5.0; this Desktop is 0.6.0",
+            ),
+            (
+                {"state": "current", "version": "0.6.0"},
+                "Set up Inkly on the HPC…",
+                False,
+                "Inkly 0.6.0 on the HPC is ready",
+            ),
+        ]
+        for state, label, enabled, status in cases:
+            app.hpc_state = state
+            assert status in app.hpc_status_text()
+            app.configure()
+            assert app.setup_button.cget("text") == label
+            assert (str(app.setup_button["state"]) == "normal") is enabled
+            assert str(app.repair_button["state"]) == "normal"
+            # Each button saves the settings shown, closes the window, then acts.
+            app.repair_button.invoke()
+        assert started == ["repair"] * 4
+        app.hpc_state = None
+        app.configure()
+        app.setup_button.invoke()
+        assert started[-1] == "auto"
+        saved = json.loads((tmp_path / "gui-settings.json").read_text())
+        assert {key: saved[key] for key in SETTINGS} == SETTINGS
+    finally:
+        app.busy = False
+        app.close()
+
+
+@native_display
+def test_native_setup_confirmation_lists_every_change_and_the_sharing_choice(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    try:
+        text = gui.setup_summary("researcher@cluster", "auto", GUI_RELEASE)
+        for part in (
+            "Inkly 0.6.0 (commit ffffffffffff)",
+            "github.com/thealice-lab/hpc-ink-setup",
+            "~/.inkly/src/hpc-ink-setup",
+            "setup.sh",
+            "PyPI",
+            "~/.inkly/src/gaussian-docs-scraper",
+            "PATH in ~/.bashrc",
+            "No Slurm commands",
+            "nothing is deleted",
+            "never downgrades",
+            "under a minute",
+        ):
+            assert part in text
+        assert "Repair runs setup.sh again" in gui.setup_summary(
+            "researcher@cluster", "repair", GUI_RELEASE
+        )
+        assert "never enter passwords" in gui.SHARED_LOGGING_NOTICE
+        for state, mode, verb in [
+            (None, "auto", "Set up"),
+            ({"state": "outdated"}, "auto", "Update"),
+            ({"state": "current"}, "repair", "Repair"),
+        ]:
+            app.hpc_state = state
+            dialog, buttons, _, _ = app.setup_dialog(mode, GUI_RELEASE)
+            assert dialog.title() == f"{verb} Inkly on the HPC"
+            assert buttons["start"].cget("text") == verb
+            buttons["cancel"].invoke()
+        app.hpc_state = None
+        for button, opt_out, expected in [
+            ("start", False, True),
+            ("start", True, False),
+            ("cancel", False, None),
+        ]:
+            dialog, buttons, shared, result = app.setup_dialog("auto", GUI_RELEASE)
+            assert shared.get() is True  # The configuration's default.
+            if opt_out:
+                shared.set(False)
+            buttons[button].invoke()
+            assert result["shared"] is expected
+            assert not dialog.winfo_exists()
+    finally:
+        app.close()
+
+
+@native_display
+def test_native_setup_starts_only_after_confirmation(workflow, tmp_path, monkeypatch):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    started, choices, errors = [], [False, None], []
+    monkeypatch.setattr(
+        app, "start", lambda action, *args: started.append((action, args))
+    )
+    monkeypatch.setattr(app, "confirm_setup", lambda mode, release: choices.pop(0))
+    try:
+        app.setup_hpc("auto")
+        assert started == [("setup_hpc", (SETTINGS, "auto", False))]
+        app.setup_hpc("repair")
+        assert len(started) == 1
+        assert "HPC setup cancelled; nothing was changed" in activity(app)
+
+        def unknown():
+            raise ValueError("Cannot tell which commit to install on the HPC.")
+
+        monkeypatch.setattr(gui.hpc_setup, "target", unknown)
+        monkeypatch.setattr(
+            gui.messagebox, "showerror", lambda *args, **kwargs: errors.append(args)
+        )
+        app.setup_hpc("auto")
+        assert errors[-1][0] == "Cannot set up the HPC" and len(started) == 1
+    finally:
+        app.close()
+
+
+@native_display
+@pytest.mark.parametrize("failed", [False, True])
+def test_native_missing_hpc_copy_is_offered_for_setup_without_an_error_box(
+    workflow, tmp_path, monkeypatch, failed
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    asked, setups = [], []
+    monkeypatch.setattr(
+        gui.messagebox,
+        "askyesno",
+        lambda title, text, **kwargs: asked.append((title, text)) or True,
+    )
+    monkeypatch.setattr(app, "setup_hpc", lambda mode: setups.append(mode))
+    try:
+        app.busy, app.action = True, "preview" if failed else "test_connection"
+        app.events.put(
+            (
+                "hpc_install",
+                {
+                    "state": "missing",
+                    "launcher": "~/.inkly/bin/ink",
+                    "version": None,
+                    "desktop": "0.6.0",
+                    "offer": True,
+                },
+            )
+        )
+        if failed:
+            app.events.put(("error", "Inkly is not installed at ~/.inkly/bin/ink"))
+        app.events.put(("done", app.action))
+        app.drain()
+        [(title, text)] = asked
+        assert title == "Set up Inkly on the HPC" and "Set it up now?" in text
+        assert "no Slurm commands, nothing deleted" in text
+        assert setups == ["auto"]
+        assert "Not installed" in app.hpc_status_text()
+    finally:
+        app.busy = False
+        app.close()
+
+
+@native_display
+def test_native_untrusted_host_offers_the_first_sign_in(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    asked, opened = [], []
+    monkeypatch.setattr(
+        gui.messagebox,
+        "askyesno",
+        lambda title, text, **kwargs: asked.append((title, text)) or True,
+    )
+    monkeypatch.setattr(app, "first_sign_in", lambda: opened.append(True))
+    try:
+        app.busy, app.action = True, "test_connection"
+        app.events.put(("host_untrusted", None))
+        app.events.put(("error", "SSH host key is not trusted"))
+        app.events.put(("done", "test_connection"))
+        app.drain()
+        [(title, text)] = asked
+        assert title == "Trust the HPC on this computer?"
+        assert "matches the fingerprint your HPC site publishes" in text
+        assert opened == [True]
+    finally:
+        app.busy = False
+        app.close()
+
+
+@native_display
+@pytest.mark.parametrize("switch", [True, False])
+def test_native_setup_progress_then_the_launcher_switch(
+    workflow, tmp_path, monkeypatch, switch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    app.settings = {**SETTINGS, "ink_path": "~/inkly-desktop-endpoint/ink"}
+    asked, notices = [], []
+    monkeypatch.setattr(
+        gui.messagebox,
+        "askyesno",
+        lambda title, text, **kwargs: asked.append((title, text)) or switch,
+    )
+    monkeypatch.setattr(
+        gui.messagebox, "showinfo", lambda *args, **kwargs: notices.append(args)
+    )
+    try:
+        app.busy, app.action = True, "setup_hpc"
+        for line in (
+            "Installing Inkly Python requirements",
+            "WARNING: You are using pip version 21.3.1; however, version 26.0.1 is available.",
+        ):
+            app.events.put(("setup_progress", {"stage": "install", "line": line}))
+        app.events.put(
+            (
+                "setup_result",
+                {
+                    "version": "0.6.0",
+                    "commit": "f" * 40,
+                    "changed": True,
+                    "capabilities": ["prepare"],
+                    "launcher": "~/.inkly/bin/ink",
+                    "previous": "~/inkly-desktop-endpoint/ink",
+                },
+            )
+        )
+        app.events.put(("notice", "Inkly 0.6.0 is installed on the HPC."))
+        app.events.put(("done", "setup_hpc"))
+        app.drain()
+        assert "HPC setup: Installing Inkly Python requirements" in activity(app)
+        assert "pip version" not in activity(app)
+        assert notices and asked[0][0] == "Use the new HPC copy?"
+        assert "Saved jobs keep the launcher recorded" in asked[0][1]
+        path = tmp_path / "gui-settings.json"
+        if switch:
+            assert app.settings["ink_path"] == "~/.inkly/bin/ink"
+            assert json.loads(path.read_text())["ink_path"] == "~/.inkly/bin/ink"
+            assert "ready for this Desktop" in app.hpc_status_text()
+        else:
+            assert app.settings["ink_path"] == "~/inkly-desktop-endpoint/ink"
+            assert not path.exists()
+    finally:
+        app.busy = False
+        app.close()
+
+
+@native_display
+def test_native_failed_setup_says_running_it_again_is_safe(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    errors = []
+    monkeypatch.setattr(
+        gui.messagebox, "showerror", lambda *args, **kwargs: errors.append(args)
+    )
+    try:
+        app.busy, app.action = True, "setup_hpc"
+        app.events.put(("error", "~/.inkly/src/hpc-ink-setup has local changes."))
+        app.events.put(("done", "setup_hpc"))
+        app.drain()
+        [(title, text)] = [error[:2] for error in errors]
+        assert title == "HPC setup stopped"
+        assert "has local changes" in text and "Running setup again is safe" in text
+    finally:
+        app.busy = False
+        app.close()
+
+
+@native_display
+def test_native_first_sign_in_opens_plain_openssh_in_a_console(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    app.settings = {**SETTINGS, "auth": "keyboard-interactive"}
+    opened, shown = [], []
+    ssh = r"C:\Windows\System32\OpenSSH\ssh.exe"
+    monkeypatch.setattr(
+        gui.subprocess, "Popen", lambda args, **kw: opened.append((args, kw))
+    )
+    monkeypatch.setattr(gui.shutil, "which", lambda name: ssh)
+    monkeypatch.setattr(
+        gui.messagebox, "showinfo", lambda *args, **kwargs: shown.append(args)
+    )
+    monkeypatch.setenv("SSH_ASKPASS", "dialog.exe")
+    try:
+        name = gui.os.name
+        monkeypatch.setattr(gui.os, "name", "nt")
+        try:
+            app.first_sign_in()
+        finally:
+            monkeypatch.setattr(gui.os, "name", name)
+        [(args, kwargs)] = opened
+        assert args[:3] == ["cmd.exe", "/c", ssh]
+        assert "StrictHostKeyChecking=ask" in args
+        assert "PreferredAuthentications=keyboard-interactive" in args
+        assert args[-4:] == ["researcher@cluster", "exit", "&", "pause"]
+        assert "SSH_ASKPASS" not in kwargs["env"]
+        assert "first sign-in window opened" in activity(app)
+        if name != "nt":
+            app.first_sign_in()
+            assert "ssh researcher@cluster exit" in shown[-1][1]
+    finally:
+        app.close()

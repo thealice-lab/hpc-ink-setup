@@ -528,3 +528,43 @@ def test_run_setup_explains_a_failed_sign_in(monkeypatch):
         with pytest.raises(ValueError, match="authentication denied") as error:
             session.run_setup(lambda frame: None)
     assert "private-marker" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "stderr, kind",
+    [
+        (b"bash: /home/alice/.inkly/bin/ink: No such file or directory\n", "missing"),
+        (b"/home/alice/.inkly/bin/ink: Command not found.\n", "missing"),
+        (
+            b"bash: /home/alice/.inkly/bin/ink: /home/alice/.inkly/venv/bin/python: "
+            b"bad interpreter: No such file or directory\n",
+            "missing",
+        ),
+        # A Python error about some other file is not a missing launcher.
+        (b"FileNotFoundError: [Errno 2] No such file or directory: 'x.db'\n", "other"),
+        (b"Host key verification failed.\n", "host"),
+    ],
+)
+def test_closed_session_tells_a_missing_launcher_and_an_untrusted_host_apart(
+    monkeypatch, stderr, kind
+):
+    popen = subprocess.Popen
+    peer = f"import sys; sys.stderr.buffer.write({stderr!r}); sys.exit(127)"
+    monkeypatch.setattr(
+        bridge.subprocess,
+        "Popen",
+        lambda args, **kwargs: popen([sys.executable, "-c", peer], **kwargs),
+    )
+    receipt = {"host": "cluster", "ink_path": "~/.inkly/bin/ink", "bundle": "a" * 32}
+    with bridge.Session(receipt, "ssh") as session:
+        with pytest.raises(ValueError) as error:
+            session.exchange({"action": "version"})
+    expected = {
+        "missing": bridge.MissingLauncherError,
+        "host": bridge.HostKeyError,
+        "other": ValueError,
+    }[kind]
+    assert type(error.value) is expected
+    if kind == "missing":
+        assert "Set up Inkly on the HPC" in str(error.value)
+    assert "alice" not in str(error.value)
