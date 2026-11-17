@@ -191,20 +191,62 @@ class DesktopController:
         "jobs": "Load my jobs and Job history",
     }
 
+    def hpc_install(self, state, settings=None, version=None, offer=False):
+        """What Test connection learned about the HPC copy; offers setup when useful."""
+        from inkly import __version__
+
+        self.emit(
+            "hpc_install",
+            {
+                "state": state,
+                "version": version,
+                "desktop": __version__,
+                "launcher": (settings or {}).get("ink_path"),
+                "offer": offer,
+            },
+        )
+
+    @staticmethod
+    def older(version, than):
+        """True when release version is older than another (X.Y.Z numbers)."""
+
+        def numbers(value):
+            return tuple(
+                int(part) for part in value.split("+")[0].split("-")[0].split(".")
+            )
+
+        try:
+            return numbers(version) < numbers(than)
+        except ValueError:
+            return False
+
     def test_connection(self, settings):
         """Check only the configured SSH endpoint handshake; no bundle or Slurm work."""
+        from inkly import __version__
+
         settings = picker.validate_settings(dict(settings))
         self.connect(settings)
         receipt = {**settings, "bundle": uuid.uuid4().hex}
         try:
             response = self.session.exchange({"action": "version"}, receipt=receipt)
+        except bridge.MissingLauncherError:
+            self.close()
+            self.emit(
+                "message",
+                f"Signed in, but Inkly is not installed at {settings['ink_path']} on "
+                "the HPC, or that copy is incomplete. No Slurm command was run.",
+            )
+            self.hpc_install("missing", settings, offer=True)
+            return
         except ValueError as error:
             if str(error) != "Unsupported operation":
                 raise
             self.emit(
-                "notice",
-                "SSH connected, but this HPC endpoint cannot report its version. Ask the maintainer for a matching Desktop endpoint.",
+                "message",
+                "Connected, but this HPC copy of Inkly is too old to report its "
+                "version. No Slurm command was run.",
             )
+            self.hpc_install("outdated", settings, offer=True)
             return
         version = response.get("version")
         capabilities = response.get("capabilities")
@@ -216,35 +258,41 @@ class DesktopController:
             or not isinstance(capabilities, list)
         ):
             raise ValueError("The HPC endpoint returned an invalid version handshake.")
-        from inkly import __version__
-
         # What matters is whether the HPC copy offers each operation this
         # Desktop uses; release numbers may differ between compatible copies.
         offered = {value for value in capabilities if isinstance(value, str)}
         missing = [op for op in self.REQUIRED_OPERATIONS if op not in offered]
         if missing:
-            message = (
+            self.emit(
+                "message",
                 f"Connected, but the HPC copy of Inkly ({version}) lacks operations "
-                f"this Desktop ({__version__}) needs: {', '.join(missing)}. Ask the "
-                "maintainer to update the HPC copy of Inkly before submitting jobs."
+                f"this Desktop ({__version__}) needs: {', '.join(missing)}. No Slurm "
+                "command was run.",
             )
-        else:
-            message = (
-                f"Connected. The HPC copy of Inkly ({version}) supports what this "
-                f"Desktop ({__version__}) needs to preview, submit and return jobs."
+            self.hpc_install("outdated", settings, version, offer=True)
+            return
+        message = (
+            f"Connected. The HPC copy of Inkly ({version}) supports what this "
+            f"Desktop ({__version__}) needs to preview, submit and return jobs."
+        )
+        absent = [
+            name for op, name in self.OPTIONAL_OPERATIONS.items() if op not in offered
+        ]
+        if absent:
+            message += (
+                " Not available until Inkly on the HPC is updated (Connection "
+                "settings): " + ", ".join(absent) + "."
             )
-            absent = [
-                name
-                for op, name in self.OPTIONAL_OPERATIONS.items()
-                if op not in offered
-            ]
-            if absent:
-                message += (
-                    " Not available until the HPC copy of Inkly is updated: "
-                    + ", ".join(absent)
-                    + "."
-                )
+        # A compatible copy from an earlier release is not a warning, but the
+        # notice says an update is available and Connection settings offers it.
+        outdated = self.older(version, __version__)
+        if outdated:
+            message += (
+                f" Inkly {__version__} can be installed on the HPC from Connection "
+                "settings (Update Inkly on the HPC)."
+            )
         message += " No input was prepared and no Slurm command was run."
+        self.hpc_install("outdated" if outdated else "current", settings, version)
         self.emit("notice", message)
 
     SETUP_STAGES = {"preflight", "lock", "code", "install", "verify"}
@@ -350,6 +398,7 @@ class DesktopController:
                 "changed": changed,
                 "capabilities": capabilities,
                 "launcher": setup.LAUNCHER,
+                "previous": settings["ink_path"],
             },
         )
         if changed:
@@ -361,11 +410,6 @@ class DesktopController:
             message = (
                 f"Inkly {release['version']} on the HPC is already up to date; nothing "
                 "was changed."
-            )
-        if settings["ink_path"] != setup.LAUNCHER:
-            message += (
-                f" This Desktop still uses {settings['ink_path']}; set the HPC launcher "
-                f"to {setup.LAUNCHER} in Connection settings to use the new copy."
             )
         message += " No Slurm command was run and nothing was deleted."
         self.emit("notice", message)
@@ -737,7 +781,7 @@ class DesktopController:
             details = {
                 **item["response"],
                 "logs": [],
-                "unavailable": "This HPC endpoint does not support job details. Ask the maintainer for a matching endpoint.",
+                "unavailable": "This HPC copy of Inkly does not support job details. Update Inkly on the HPC from Connection settings.",
             }
         self.emit("job_details", details)
 
@@ -747,10 +791,10 @@ class DesktopController:
         receipt = {**settings, "bundle": uuid.uuid4().hex}
         if not self.endpoint_supports("jobs", receipt):
             self.emit(
-                "notice",
-                f"{feature} needs an updated HPC copy of Inkly. Ask the maintainer "
-                "to update it; Add files works as before.",
+                "message",
+                f"{feature} needs an updated HPC copy of Inkly; Add files works as before.",
             )
+            self.hpc_install("outdated", settings, offer=True)
             return None
         return self.session.exchange({"action": "jobs"}, receipt=receipt)
 
@@ -836,7 +880,7 @@ class DesktopController:
             self.emit(
                 "notice",
                 f"{len(restore)} job(s) are not on this computer, and copying them "
-                "needs an updated HPC copy of Inkly. Ask the maintainer to update it.",
+                "needs an updated HPC copy of Inkly. Update Inkly on the HPC from Connection settings.",
             )
             self.emit("jobs_restored", {"paths": []})
             return
@@ -1151,6 +1195,15 @@ class DesktopController:
                 else "unexpected"
             )
             self.audit("desktop_error", {"action": action, "code": code})
+            if isinstance(error, bridge.HostKeyError):
+                self.emit("host_untrusted", None)
+            elif (
+                isinstance(error, bridge.MissingLauncherError) and action != "setup_hpc"
+            ):
+                settings = next(
+                    (a for a in args if isinstance(a, dict) and "ink_path" in a), None
+                )
+                self.hpc_install("missing", settings, offer=True)
             self.review_id = None
             self.emit("review", None)
             self.drop_requests()  # Never run a stale cancel during a later check.
