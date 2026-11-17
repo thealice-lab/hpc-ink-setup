@@ -2,6 +2,11 @@
 
 This is the main setup guide for installing and validating Inkly on the Cuttlefish HPC cluster.
 
+Inkly Desktop 0.6.0 and later can perform the installation steps for you
+(Connection settings → **Set up Inkly on the HPC**; see
+[Set up Inkly on the HPC](DESKTOP.md#set-up-inkly-on-the-hpc)). The validation
+checks below still apply.
+
 `dev` is the researcher release candidate. A successful installation does not
 by itself establish documentation availability, independent account access, or
 Windows Desktop acceptance. Complete the checks below before researcher use.

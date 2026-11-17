@@ -104,6 +104,11 @@ elsewhere. Relative script paths below assume you are in the laptop clone.
 
 ## 2. Install and verify the HPC side
 
+**Inkly Desktop users** (0.6.0 and later) can let Desktop do this step:
+Connection settings → **Set up Inkly on the HPC**. See
+[What Desktop's setup runs](#what-desktops-setup-runs) below. The manual steps
+in this section remain the reference.
+
 From laptop PowerShell, connect using the configured account:
 
 ```powershell
@@ -165,6 +170,34 @@ those prerequisites with your site's setup guide. A model service is used by
 Inkly's chat features; the TENSOR file handoff itself does not call it.
 
 Type `exit` to return to **laptop PowerShell**. The remaining commands run there.
+
+### What Desktop's setup runs
+
+Desktop's **Set up Inkly on the HPC** runs `scripts/desktop_hpc_setup.sh` from
+this repository on the HPC, inside the same SSH connection that then continues
+as the Desktop session. It is the same code a manual clone gets:
+
+1. **Checks the login node** before creating anything: bash 4+, Git, Python
+   3.9+ with `venv` and `ensurepip`, 1 GB free in the home folder, and access
+   to GitHub and PyPI.
+2. **Takes a per-account lock** (`~/.inkly/desktop-setup.lock`), so two
+   Desktops cannot set up at once.
+3. **Gets the code** by the full commit SHA that Desktop was built from (or,
+   from source, the checkout's committed `HEAD`). A new checkout is fetched
+   into a temporary folder and renamed to `~/.inkly/src/hpc-ink-setup`. An
+   existing one must be a clean checkout of this repository. It never
+   downgrades an installed copy or a checkout newer than Desktop.
+4. **Runs `bash setup.sh`** from that checkout with no input, which installs
+   or refreshes `~/.inkly` exactly as in the manual steps above. Its output
+   appears in Desktop's Activity and is kept in `~/.inkly/logs/desktop-setup-<time>.log`.
+5. **Verifies** that `~/.inkly/bin/ink` reports Desktop's version, then hands
+   the connection to `~/.inkly/bin/ink tensor --session`.
+
+It runs no Slurm commands, deletes nothing and needs no administrator rights.
+If the same commit is already installed, it changes nothing unless Repair was
+chosen. Turning shared logging off in Desktop only applies to a new
+`~/.inkly/config.toml`. The Gaussian documentation corpus is not provisioned,
+as with `setup.sh` itself.
 
 ## 3. Export from TENSOR and preview the transfer
 

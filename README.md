@@ -29,8 +29,10 @@ This is an **unsigned pre-release**, built by GitHub Actions from `7dc3a0a`.
 Its EXE SHA-256 is
 `728EAABCFB8DDC52F7AE6447A4E6682B510A947F941B71E00EAAE7A6B0E3D1BD`.
 Windows PowerShell 5.1 and Windows OpenSSH Client are required; Python is
-bundled. Actual HPC use also needs the site's network/VPN, verified host key,
-authorized account and a matching Inkly HPC endpoint. See
+bundled. Actual HPC use also needs the site's network/VPN, verified host key
+and an authorized account. From Inkly Desktop 0.6.0, Desktop can install or
+update Inkly on your HPC account itself (Connection settings → **Set up Inkly
+on the HPC**); earlier builds need a matching Inkly HPC endpoint. See
 [Desktop download and testing instructions](docs/DESKTOP.md#download-and-open-inkly-desktop)
 for the install location, troubleshooting and standalone helper use.
 
@@ -214,6 +216,13 @@ work; this file workflow does not imply those tasks are complete.
 > **Cuttlefish users:** Follow [`docs/CUTTLEFISH_SETUP.md`](docs/CUTTLEFISH_SETUP.md) for the current Cuttlefish setup and validation procedure.
 
 This section covers the general user-side installation path.
+
+**Using Inkly Desktop?** From Inkly Desktop 0.6.0, you can skip these steps:
+open Connection settings and choose **Set up Inkly on the HPC**. Desktop signs
+in once, fetches its exact release into `~/.inkly/src/hpc-ink-setup` and runs
+the same `setup.sh`, so the result is the same as the steps below. See
+[Set up Inkly on the HPC](docs/DESKTOP.md#set-up-inkly-on-the-hpc). The
+manual steps stay fully supported.
 
 ### 1. Clone the repository
 

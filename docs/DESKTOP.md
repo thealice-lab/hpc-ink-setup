@@ -4,7 +4,8 @@ Open **InklyDesktop.exe**. The packaged application includes Python, its window
 toolkit and the generic SSH sign-in dialog. Researchers do not need to type a
 command or install Python to use this build. Windows OpenSSH Client, access to
 the site's network/VPN and an account with Gaussian access are still required.
-The HPC must already have the matching Inkly TENSOR endpoint installed.
+If your HPC account does not have Inkly yet, or has an older copy, Desktop can
+install or update it for you: see [Set up Inkly on the HPC](#set-up-inkly-on-the-hpc).
 
 This is a development build for workflow review, not a signed installer.
 Follow your institution's software distribution process; code signing and
@@ -72,6 +73,101 @@ update the helper's version, source commit and EXE SHA-256 (from the release's
 `tests/test_windows_desktop_download.py`. Do not commit ZIP/EXE binaries or
 treat this helper as an HPC deployment tool.
 
+## Set up Inkly on the HPC
+
+From Inkly Desktop 0.6.0, you do not need the HPC command line to install
+Inkly. Desktop installs or updates **full Inkly** on your own HPC account, the
+same as cloning the repository and running `bash setup.sh` yourself. Afterwards
+both Desktop and `ink` in an HPC terminal work.
+
+Open **Connection settings**. The **Inkly on the HPC** section shows what
+**Test connection** last found and has three buttons:
+
+- **Set up Inkly on the HPC** (it reads **Update** when the HPC copy is older
+  than this Desktop) installs this Desktop's release. If the HPC is already
+  up to date, nothing is changed.
+- **Repair** runs `setup.sh` again even when the HPC is up to date, for
+  example after files in `~/.inkly` were removed by mistake.
+- **First sign-in** is for a computer that has not connected to this HPC
+  before (see below).
+
+Each button first saves the settings shown. You don't have to look for this
+section: when Test connection, Load my jobs, Job history or a preview finds
+Inkly missing on the HPC, or too old for this Desktop, Desktop asks whether
+to set it up now. An older copy that still offers everything this Desktop
+needs keeps working; the Test connection message then says an update is
+available.
+
+### What setup does on the HPC
+
+Before anything runs, Desktop shows exactly what will happen and waits for
+**Set up**, **Update** or **Repair**. It then signs in **once** (password
+and Duo as usual), and the same connection continues as your normal Desktop
+session. Setup:
+
+- downloads this Desktop's exact release commit from
+  github.com/thealice-lab/hpc-ink-setup into `~/.inkly/src/hpc-ink-setup`
+  (public: no GitHub account is needed), then runs its own `setup.sh`;
+- creates or reuses `~/.inkly`: the Python environment (`venv`), Inkly itself
+  (`lib`), the `ink` launcher (`bin`), and your settings and history;
+- installs Python packages from PyPI, and the Gaussian docs scraper in
+  `~/.inkly/src/gaussian-docs-scraper`;
+- adds `~/.inkly/bin` to `PATH` in `~/.bashrc` if it is not there yet, so `ink`
+  works in an HPC terminal after a new login.
+
+It runs **no Slurm commands**, **deletes nothing**, never downgrades a newer
+HPC copy and never overwrites your own changes. It usually takes under a
+minute, and each step appears in Activity. A full log stays on the HPC in
+`~/.inkly/logs/desktop-setup-<time>.log`. Your own clone in
+`~/hpc-ink-setup`, if you have one, is not used or changed.
+
+**Shared logging.** In a new install, Inkly's default configuration shares
+your Inkly chats with your lab's Unix group in a folder on scratch, to help
+improve Inkly. The confirmation explains this and has a checkbox to turn it
+off. The checkbox only affects a new `~/.inkly/config.toml`; an existing one
+is kept as it is. You can change it later in that file. Chats may contain
+personal details, cluster information and unpublished work, so never enter
+passwords, credentials, tokens or private keys.
+
+**After setup**, if Desktop was using another launcher (for example an older
+copy elsewhere), it asks whether to use `~/.inkly/bin/ink` for new jobs.
+Saved jobs keep the launcher recorded in their receipts, so you can still
+check and return them.
+
+### If setup stops
+
+The message says what happened, and running setup again is always safe: it
+continues where it stopped. Common reasons:
+
+| Message | What to do |
+| --- | --- |
+| The HPC copy is newer than this Desktop | Get the newer Inkly Desktop release. Setup never downgrades. |
+| `~/.inkly/src/hpc-ink-setup` has local changes, or is another repository | Commit or move those changes, or move the folder aside, then retry. Setup never overwrites them. |
+| Another Inkly setup is already running | Wait for it to finish (for example in another Desktop window), then retry. |
+| Cannot reach GitHub or the Python package index | The login node needs internet access for setup. Ask your site how to install software from login nodes. |
+| Python 3.9 or newer with venv is needed, or too little free space | Load a newer Python as your site describes, or free space in your home folder (1 GB is needed). |
+
+### First sign-in on a new computer
+
+Desktop's connections always check the HPC's SSH host key strictly. On a
+computer that has never connected to this HPC, Desktop stops with a message
+that the host key is not trusted, and offers **First sign-in**. That opens
+plain OpenSSH in a console window, which shows the HPC's key fingerprint and
+asks whether to trust it. Type `yes` only if it matches the fingerprint your
+HPC site publishes, then sign in once. OpenSSH remembers the key, and Desktop
+uses it from then on.
+
+### Other HPCs and running from source
+
+- **Other HPCs:** setup works on any Linux HPC whose login nodes have bash 4
+  or newer, Git, Python 3.9 or newer with `venv`, and access to GitHub and
+  PyPI. Submitting jobs also needs a supported cluster profile; today that is
+  Cuttlefish. The shared-logging defaults are specific to the Cuttlefish lab
+  and report "unavailable" elsewhere.
+- **Running Desktop from source:** setup installs the checkout's committed
+  `HEAD`, which must already be on GitHub. A packaged Desktop installs the
+  commit it was built from.
+
 ## First calculation
 
 Use **Test connection** beside Connection settings before adding inputs. It
@@ -81,13 +177,14 @@ connection open for Preview. It does not prepare a bundle or run a Slurm
 command. The result says whether the HPC copy of Inkly offers every operation
 this Desktop needs and names optional features, such as Cancel job, that stay
 unavailable until that copy is updated. An HPC copy from an earlier release is
-fine when it offers those operations. This checks access to the endpoint, not
+fine when it offers those operations. When Inkly is missing or too old, Desktop
+offers to [set it up](#set-up-inkly-on-the-hpc) instead. This checks access to the endpoint, not
 Gaussian runtime availability, scheduler capacity or whether a calculation will
 succeed.
 
 1. **Connection settings:** enter your own username/host, the HPC Inkly launcher
-   provided by your maintainer, authentication method and maximum hours per new
-   job. Settings stay in `%LOCALAPPDATA%\Inkly\tensor-picker.json`. Existing
+   (`~/.inkly/bin/ink` after [Set up Inkly on the HPC](#set-up-inkly-on-the-hpc)),
+   authentication method and maximum hours per new job. Settings stay in `%LOCALAPPDATA%\Inkly\tensor-picker.json`. Existing
    file-picker settings are reused. Never enter credentials in these fields.
 2. **Add files** selects one or several Gaussian `.gjf`/`.com` exports.
    **Add folder** adds inputs directly in that folder, without searching
@@ -350,8 +447,10 @@ OpenSSH without storing it. Existing authentication environment values are
 restored when the connection closes. No password is stored in GUI preferences.
 
 Host-key verification remains strict. A new user must verify the site's host
-fingerprint through the established connection procedure first. The
-[Windows onboarding guide](TENSOR.md) describes those prerequisites. Changing
+fingerprint once, with **First sign-in** in Connection settings (see
+[First sign-in on a new computer](#first-sign-in-on-a-new-computer)) or
+through the established connection procedure in the
+[Windows onboarding guide](TENSOR.md). Changing
 the hostname alone does not make another cluster supported by the generator.
 
 Supported inputs are the same self-contained Gaussian exports as the bridge,
