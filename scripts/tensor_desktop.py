@@ -164,6 +164,21 @@ class DesktopApp:
             "TLabel", background="#f3f6fa", foreground="#25334a", font=("Segoe UI", 10)
         )
         style.configure("TButton", font=("Segoe UI", 10), padding=(12, 8))
+        # Framed sections and checkboxes match the window instead of the theme grey.
+        style.configure("TLabelframe", background="#f3f6fa", bordercolor="#c9d3dd")
+        style.configure(
+            "TLabelframe.Label",
+            background="#f3f6fa",
+            foreground="#25334a",
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.configure(
+            "TCheckbutton",
+            background="#f3f6fa",
+            foreground="#25334a",
+            font=("Segoe UI", 10),
+        )
+        style.map("TCheckbutton", background=[("active", "#f3f6fa")])
         style.configure("Accent.TButton", background="#147c8a", foreground="white")
         style.map(
             "Accent.TButton",

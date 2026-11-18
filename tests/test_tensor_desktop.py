@@ -3343,3 +3343,33 @@ def test_native_first_sign_in_opens_plain_openssh_in_a_console(
             assert "ssh researcher@cluster exit" in shown[-1][1]
     finally:
         app.close()
+
+
+@native_display
+def test_native_framed_sections_and_checkboxes_match_the_window(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    styled = {}
+
+    class Recording(gui.ttk.Style):
+        def configure(self, name, *args, **kwargs):
+            styled.setdefault(name, {}).update(kwargs)
+            return super().configure(name, *args, **kwargs)
+
+    monkeypatch.setattr(gui.ttk, "Style", Recording)
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    try:
+        window = styled["TFrame"]["background"]
+        for name in ("TLabelframe", "TLabelframe.Label", "TCheckbutton"):
+            assert styled[name]["background"] == window, name
+    finally:
+        app.close()
