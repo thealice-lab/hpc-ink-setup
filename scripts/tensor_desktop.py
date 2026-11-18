@@ -29,10 +29,12 @@ import tensor_picker as picker
 from tensor_desktop_backend import DesktopController
 
 
-# pip's upgrade advice is noise for researchers; setup's own log keeps it.
+# pip's upgrade advice and already-installed packages are noise for researchers;
+# setup's own log on the HPC keeps every line.
 PIP_NOTICES = (
     "WARNING: You are using pip version",
     "You should consider upgrading via",
+    "Requirement already satisfied:",
 )
 
 SHARED_LOGGING_NOTICE = (
@@ -1148,10 +1150,6 @@ class DesktopApp:
         if shared is None:
             self.log("HPC setup cancelled; nothing was changed on the HPC.")
             return
-        self.log(
-            f"Setting up Inkly {release['version']} on {self.settings['host']} "
-            f"(commit {release['commit'][:12]}, {mode})."
-        )
         self.start("setup_hpc", dict(self.settings), mode, shared)
 
     def setup_dialog(self, mode, release):
