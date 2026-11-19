@@ -336,8 +336,10 @@ class DesktopController:
 
         self.emit(
             "message",
-            f"Setting up Inkly {release['version']} on the HPC. Complete the separate "
-            "SSH sign-in dialog if prompted; this can take a few minutes.",
+            f"{'Repairing' if mode == 'repair' else 'Setting up'} Inkly "
+            f"{release['version']} (commit {release['commit'][:12]}) on "
+            f"{settings['host']}. Complete the separate SSH sign-in dialog if "
+            "prompted; this usually takes under a minute.",
         )
         stack = ExitStack()
         try:

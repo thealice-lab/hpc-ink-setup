@@ -29,10 +29,12 @@ import tensor_picker as picker
 from tensor_desktop_backend import DesktopController
 
 
-# pip's upgrade advice is noise for researchers; setup's own log keeps it.
+# pip's upgrade advice and already-installed packages are noise for researchers;
+# setup's own log on the HPC keeps every line.
 PIP_NOTICES = (
     "WARNING: You are using pip version",
     "You should consider upgrading via",
+    "Requirement already satisfied:",
 )
 
 SHARED_LOGGING_NOTICE = (
@@ -164,6 +166,21 @@ class DesktopApp:
             "TLabel", background="#f3f6fa", foreground="#25334a", font=("Segoe UI", 10)
         )
         style.configure("TButton", font=("Segoe UI", 10), padding=(12, 8))
+        # Framed sections and checkboxes match the window instead of the theme grey.
+        style.configure("TLabelframe", background="#f3f6fa", bordercolor="#c9d3dd")
+        style.configure(
+            "TLabelframe.Label",
+            background="#f3f6fa",
+            foreground="#25334a",
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.configure(
+            "TCheckbutton",
+            background="#f3f6fa",
+            foreground="#25334a",
+            font=("Segoe UI", 10),
+        )
+        style.map("TCheckbutton", background=[("active", "#f3f6fa")])
         style.configure("Accent.TButton", background="#147c8a", foreground="white")
         style.map(
             "Accent.TButton",
@@ -1133,10 +1150,6 @@ class DesktopApp:
         if shared is None:
             self.log("HPC setup cancelled; nothing was changed on the HPC.")
             return
-        self.log(
-            f"Setting up Inkly {release['version']} on {self.settings['host']} "
-            f"(commit {release['commit'][:12]}, {mode})."
-        )
         self.start("setup_hpc", dict(self.settings), mode, shared)
 
     def setup_dialog(self, mode, release):

@@ -2807,6 +2807,11 @@ def test_setup_hpc_installs_this_release_over_one_sign_in(hpc_setup):
     ]
     [result] = setup_events(hpc_setup, "setup_result")
     assert result["changed"] is True and result["version"] == "0.6.0"
+    # One opening line in Activity: what, which commit, where, and the sign-in.
+    [opening] = [m for m in setup_events(hpc_setup, "message") if "Inkly 0.6.0" in m]
+    assert opening.startswith(
+        f"Setting up Inkly 0.6.0 (commit {'c' * 12}) on {SETTINGS['host']}."
+    )
     [notice] = setup_events(hpc_setup, "notice")
     assert "Inkly 0.6.0 is installed" in notice and "No Slurm command" in notice
     # Desktop already uses ~/.inkly/bin/ink, so the signed-in session is kept.
@@ -2831,6 +2836,10 @@ def test_setup_hpc_for_another_launcher_explains_the_switch(hpc_setup):
     c.execute("setup_hpc", settings, "repair", False)
     [session] = hpc_setup.sessions
     assert " M=repair; S=0; " in session.remote
+    assert any(
+        m.startswith("Repairing Inkly 0.6.0")
+        for m in setup_events(hpc_setup, "message")
+    )
     assert session.closed and c.session is None
     [notice] = setup_events(hpc_setup, "notice")
     assert "already up to date" in notice
@@ -3251,6 +3260,7 @@ def test_native_setup_progress_then_the_launcher_switch(
         for line in (
             "Installing Inkly Python requirements",
             "WARNING: You are using pip version 21.3.1; however, version 26.0.1 is available.",
+            "Requirement already satisfied: tomli>=2.0 in /home/x/.inkly/venv (2.4.1)",
         ):
             app.events.put(("setup_progress", {"stage": "install", "line": line}))
         app.events.put(
@@ -3271,6 +3281,7 @@ def test_native_setup_progress_then_the_launcher_switch(
         app.drain()
         assert "HPC setup: Installing Inkly Python requirements" in activity(app)
         assert "pip version" not in activity(app)
+        assert "Requirement already satisfied" not in activity(app)
         assert notices and asked[0][0] == "Use the new HPC copy?"
         assert "Saved jobs keep the launcher recorded" in asked[0][1]
         path = tmp_path / "gui-settings.json"
@@ -3341,5 +3352,35 @@ def test_native_first_sign_in_opens_plain_openssh_in_a_console(
         if name != "nt":
             app.first_sign_in()
             assert "ssh researcher@cluster exit" in shown[-1][1]
+    finally:
+        app.close()
+
+
+@native_display
+def test_native_framed_sections_and_checkboxes_match_the_window(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    styled = {}
+
+    class Recording(gui.ttk.Style):
+        def configure(self, name, *args, **kwargs):
+            styled.setdefault(name, {}).update(kwargs)
+            return super().configure(name, *args, **kwargs)
+
+    monkeypatch.setattr(gui.ttk, "Style", Recording)
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+    )
+    try:
+        window = styled["TFrame"]["background"]
+        for name in ("TLabelframe", "TLabelframe.Label", "TCheckbutton"):
+            assert styled[name]["background"] == window, name
     finally:
         app.close()
