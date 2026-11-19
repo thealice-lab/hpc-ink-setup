@@ -80,6 +80,14 @@ Inkly. Desktop installs or updates **full Inkly** on your own HPC account, the
 same as cloning the repository and running `bash setup.sh` yourself. Afterwards
 both Desktop and `ink` in an HPC terminal work.
 
+**Before you start, sign in to your HPC account once the usual way**, for
+example with `ssh <username>@<host>` in a terminal, as your administrator
+describes when they create the account. That first sign-in makes this
+computer trust the HPC's host key and completes any first-login steps on the
+account (such as a password change). Desktop does not do these for you. If you
+have never signed in from this computer, use **First sign-in** (see
+[First sign-in on a new computer](#first-sign-in-on-a-new-computer)).
+
 Open **Connection settings**. The **Inkly on the HPC** section shows what
 **Test connection** last found and has three buttons:
 

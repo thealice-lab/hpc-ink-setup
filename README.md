@@ -217,8 +217,11 @@ work; this file workflow does not imply those tasks are complete.
 
 This section covers the general user-side installation path.
 
-**Using Inkly Desktop?** From Inkly Desktop 0.6.0, you can skip these steps:
-open Connection settings and choose **Set up Inkly on the HPC**. Desktop signs
+**Using Inkly Desktop?** From Inkly Desktop 0.6.0, you can skip these steps.
+First sign in to your HPC account once the usual way (for example `ssh
+<username>@<host>` in a terminal, as your administrator describes), so this
+computer trusts the HPC and any first-login steps are done. Then open
+Connection settings and choose **Set up Inkly on the HPC**. Desktop signs
 in once, fetches its exact release into `~/.inkly/src/hpc-ink-setup` and runs
 the same `setup.sh`, so the result is the same as the steps below. See
 [Set up Inkly on the HPC](docs/DESKTOP.md#set-up-inkly-on-the-hpc). The
