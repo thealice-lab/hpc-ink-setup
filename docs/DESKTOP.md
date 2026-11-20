@@ -285,6 +285,10 @@ new sign-in. If the watch does not end within 20 seconds, or you click Stop
 watching again, the app disconnects instead. Neither cancels Slurm jobs.
 Closing the app disconnects as well.
 
+If the connection is lost while the app is open, for example because the
+computer slept or the network changed, Activity says so. Jobs keep running on
+the HPC: choose **Check & return results** to sign in again and continue.
+
 ### Load my jobs and Job history
 
 **Load my jobs**, in the top bar beside Job history, fills the list from the
