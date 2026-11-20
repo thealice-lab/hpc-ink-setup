@@ -29,6 +29,82 @@ def test_install_ink_uses_current_python_interpreter(tmp_path, monkeypatch):
         assert installed_ink.stat().st_mode & 0o111
 
 
+def _shell_path_config(monkeypatch, tmp_path, *, enabled=True):
+    bin_dir = tmp_path / ".inkly" / "bin"
+    shell_rc = tmp_path / ".bashrc"
+    monkeypatch.setattr(
+        install,
+        "INSTALL_CFG",
+        SimpleNamespace(
+            allow_path_injection=enabled,
+            allow_modify_shell_rc=enabled,
+            shell_rc=str(shell_rc),
+        ),
+    )
+    monkeypatch.setattr(install, "STATE_CFG", SimpleNamespace(bin_dir=bin_dir))
+    return shell_rc, f'export PATH="{bin_dir}:$PATH"'
+
+
+def _active_path_lines(shell_rc, line):
+    return [
+        entry
+        for entry in shell_rc.read_text(encoding="utf-8").splitlines()
+        if entry == line
+    ]
+
+
+def test_shell_path_is_added_once(tmp_path, monkeypatch):
+    shell_rc, line = _shell_path_config(monkeypatch, tmp_path)
+    shell_rc.write_text("alias ll='ls -l'\n", encoding="utf-8")
+
+    install.configure_shell_path()
+    install.configure_shell_path()
+
+    assert shell_rc.read_text(encoding="utf-8").startswith("alias ll='ls -l'\n")
+    assert len(_active_path_lines(shell_rc, line)) == 1
+
+
+def test_shell_path_is_added_when_only_a_commented_line_names_it(tmp_path, monkeypatch):
+    shell_rc, line = _shell_path_config(monkeypatch, tmp_path)
+    commented = f"  # {line}"
+    shell_rc.write_text(f"{commented}\n", encoding="utf-8")
+
+    install.configure_shell_path()
+
+    text = shell_rc.read_text(encoding="utf-8")
+    assert commented in text.splitlines()
+    assert len(_active_path_lines(shell_rc, line)) == 1
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        'export PATH="{bin}:$PATH"',
+        'export PATH="{bin}:$PATH"  # added by Inkly',
+        "    PATH={bin}:$PATH",
+    ],
+)
+def test_an_active_line_with_the_bin_directory_is_kept_as_it_is(
+    tmp_path, monkeypatch, existing
+):
+    shell_rc, _ = _shell_path_config(monkeypatch, tmp_path)
+    contents = existing.format(bin=tmp_path / ".inkly" / "bin") + "\n"
+    shell_rc.write_text(contents, encoding="utf-8")
+
+    install.configure_shell_path()
+
+    assert shell_rc.read_text(encoding="utf-8") == contents
+
+
+def test_shell_file_is_untouched_when_path_injection_is_off(tmp_path, monkeypatch):
+    shell_rc, _ = _shell_path_config(monkeypatch, tmp_path, enabled=False)
+    shell_rc.write_text("# keep\n", encoding="utf-8")
+
+    install.configure_shell_path()
+
+    assert shell_rc.read_text(encoding="utf-8") == "# keep\n"
+
+
 def _write_fake_runtime(package_root: Path, marker: str) -> None:
     package = package_root / "inkly"
     package.mkdir(parents=True)
