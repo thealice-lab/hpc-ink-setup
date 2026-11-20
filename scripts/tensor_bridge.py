@@ -39,6 +39,12 @@ SETUP_COMMAND_LIMIT = 30000
 SETUP_IDLE_SECONDS = 300
 SETUP_TOTAL_SECONDS = 1200
 
+LOST_CONNECTION = (
+    "Lost the connection to the HPC, for example because this computer slept or "
+    "the network changed. Submitted jobs keep running on the HPC. Sign in again "
+    "to continue, for example with Check & return results."
+)
+
 
 def setup_command(
     script, *, commit, version, repository, mode="auto", shared_logging=True
@@ -156,6 +162,9 @@ class Session:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.responses = queue.Queue()
+        # Once the HPC has answered, a closed stream means the connection was
+        # lost (sleep, network change), not a login or version problem.
+        self.answered = False
         self.error_tail = b""
         self.error_reader = threading.Thread(target=self._read_errors, daemon=True)
         self.error_reader.start()
@@ -208,8 +217,11 @@ class Session:
             deadline.cancel()
         if raw is None:
             raise self._closed(
-                "SSH closed; check login and matching HPC version, then resume"
+                LOST_CONNECTION
+                if self.answered
+                else "SSH closed; check login and matching HPC version, then resume"
             )
+        self.answered = True
         if len(raw) > 96 * 1024 * 1024:
             raise ValueError("Response exceeds transfer limit")
         return _response(raw, receipt)
@@ -287,6 +299,7 @@ class Session:
                 raise ValueError("Invalid progress from the HPC setup; it was stopped.")
             if frame.get("done") is True:
                 if frame.get("ok") is True:
+                    self.answered = True
                     return frame
                 error = frame.get("error")
                 raise ValueError(
