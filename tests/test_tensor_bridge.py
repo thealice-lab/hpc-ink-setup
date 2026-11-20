@@ -210,6 +210,51 @@ def test_session_reports_auth_failure_without_echoing_remote_stderr(monkeypatch)
     assert "private-marker" not in str(error.value)
 
 
+def test_a_connection_lost_after_answers_is_not_reported_as_a_login_problem(
+    monkeypatch,
+):
+    # The HPC answers once, then the connection drops (sleep, network change).
+    peer = (
+        "import json, sys\n"
+        "line = sys.stdin.buffer.readline()\n"
+        "print(json.dumps({'ok': True, **json.loads(line)}), flush=True)\n"
+        "sys.stderr.write('client_loop: send disconnect: Connection reset')\n"
+        "sys.exit(255)\n"
+    )
+    receipt = fake_remote(monkeypatch, peer)
+    with bridge.Session(receipt, "ssh") as session:
+        assert session.exchange({"action": "status"})["action"] == "status"
+        with pytest.raises(ValueError) as error:
+            session.exchange({"action": "status"})
+    assert str(error.value) == bridge.LOST_CONNECTION
+    assert "Submitted jobs keep running" in str(error.value)
+    assert "matching HPC version" not in str(error.value)
+
+
+def test_a_connection_that_never_answers_still_points_to_login_and_version(
+    monkeypatch,
+):
+    receipt = fake_remote(monkeypatch, "import sys; sys.exit(1)")
+    with bridge.Session(receipt, "ssh") as session:
+        with pytest.raises(ValueError, match="check login and matching HPC version"):
+            session.exchange({"action": "version"})
+
+
+def test_a_connection_lost_after_setup_finished_is_reported_as_lost(monkeypatch):
+    frames = [{"done": True, "ok": True, "version": "0.6.0", "commit": "a" * 40}]
+    peer = (
+        "import json, sys\n"
+        f"print('INKLY-SETUP ' + json.dumps({frames[0]!r}), flush=True)\n"
+        "sys.exit(255)\n"
+    )
+    receipt = fake_remote(monkeypatch, peer)
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        session.run_setup(lambda frame: None)
+        with pytest.raises(ValueError) as error:
+            session.exchange({"action": "version"})
+    assert str(error.value) == bridge.LOST_CONNECTION
+
+
 def test_cuttlefish_auth_matches_existing_keyboard_interactive_helper():
     receipt = {
         "host": "cluster",
