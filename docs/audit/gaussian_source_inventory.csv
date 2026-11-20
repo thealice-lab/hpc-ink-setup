@@ -1,0 +1,107 @@
+label,type,category,scope,host_or_site,status,passages,chars,last_scraped,url
+Harvard RC - Gaussian,html,HPC center software page,external,docs.rc.fas.harvard.edu,stored,25,2352,2026-11-01,https://docs.rc.fas.harvard.edu/kb/gaussian/
+TACC - Gaussian,html,HPC center software page,external,docs.tacc.utexas.edu,stored,13,2359,2026-11-01,https://docs.tacc.utexas.edu/software/gaussian/
+NSC Sweden - Gaussian,html,HPC center software page,external,www.nsc.liu.se,stored,30,4516,2026-11-01,https://www.nsc.liu.se/software/installed/tetralith/gaussian/
+Ohio Supercomputer Center - Gaussian,html,HPC center software page,external,www.osc.edu,stored,20,9377,2026-11-01,https://www.osc.edu/resources/available_software/software_list/gaussian
+HPC Wiki - Gaussian,html,HPC center software page,external,hpc-wiki.info,stored,30,8598,2026-11-01,https://hpc-wiki.info/hpc/Gaussian
+CSC Finland - Gaussian,html,HPC center software page,external,docs.csc.fi,stored,30,2553,2026-11-01,https://docs.csc.fi/apps/gaussian/
+U Florida RC - Gaussian,html,HPC center software page,external,docs.rc.ufl.edu,stored,17,2746,2026-11-01,https://docs.rc.ufl.edu/software/apps/gaussian
+U Chicago RCC - Gaussian,html,HPC center software page,external,docs.rcc.uchicago.edu,stored,30,4782,2026-11-01,https://docs.rcc.uchicago.edu/software/apps-and-envs/gaussian/
+Yale YCRC - Gaussian,html,HPC center software page,external,docs.ycrc.yale.edu,stored,9,2541,2026-11-01,https://docs.ycrc.yale.edu/clusters-at-yale/guides/gaussian
+FSU RCC - Gaussian,html,HPC center software page,external,docs.rcc.fsu.edu,stored,24,2743,2026-11-01,https://docs.rcc.fsu.edu/software/gaussian/
+Utah CHPC - Gaussian09,html,HPC center software page,external,www.chpc.utah.edu,stored,28,2530,2026-11-01,https://www.chpc.utah.edu/documentation/software/gaussian09.php
+Utah CHPC - Gaussian16,html,HPC center software page,external,www.chpc.utah.edu,stored,25,1997,2026-11-01,https://www.chpc.utah.edu/documentation/software/gaussian16/index.php
+NC State HPC - Gaussian,html,HPC center software page,external,hpc.ncsu.edu,stored,30,4083,2026-11-01,https://hpc.ncsu.edu/Software/Apps.php?app=Gaussian
+GWDG - Gaussian,html,HPC center software page,external,docs.hpc.gwdg.de,stored,20,5970,2026-11-01,https://docs.hpc.gwdg.de/software_stacks/applications/gaussian/index.html
+George Mason ORC - Gaussian,html,HPC center software page,external,wiki.orc.gmu.edu,stored,30,2697,2026-11-01,https://wiki.orc.gmu.edu/mkdocs/Running_Gaussian/
+HPC2N Umea - Gaussian,html,HPC center software page,external,docs.hpc2n.umu.se,stored,20,3236,2026-11-01,https://docs.hpc2n.umu.se/software/apps/gaussian/
+Flinders DeepThought - Gaussian,html,HPC center software page,external,deepthoughtdocs.flinders.edu.au,not stored: HTTP 404,0,0,,https://deepthoughtdocs.flinders.edu.au/en/develop/software/gaussian16.html
+William and Mary - Gaussian,html,HPC center software page,external,www.wm.edu,stored,19,3423,2026-11-01,https://www.wm.edu/offices/it/services/researchcomputing/using/software/gaussian/
+Delaware IT-RCI - Gaussian on Darwin,html,HPC center software page,external,docs.hpc.udel.edu,stored,13,2515,2026-11-01,https://docs.hpc.udel.edu/software/gaussian/darwin
+UTEP - Gaussian16 HPC Usage Guide (PDF),html,course or tutorial material,external,www.utep.edu,stored,11,834,2026-11-01,https://www.utep.edu/information-resources/research/resources/hpc%20usage%20guide%20for%20gaussian%2016%20on%20jakar.docx.pdf
+MSU ICER - Computational Quantum Chemistry Tools (PDF),html,course or tutorial material,external,docs.icer.msu.edu,stored,30,1717,2026-11-01,https://docs.icer.msu.edu/attachments/Computational_Quantum_Chemistry_Tools.pdf
+UBA - GaussView/Gaussian Guide and Exercise Manual (PDF),html,course or tutorial material,external,users.df.uba.ar,stored,14,1090,2026-11-01,http://users.df.uba.ar/rboc/em3/GAUSSIAN_TRAIN.pdf
+Tel Aviv Uni - Gaussian Manual (PDF),html,course or tutorial material,external,www.tau.ac.il,stored,30,2199,2026-11-01,https://www.tau.ac.il/~ephraim/Gaussian_manual.pdf
+Illinois Pogorelov Lab - Gaussian Intro Tutorial (PDF),html,course or tutorial material,external,pogorelov.scs.illinois.edu,stored,16,1009,2026-11-01,http://pogorelov.scs.illinois.edu/wp-content/uploads/2020/06/qm-gaussian-intro-1-tutorial-PogorelovLab.2011.v1.web_.pdf
+Illinois SCS - Gaussian Intro 2 (PDF),html,course or tutorial material,external,scs.illinois.edu,stored,14,1087,2026-11-01,https://scs.illinois.edu/system/files/inline-files/gaussian-intro-2.pdf
+Texas A&M - Computational Chemistry Handout (PDF),html,course or tutorial material,external,www.chem.tamu.edu,stored,29,3138,2026-11-01,https://www.chem.tamu.edu/class/majors/chem101h-lab/chem/Computational%20Chemistry%20Handout%20-%202016.pdf
+UW Faculty - Computational Chemistry Tutorial (PDF),html,course or tutorial material,external,faculty.washington.edu,stored,6,531,2026-11-01,https://faculty.washington.edu/tingcao/wordpress/wp-content/uploads/2020/05/Comp_Chem_Tutorial__Spr2020.pdf
+Illinois SCS - Gaussian GaussView Tutorial (PDF),html,course or tutorial material,external,scs.illinois.edu,"stored, near-empty",2,83,2026-11-01,https://scs.illinois.edu/system/files/inline-files/SCS-Gaussian-GaussView-tutorial_1.pdf
+NBO Wisconsin - INSTALL.gaussian (Gaussian-09 D.01/NBO6 txt),html,related program docs,external,nbo.chem.wisc.edu,stored,23,1450,2026-11-01,https://nbo.chem.wisc.edu/INSTALL.gaussian
+NBO Wisconsin - INSTALL.g09c01 (Gaussian-09 C.01/NBO6 txt),html,related program docs,external,nbo.chem.wisc.edu,stored,28,1744,2026-11-01,https://nbo.chem.wisc.edu/INSTALL.g09c01
+BYU Office of Research Computing - Gaussian16,html,HPC center software page,external,rc.byu.edu,stored,7,1813,2026-11-01,https://rc.byu.edu/wiki/?page=Gaussian+16
+CU Boulder Research Computing - Gaussian,html,HPC center software page,external,curc.readthedocs.io,stored,18,5438,2026-11-01,https://curc.readthedocs.io/en/latest/software/gaussian.html
+NDSU CCAST - Running Gaussian 16,html,HPC center software page,external,kb.ndsu.edu,stored,30,8034,2026-11-01,https://kb.ndsu.edu/it/page.php?id=135576
+Minnesota Supercomputing Institute - Gaussian,html,HPC center software page,external,msi.umn.edu,not stored: HTTP 404,0,0,,https://msi.umn.edu/our-resources/msi-software/gaussian
+Purdue RCAC (Bell) - Gaussian,html,HPC center software page,external,www.rcac.purdue.edu,not stored: HTTP 404,0,0,,https://www.rcac.purdue.edu/knowledge/bell/run/examples/apps/gaussian
+Argonne National Laboratory CNM - Gaussian,html,HPC center software page,external,wiki.anl.gov,stored,30,2723,2026-11-01,https://wiki.anl.gov/cnm/HPC/Applications/Gaussian
+UW-Madison Chemistry HPC - Gaussian,html,HPC center software page,external,hpc.chem.wisc.edu,stored,22,3522,2026-11-01,https://hpc.chem.wisc.edu/software/kestrel-software/gaussian/
+NIH HPC (Biowulf) - Gaussian,html,HPC center software page,external,hpc.nih.gov,stored,24,2567,2026-11-01,https://hpc.nih.gov/apps/Gaussian.html
+Oakland University HPC - Gaussian on Matilda,html,HPC center software page,external,support.oakland.edu,stored,6,786,2026-11-01,https://support.oakland.edu/TDClient/33/Support-Center/KB/PrintArticle?ID=257
+Kennesaw State CRC - Gaussian Quickstart,html,HPC center software page,external,campus.kennesaw.edu,stored,8,1517,2026-11-01,https://campus.kennesaw.edu/offices-services/research/centers-facilities/center-research-computing/resources/quickstart/gaussian.php
+University of Arizona HPC - Gaussian,html,HPC center software page,external,hpcdocs.hpc.arizona.edu,stored,7,2922,2026-11-01,https://hpcdocs.hpc.arizona.edu/software/popular_software/gaussian/
+Cambridge Chemistry Dept - Gaussian16,html,HPC center software page,external,computing.ch.cam.ac.uk,stored,13,5191,2026-11-01,https://computing.ch.cam.ac.uk/software/gaussian-16
+Oxford ARC - Gaussian,html,HPC center software page,external,arc-software-guide.readthedocs.io,stored,14,2644,2026-11-01,https://arc-software-guide.readthedocs.io/en/latest/apps/arc_gaussian.html
+UCL Research Computing - Other Software (Gaussian),html,HPC center software page,external,www.rc.ucl.ac.uk,stored,30,2579,2026-11-01,https://www.rc.ucl.ac.uk/docs/Software_Guides/Other_Software/
+Manchester CSF4 - Gaussian16,html,HPC center software page,external,ri.itservices.manchester.ac.uk,stored,30,8392,2026-11-01,https://ri.itservices.manchester.ac.uk/csf4/software/applications/gaussian16/
+Bristol ACRC - Gaussian,html,HPC center software page,external,www.acrc.bris.ac.uk,stored,17,3738,2026-11-01,https://www.acrc.bris.ac.uk/packages/gaussian.htm
+RWTH Aachen - Gaussian (CLAIX),html,HPC center software page,external,help.itc.rwth-aachen.de,stored,26,4347,2026-11-01,https://help.itc.rwth-aachen.de/en/service/rhr4fjjutttf/article/33bc9a6953bc4621a510b2102f25df94/
+bwHPC Germany - Gaussian,html,HPC center software page,external,wiki.bwhpc.de,stored,30,6533,2026-11-01,https://wiki.bwhpc.de/e/Gaussian
+QMUL - Gaussian,html,HPC center software page,external,docs.hpc.qmul.ac.uk,stored,16,1140,2026-11-01,https://docs.hpc.qmul.ac.uk/apps/chem/gaussian/
+Paderborn PC2 - Gaussian,html,HPC center software page,external,upb-pc2.atlassian.net,stored,25,5393,2026-11-01,https://upb-pc2.atlassian.net/wiki/spaces/PC2DOK/pages/105152525
+IDRIS France - Gaussian (Jean Zay),html,HPC center software page,external,www.idris.fr,stored,8,2402,2026-11-01,http://www.idris.fr/docs/jean-zay/logiciels_bibliotheques/logiciels_simulato/gaussian/
+CINES France - Optimal Gaussian Usage Memo (PDF),html,course or tutorial material,external,www.cines.fr,stored,9,602,2026-11-01,https://www.cines.fr/wp-content/uploads/2016/02/memo-gaussian.pdf
+ETH Zurich Euler - Gaussian,html,HPC center software page,external,docs.hpc.ethz.ch,stored,12,1934,2026-11-01,https://docs.hpc.ethz.ch/software/chemistry/gaussian/
+ICHEC Ireland - Gaussian,html,HPC center software page,external,www.ichec.ie,stored,7,1095,2026-11-01,https://www.ichec.ie/academic/national-hpc-service/software/gaussian
+DTU Denmark - Gaussian jobs under LSF,html,HPC center software page,external,www.hpc.dtu.dk,stored,19,4229,2026-11-01,https://www.hpc.dtu.dk/?page_id=2036
+Sigma2/NRIS Norway - Gaussian,html,HPC center software page,external,documentation.sigma2.no,stored,12,1938,2026-11-01,https://documentation.sigma2.no/software/application_guides/gaussian/gaussian.html
+IT4Innovations Czech - Gaussian,html,HPC center software page,external,docs.it4i.cz,stored,16,2336,2026-11-01,https://docs.it4i.cz/en/docs/software/chemistry/gaussian
+TalTech Estonia - Gaussian,html,HPC center software page,external,hpc.pages.taltech.ee,stored,23,4916,2026-11-01,https://hpc.pages.taltech.ee/user-guides-new4/chemistry/gaussian.html
+NCI Australia (Gadi) - Gaussian 09,html,HPC center software page,external,opus.nci.org.au,stored,9,2001,2026-11-01,https://opus.nci.org.au/spaces/Help/pages/248840500/Gaussian+09...
+ACENET Canada - Gaussian Training Session,html,HPC center software page,external,acenet-arc.github.io,stored,30,4939,2026-11-01,https://acenet-arc.github.io/gaussian_training/Gaussian_training_session.html
+KISTI Korea (Nurion) - Gaussian16,html,HPC center software page,external,docs-ksc.gitbook.io,stored,25,3965,2026-11-01,https://docs-ksc.gitbook.io/nurion-user-guide-eng/software/gaussian16
+KISTI Korea (Nurion) - Gaussian16 LINDA,html,HPC center software page,external,docs-ksc.gitbook.io,stored,10,1816,2026-11-01,https://docs-ksc.gitbook.io/nurion-user-guide-eng/software/gaussian16-linda
+NeSI New Zealand - Gaussian,html,HPC center software page,external,docs.nesi.org.nz,stored,30,2292,2026-11-01,https://docs.nesi.org.nz/Software/Available_Applications/Gaussian/
+CHPC South Africa - Gaussian,html,HPC center software page,external,wiki.chpc.ac.za,stored,6,1011,2026-11-01,https://wiki.chpc.ac.za/howto:gaussian
+University of Calgary ARC - Gaussian,html,HPC center software page,external,rcs.ucalgary.ca,stored,30,5352,2026-11-01,https://rcs.ucalgary.ca/Gaussian_on_ARC
+SHARCNET Canada - Gaussian16 NBO7 Slides (PDF),html,course or tutorial material,external,helpwiki.sharcnet.ca,not stored: no extractable text,0,0,,https://helpwiki.sharcnet.ca/wiki/images/6/68/Gaussian16_NBO7.pdf
+Princeton MacMillan Group - Introduction to Computational Chemistry (PDF),html,course or tutorial material,external,macmillan.princeton.edu,stored,14,875,2026-11-01,https://macmillan.princeton.edu/wp-content/uploads/CompChemIntro_NoLayer.pdf
+Princeton MacMillan Group - Fundamentals of Computational Chemistry (PDF),html,course or tutorial material,external,macmillan.princeton.edu,stored,12,824,2026-11-01,https://macmillan.princeton.edu/wp-content/uploads/HWS_computational.pdf
+Montana State - Introduction to Ab Initio Quantum Chemical Computation (PDF),html,course or tutorial material,external,chemistry.montana.edu,stored,27,2243,2026-11-01,https://chemistry.montana.edu/callis/courses/chmy374/374Computation18.pdf
+Illinois Pogorelov Lab - Gaussian Intro Tutorial Part 2 (PDF),html,course or tutorial material,external,pogorelov.scs.illinois.edu,not stored: all passages removed as duplicates of Part 1,0,0,,http://pogorelov.scs.illinois.edu/wp-content/uploads/2020/06/qm-gaussian-intro-2-tutorial-PogorelovLab.2011.v1.web_.pdf
+Southampton CHEM3023 - Gaussian Basis Sets Lecture (PDF),html,course or tutorial material,external,www.southampton.ac.uk,stored,28,2026,2026-11-01,https://www.southampton.ac.uk/assets/centresresearch/documents/compchem/chem3023_L6.pdf
+Southampton CHEM6085 - DFT Gaussian Basis Sets Lecture (PDF),html,course or tutorial material,external,www.southampton.ac.uk,stored,14,1156,2026-11-01,https://www.southampton.ac.uk/assets/centresresearch/documents/compchem/DFT_L8.pdf
+McGill Barrett Group - Gaussian 09W Tutorial (PDF),html,course or tutorial material,external,barrett-group.mcgill.ca,not stored: network error,0,0,,https://barrett-group.mcgill.ca/tutorials/Gaussian%20tutorial.pdf
+Uni Rostock - Basis Sets Used in Molecular Orbital Calculations (PDF),html,course or tutorial material,external,www.schulz.chemie.uni-rostock.de,stored,30,2356,2026-11-01,https://www.schulz.chemie.uni-rostock.de/storages/uni-rostock/Alle_MNF/Chemie_Schulz/Computerchemie_3/basis_sets.pdf
+Lakehead University - CHEM 3451 Computational Chemistry Lab Manual (PDF),html,course or tutorial material,external,www.lakeheadu.ca,stored,30,2601,2026-11-01,https://www.lakeheadu.ca/sites/default/files/uploads/31/CHEM_3451_lab_manual_F2013_Comp-Chem.pdf
+Harvard (Kwan) - Chem 117 Lecture 9: Intro to Computational Chemistry (PDF),html,course or tutorial material,external,ekwan.github.io,stored,30,1812,2026-11-01,https://ekwan.github.io/pdfs/nmr/lecture%209.pdf
+Tel Aviv Uni - Introduction to GaussView (PDF),html,course or tutorial material,external,www.tau.ac.il,stored,26,1897,2026-11-01,https://www.tau.ac.il/~ephraim/intro2gaussview.pdf
+Tel Aviv Uni - Lab 4: Transition States and Reaction Paths (PDF),html,course or tutorial material,external,www.tau.ac.il,stored,10,725,2026-11-01,https://www.tau.ac.il/~ephraim/glab-4.pdf
+Sir Syed College (India) - Computational Analysis Add-On Course Syllabus (PDF),html,course or tutorial material,external,sirsyedcollege.ac.in,stored,17,1400,2026-11-01,https://sirsyedcollege.ac.in/crm/public/uploads/otherpgm_syllabus/Ph9Th4TujUsKRCFPu3pGVWgMpDnCyb.pdf
+"U Tokyo IIS - Gaussian Usage Guide (PDF, Japanese)",html,course or tutorial material,external,www.iis.u-tokyo.ac.jp,stored,21,1239,2026-11-01,http://www.iis.u-tokyo.ac.jp/~houjou/kinozai/Gaussian.pdf
+"ENS Lyon - Gaussian/Avogadro TP Mode d'Emploi (PDF, French)",html,course or tutorial material,external,perso.ens-lyon.fr,stored,27,2121,2026-11-01,https://perso.ens-lyon.fr/carine.michel/wp-content/uploads/2019/04/TP.pdf
+"Univ. Toulouse - Doctoral Course: Introduction to Gaussian 16 (PDF, French)",html,course or tutorial material,external,scout.univ-toulouse.fr,stored,8,615,2026-11-01,https://scout.univ-toulouse.fr/pub/docs/group-ED-SDM/web/COURS_DOCTORAUX/3.pdf
+"UNAD Colombia - Quimica Computacional Course Content (PDF, Spanish)",html,course or tutorial material,external,repository.unad.edu.co,stored,26,1975,2026-11-01,https://repository.unad.edu.co/bitstream/handle/10596/12499/210116-contenido%20del%20curso.pdf?sequence=1
+"Universidad de Valencia - Introduccion a la Quimica Computacional (PDF, Spanish)",html,course or tutorial material,external,www.uv.es,"stored, near-empty",1,46,2026-11-01,https://www.uv.es/tunon/QComp/Sesion_QC_Entorno.pdf
+"Uni Kiel - Einfuhrung in die Computerchemie (PDF, German)",html,course or tutorial material,external,ravel.pctc.uni-kiel.de,stored,30,1968,2026-11-01,http://ravel.pctc.uni-kiel.de/scripts/Intro_TC/Intro_TC.pdf
+Illinois SCS Answers - Intro to Gaussian I (HTML),html,course or tutorial material,external,answers.uillinois.edu,stored,18,2980,2026-11-01,https://answers.uillinois.edu/scs/103204
+Illinois SCS Answers - GaussView Tutorial (HTML),html,course or tutorial material,external,answers.uillinois.edu,stored,8,1257,2026-11-01,https://answers.uillinois.edu/scs/103608
+Illinois SCS Answers - pKa Estimations Using Gaussian (HTML),html,course or tutorial material,external,answers.uillinois.edu,stored,14,3185,2026-11-01,https://answers.uillinois.edu/scs/103621
+Brent Westbrook - Computational Chemistry Tutorial (PDF),html,course or tutorial material,external,bwestbro.com,stored,21,2185,2026-11-01,https://bwestbro.com/misc/gauss.pdf
+UC Berkeley MGCF - Computational Methods Tutorials Index (HTML),html,course or tutorial material,external,glab.cchem.berkeley.edu,stored,30,41655,2026-11-01,https://glab.cchem.berkeley.edu/mgcf/tutorials.html
+Leddin Computational Chemistry Resources - Gaussian Overview (HTML),html,course or tutorial material,external,emleddin.github.io,stored,5,354,2026-11-01,https://emleddin.github.io/comp-chem-website/Otherguide-gaussian-overview.html
+Leddin Computational Chemistry Resources - Gaussian Input Files (HTML),html,course or tutorial material,external,emleddin.github.io,stored,4,670,2026-11-01,https://emleddin.github.io/comp-chem-website/Otherguide-gaussian-input.html
+Illinois SCS Answers - Intro to Gaussian II (HTML),html,course or tutorial material,external,answers.uillinois.edu,stored,3,158,2026-11-01,https://answers.uillinois.edu/scs/103413
+UCSB (Kahn) Chem126 - Transition State Optimization Tutorial,html,course or tutorial material,external,people.chem.ucsb.edu,stored,8,3943,2026-11-01,https://people.chem.ucsb.edu/kahn/kalju/chem126/public/qm_ts_optim.html
+Harvard (Kwan) Chem106 - Transition State for an SN2 Reaction (PDF),html,course or tutorial material,external,ekwan.github.io,"stored, near-empty",1,102,2026-11-01,https://ekwan.github.io/pdfs/computations/2%20-%20Transition%20State%20for%20an%20SN2%20Reaction.pdf
+Matter Modeling Stack Exchange - gaussian tag,se,Stack Exchange Q&A,external,mattermodeling.stackexchange.com tag=gaussian,stored,30,11505,2026-11-01,
+Matter Modeling Stack Exchange - density-functional-theory tag,se,Stack Exchange Q&A,external,mattermodeling.stackexchange.com tag=density-functional-theory,stored,30,12737,2026-11-01,
+Matter Modeling Stack Exchange - computational-chemistry tag,se,Stack Exchange Q&A,external,mattermodeling.stackexchange.com tag=computational-chemistry,stored,21,9706,2026-11-01,
+Matter Modeling Stack Exchange - quantum-chemistry tag,se,Stack Exchange Q&A,external,mattermodeling.stackexchange.com tag=quantum-chemistry,stored,8,4565,2026-11-01,
+Matter Modeling Stack Exchange - high-performance-computing tag,se,Stack Exchange Q&A,external,mattermodeling.stackexchange.com tag=high-performance-computing,stored,22,7864,2026-11-01,
+Chemistry Stack Exchange - quantum-chemistry tag,se,Stack Exchange Q&A,external,chemistry.stackexchange.com tag=quantum-chemistry,stored,11,3960,2026-11-01,
+Chemistry Stack Exchange - computational-chemistry tag,se,Stack Exchange Q&A,external,chemistry.stackexchange.com tag=computational-chemistry,stored,30,17082,2026-11-01,
+Matter Modeling Stack Exchange - basis-sets tag,se,Stack Exchange Q&A,external,mattermodeling.stackexchange.com tag=basis-sets,stored,16,6157,2026-11-01,
+Chemistry Stack Exchange - basis-set tag,se,Stack Exchange Q&A,external,chemistry.stackexchange.com tag=basis-set,stored,30,9208,2026-11-01,
+Matter Modeling Stack Exchange - td-dft tag,se,Stack Exchange Q&A,external,mattermodeling.stackexchange.com tag=td-dft,stored,26,8858,2026-11-01,
+SciComp Stack Exchange - hpc tag,se,Stack Exchange Q&A,external,scicomp.stackexchange.com tag=hpc,"stored, near-empty",1,455,2026-11-01,
