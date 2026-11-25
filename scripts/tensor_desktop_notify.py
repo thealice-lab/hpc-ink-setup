@@ -7,11 +7,9 @@ there is nothing extra to install; elsewhere the notifier does nothing.
 """
 
 import ctypes
-import json
-import os
-from pathlib import Path
 import sys
-import tempfile
+
+import tensor_desktop_preferences as preferences
 
 # Ended without a result, from Slurm's point of view. Cancelled jobs are left
 # out: Desktop cancels only when the researcher asks.
@@ -28,7 +26,7 @@ DONE_STATES = FAILED_STATES | {"RETURNED", "CANCELLED"}
 
 TITLE_LIMIT = 63  # szInfoTitle holds 64 wide characters with the terminator.
 TEXT_LIMIT = 255  # szInfo holds 256.
-PREFERENCES = "desktop-preferences.json"
+PREFERENCES = preferences.PREFERENCES
 
 
 def state_name(state):
@@ -91,31 +89,12 @@ def message(returned, failed, watching):
 
 def load_preference(directory):
     """Whether notifications are on (the default) in Desktop's preferences."""
-    try:
-        data = json.loads((Path(directory) / PREFERENCES).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return True
-    return data.get("notify", True) is not False if isinstance(data, dict) else True
+    return preferences.load(directory, "notify")
 
 
 def save_preference(directory, enabled):
     """Store the choice atomically; other preferences in the file are kept."""
-    path = Path(directory) / PREFERENCES
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            data = {}
-    except (OSError, ValueError):
-        data = {}
-    data["notify"] = bool(enabled)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".desktop-preferences-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(data, stream, indent=2)
-        os.replace(name, path)
-    finally:
-        Path(name).unlink(missing_ok=True)
+    preferences.save(directory, "notify", enabled)
 
 
 class GUID(ctypes.Structure):
