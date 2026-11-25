@@ -28,6 +28,8 @@ jobs:
 
   windows-desktop:
     runs-on: windows-2022
+    # A native dialog left open would otherwise hold the runner for hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
