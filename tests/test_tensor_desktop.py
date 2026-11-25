@@ -3157,6 +3157,143 @@ def test_release_versions_compare_by_number(version, than, older):
 GUI_RELEASE = {"version": "0.6.0", "commit": "f" * 40}
 
 
+@native_display
+def test_native_cpus_and_memory_follow_prepared_selected_rows(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w = workflow
+    first, second = (str(path) for path in w.paths)
+
+    def show(path, **changes):
+        app.events.put(("row", {**app.rows[path], **changes}))
+        app.drain()
+
+    def state():
+        app.buttons()
+        return str(app.resources_button["state"])
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        assert state() == "disabled"  # Nothing selected.
+        app.table.selection_set(first)
+        assert state() == "normal"
+        show(first, input_changed=True)
+        assert state() == "disabled"
+        show(first, input_changed=False, state="PENDING", job_id="123")
+        assert state() == "disabled"
+        show(first, state="PREPARED", job_id="")
+        assert state() == "normal"
+
+        scheduled, asked, questions = [], [], []
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+        monkeypatch.setattr(app, "ask_resources", lambda rows: asked.append(rows))
+        app.resources_button.invoke()
+        assert [row["name"] for row in asked[-1]] == ["sample_1.gjf"]
+        assert not scheduled  # Cancelled.
+        changes = {"cpus": 8, "memory_mib": None}
+        monkeypatch.setattr(app, "ask_resources", lambda rows: dict(changes))
+        app.resources_button.invoke()
+        expected = ("change_resources", [first], [first, second], SETTINGS, changes)
+        assert scheduled == [expected]
+
+        # An edited job script is only discarded after an explicit yes.
+        show(first, script_edited=True)
+
+        def answer(value):
+            def ask(title, text, **kwargs):
+                questions.append((title, text, kwargs.get("default")))
+                return value
+
+            return ask
+
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.resources_button.invoke()
+        assert len(scheduled) == 1
+        assert questions[-1][0] == "Discard script edits?"
+        assert "sample_1.gjf" in questions[-1][1] and questions[-1][2] == "no"
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(True))
+        app.resources_button.invoke()
+        assert scheduled[-1] == expected
+
+        # While watching, the change goes to the watch on its open connection.
+        show(first, script_edited=False)
+        requests = []
+        monkeypatch.setattr(
+            w.controller, "request", lambda *args: requests.append(args)
+        )
+        app.busy, app.action = True, "submit"
+        assert state() == "normal"
+        app.resources_button.invoke()
+        assert requests == [expected]
+        assert len(scheduled) == 2
+    finally:
+        app.busy = False
+        app.close()
+
+
+@native_display
+def test_native_cpus_and_memory_window_reads_and_checks_values(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    row = {"name": "a.gjf", "resources": {"cpus": 4, "slurm_memory_mib": 7680}}
+    try:
+        dialog, values, _, buttons, result = app.resources_dialog([row])
+        assert dialog.title() == "CPUs and memory"
+        assert (values["cpus"].get(), values["memory"].get()) == ("4", "7.5")
+        buttons["apply"].invoke()  # Nothing changed: the window stays open.
+        assert result["changes"] is None and dialog.winfo_exists()
+        values["cpus"].set("eight")
+        buttons["apply"].invoke()
+        assert result["changes"] is None and dialog.winfo_exists()
+        values["cpus"].set("8")
+        values["memory"].set("16 GB")
+        buttons["apply"].invoke()
+        assert result["changes"] == {"cpus": 8, "memory_mib": 16384}
+        assert not dialog.winfo_exists()
+
+        # Rows with different values start blank; Cancel changes nothing.
+        other = {"name": "b.gjf", "resources": {"cpus": 2, "slurm_memory_mib": 7680}}
+        dialog, values, _, buttons, result = app.resources_dialog([row, other])
+        assert (values["cpus"].get(), values["memory"].get()) == ("", "7.5")
+        buttons["cancel"].invoke()
+        assert result["changes"] is None and not dialog.winfo_exists()
+    finally:
+        app.close()
+
+
+@native_display
+@pytest.mark.parametrize(
+    "cpus, memory, expected",
+    [
+        ("8", "", {"cpus": 8, "memory_mib": None}),
+        (" 8 ", "1.5", {"cpus": 8, "memory_mib": 1536}),
+        ("", "16gb", {"cpus": None, "memory_mib": 16384}),
+        ("4", "7.5", "Change the CPUs, the memory or both first"),
+        ("", "", "Change the CPUs, the memory or both first"),
+        ("8.5", "", "CPUs must be a whole number"),
+        ("", "-2", "Memory must be a number of GB"),
+        ("", "nan", "Memory must be a number of GB"),
+        ("", "0.5", "Memory must be from 1 to 4096 GB"),
+        ("2000", "", "CPUs must be a whole number from 1 to 1024"),
+    ],
+)
+def test_native_resource_entries_are_parsed_in_gb(cpus, memory, expected):
+    import tensor_desktop as gui
+
+    prefill = {"cpus": "4", "memory": "7.5"}
+    if isinstance(expected, dict):
+        assert gui.parse_resource_entries(cpus, memory, prefill) == expected
+    else:
+        with pytest.raises(ValueError, match=expected):
+            gui.parse_resource_entries(cpus, memory, prefill)
+
+
 def setup_window(workflow, tmp_path, monkeypatch):
     """A Desktop window whose message boxes fail fast and whose dialogs never wait."""
     import tkinter as tk

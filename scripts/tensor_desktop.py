@@ -6,6 +6,7 @@ import ctypes
 import gc
 import json
 import os
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 import queue
 import re
@@ -26,7 +27,7 @@ import tensor_desktop_jobs as jobs
 import tensor_desktop_setup as hpc_setup
 import tensor_desktop_status as status
 import tensor_picker as picker
-from tensor_desktop_backend import DesktopController
+from tensor_desktop_backend import DesktopController, resource_text
 
 
 # pip's upgrade advice and already-installed packages are noise for researchers;
@@ -70,6 +71,40 @@ def setup_summary(host, mode, release):
         "and never overwrites your own changes. It usually takes under a minute; "
         "if it stops, running it again is safe."
     )
+
+
+def memory_text(mib):
+    """Slurm MiB as the GB figure the CPUs and memory window shows."""
+    return f"{round(mib / 1024, 2):g}"
+
+
+def parse_resource_entries(cpus_text, memory_text_value, prefill):
+    """New CPUs and total Slurm memory (MiB) from the CPUs and memory window.
+
+    An empty box, or one still showing the value it was opened with, keeps the
+    current value. Memory is typed in GB (1 GB = 1024 MiB).
+    """
+    cpus_text, memory_value = cpus_text.strip(), memory_text_value.strip()
+    if memory_value.lower().endswith("gb"):
+        memory_value = memory_value[:-2].strip()
+    cpus = memory = None
+    if cpus_text and cpus_text != prefill.get("cpus"):
+        if not re.fullmatch(r"[0-9]+", cpus_text):
+            raise ValueError("CPUs must be a whole number, for example 8.")
+        cpus = int(cpus_text)
+    if memory_value and memory_value != prefill.get("memory"):
+        try:
+            gb = Decimal(memory_value)
+        except InvalidOperation:
+            raise ValueError(
+                "Memory must be a number of GB, for example 16 or 7.5."
+            ) from None
+        if not gb.is_finite() or gb <= 0:
+            raise ValueError("Memory must be a number of GB, for example 16 or 7.5.")
+        memory = int((gb * 1024).to_integral_value(rounding=ROUND_HALF_UP))
+    if cpus is None and memory is None:
+        raise ValueError("Change the CPUs, the memory or both first.")
+    return picker.resource_changes({"cpus": cpus, "memory_mib": memory})
 
 
 def bundled_askpass():
@@ -286,6 +321,10 @@ class DesktopApp:
         self.cancel_button.pack(side="left", padx=(16, 0))
         self.rerun_button = ttk.Button(bar, text="Run again", command=self.run_again)
         self.rerun_button.pack(side="left", padx=8)
+        self.resources_button = ttk.Button(
+            bar, text="CPUs & memory…", command=self.change_resources
+        )
+        self.resources_button.pack(side="left")
         # Packed last so the file count gives way first in narrow windows.
         self.count = ttk.Label(bar, text="No files added")
         self.count.pack(side="right")
@@ -293,8 +332,8 @@ class DesktopApp:
             content,
             text=(
                 "Add .gjf or .com inputs, or Load my jobs from the HPC. Preview, "
-                "Submit and Check use the whole list; Cancel job and Run again use "
-                "selected rows."
+                "Submit and Check use the whole list; Cancel job, Run again and "
+                "CPUs & memory use selected rows."
             ),
             wraplength=1000,
         )
@@ -453,6 +492,8 @@ class DesktopApp:
                 "job_details": "Reading job details…",
                 "cancel_jobs": "Cancelling the selected pending jobs…",
                 "rerun": "Preparing the selected files again (nothing is submitted)…",
+                "change_resources": "Preparing the selected files again with new CPUs "
+                "and memory (nothing is submitted)…",
                 "load_jobs": "Finding your recent jobs on the HPC…",
                 "restore_jobs": "Copying jobs that are not on this computer…",
                 "search_jobs": "Looking for your input files in the chosen folder…",
@@ -718,6 +759,7 @@ class DesktopApp:
             "clear": self.clear_button,
             "cancel": self.cancel_button,
             "rerun": self.rerun_button,
+            "resources": self.resources_button,
             "preview": self.preview_button,
             "submit": self.submit_button,
             "monitor": self.monitor_button,
@@ -791,6 +833,9 @@ class DesktopApp:
         self.rerun_button.configure(
             state="normal" if self.rerunnable() and ready else "disabled"
         )
+        self.resources_button.configure(
+            state="normal" if self.changeable() and ready else "disabled"
+        )
         self.script_button.configure(
             state="normal" if self.table.selection() and self.rows else "disabled"
         )
@@ -832,6 +877,17 @@ class DesktopApp:
                 status.state_name(row.get("state")) != "PREPARED"
                 or row.get("input_changed")
             )
+            for _, row in rows
+        )
+
+    def changeable(self):
+        """Prepared, unchanged rows: their CPUs and memory may still change."""
+        rows = self.selected_rows()
+        return bool(rows) and all(
+            row
+            and status.state_name(row.get("state")) == "PREPARED"
+            and not row.get("input_changed")
+            and not row.get("job_id")
             for _, row in rows
         )
 
@@ -917,6 +973,121 @@ class DesktopApp:
                 self.buttons()
             else:
                 self.start("rerun", *arguments)
+
+    def change_resources(self):
+        if self.busy and not self.watching():
+            return
+        if not self.changeable() or not self.settings_ready():
+            return
+        rows = self.selected_rows()
+        changes = self.ask_resources([row for _, row in rows])
+        if changes is None:
+            return
+        edited = [row["name"] for _, row in rows if row.get("script_edited")]
+        if edited and not messagebox.askyesno(
+            "Discard script edits?",
+            f"{len(edited)} selected file(s) have an edited job script:\n\n"
+            + self.listing(edited)
+            + "\n\nChanging CPUs or memory prepares them again from the input, so "
+            "those script edits are discarded. Continue?",
+            parent=self.root,
+            default="no",
+        ):
+            return
+        self.review = None
+        arguments = (
+            [path for path, _ in rows],
+            [str(path) for path in self.files],
+            dict(self.settings),
+            changes,
+        )
+        if self.watching():
+            self.controller.request("change_resources", *arguments)
+            self.log(
+                "Changing CPUs and memory on the open connection; watching continues."
+            )
+            self.buttons()
+        else:
+            self.start("change_resources", *arguments)
+
+    def ask_resources(self, rows):
+        """New CPUs and memory for the selected rows, or None when cancelled."""
+        dialog, _, entries, buttons, result = self.resources_dialog(rows)
+        dialog.grab_set()
+        entries["cpus"].focus_set()
+        self.root.wait_window(dialog)
+        return result["changes"]
+
+    def resources_dialog(self, rows):
+        """The CPUs and memory window, its values, entries, buttons and result."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("CPUs and memory")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=22)
+        frame.pack(fill="both", expand=True)
+        current = self.listing(
+            [f"{row['name']}: {resource_text(row['resources'])}" for row in rows]
+        )
+        ttk.Label(
+            frame,
+            text=(
+                f"New CPUs and memory for {len(rows)} prepared file(s):\n\n{current}"
+                "\n\nLeave a box as it is to keep that value. Each file is prepared "
+                "again as a new job: its old receipt is kept beside the input and "
+                "nothing is submitted. The HPC writes the matching %nprocshared and "
+                "%mem into its own copy of the input; your file is not changed. Slurm "
+                "decides whether the cluster can run what you ask for."
+            ),
+            wraplength=520,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        def common(key):
+            values = {row["resources"][key] for row in rows}
+            return values.pop() if len(values) == 1 else None
+
+        cpus, memory = common("cpus"), common("slurm_memory_mib")
+        prefill = {
+            "cpus": "" if cpus is None else str(cpus),
+            "memory": "" if memory is None else memory_text(memory),
+        }
+        values = {key: tk.StringVar(value=text) for key, text in prefill.items()}
+        entries = {}
+        for row, key, label in (
+            (1, "cpus", "CPUs"),
+            (2, "memory", "Memory (GB, total for Slurm)"),
+        ):
+            ttk.Label(frame, text=label).grid(
+                row=row, column=0, sticky="w", pady=(12 if row == 1 else 6, 0)
+            )
+            entries[key] = ttk.Entry(frame, textvariable=values[key], width=12)
+            entries[key].grid(
+                row=row, column=1, sticky="w", pady=(12 if row == 1 else 6, 0)
+            )
+        problem = ttk.Label(frame, text="", foreground="#a4262c", wraplength=520)
+        problem.grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        result = {"changes": None}
+
+        def apply():
+            try:
+                result["changes"] = parse_resource_entries(
+                    values["cpus"].get(), values["memory"].get(), prefill
+                )
+            except ValueError as error:
+                problem.configure(text=str(error))
+                return
+            dialog.destroy()
+
+        buttons = {
+            "apply": ttk.Button(
+                frame, text="Prepare again", command=apply, style="Accent.TButton"
+            ),
+            "cancel": ttk.Button(frame, text="Cancel", command=dialog.destroy),
+        }
+        buttons["cancel"].grid(row=4, column=0, sticky="w", pady=(14, 0))
+        buttons["apply"].grid(row=4, column=1, sticky="e", pady=(14, 0))
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        return dialog, values, entries, buttons, result
 
     def invalidate(self):
         self.review = None
