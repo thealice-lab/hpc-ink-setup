@@ -118,8 +118,14 @@ def workflow(tmp_path, monkeypatch):
                     "state": "PREPARED",
                     "script": "# synthetic SBATCH",
                     "resources": {
-                        "cpus": 2,
-                        "slurm_memory_mib": 1024,
+                        "cpus": request.get("cpus") or 2,
+                        "cpus_source": "explicit override"
+                        if request.get("cpus") is not None
+                        else "TENSOR export",
+                        "slurm_memory_mib": request.get("memory_mib") or 1024,
+                        "memory_source": "explicit Slurm override"
+                        if request.get("memory_mib") is not None
+                        else "TENSOR export plus cluster headroom",
                         "gaussian_memory_mb": 768,
                         "hours": request["hours"],
                     },
@@ -1430,6 +1436,140 @@ def test_run_again_archives_receipt_and_prepares_without_submitting(workflow):
         if e["event_type"] == "desktop_rerun"
     ]
     assert [e["status"] for e in reruns] == ["approved", "prepared"]
+
+
+def resource_events(workflow):
+    workflow.controller.execute("close")
+    return [
+        e["payload"]["status"]
+        for e in workflow.controller.journal.take()
+        if e["event_type"] == "desktop_resources"
+    ]
+
+
+def test_cpus_and_memory_change_prepares_a_new_handoff_without_submitting(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    receipt_path = w.paths[0].with_suffix(".gjf.inkly.json")
+    original = receipt_path.read_bytes()
+    w.calls.clear()
+    w.events.clear()
+    w.controller.change_resources(
+        [w.paths[0]], w.paths, SETTINGS, {"cpus": 8, "memory_mib": 16384}
+    )
+    archives = list(w.paths[0].parent.glob("sample_1.gjf.inkly.json.resources-*.bak"))
+    assert len(archives) == 1 and archives[0].read_bytes() == original
+    new_receipt = json.loads(receipt_path.read_text())
+    assert new_receipt["bundle"] != json.loads(original)["bundle"]
+    resources = w.records[new_receipt["bundle"]]["resources"]
+    assert (resources["cpus"], resources["slurm_memory_mib"]) == (8, 16384)
+    assert resources["cpus_source"] == "explicit override"
+    assert "submit" not in actions(w)
+    assert actions(w)[:2] == ["status", "prepare"]
+    assert actions(w).count("prepare") == 1
+    assert w.controller.review()["count"] == 2
+    assert rows_for(w, w.paths[0])[-1]["resources"]["cpus"] == 8
+    assert any(
+        "now 8 CPUs, 16 GB Slurm memory (was 2 CPUs, 1 GB Slurm memory). "
+        "Nothing was submitted." in text
+        for text in messages(w)
+    )
+    assert resource_events(w) == ["approved", "prepared"]
+
+
+def test_a_blank_value_keeps_an_earlier_choice(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 8, "memory_mib": None}
+    )
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": None, "memory_mib": 4096}
+    )
+    bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    resources = w.records[bundle]["resources"]
+    assert (resources["cpus"], resources["slurm_memory_mib"]) == (8, 4096)
+    assert len(list(w.paths[0].parent.glob("*.resources-*.bak"))) == 2
+
+
+def test_unchanged_resources_prepare_nothing(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.calls.clear()
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 2, "memory_mib": 1024}
+    )
+    assert "prepare" not in actions(w)
+    assert not list(w.paths[0].parent.glob("*.resources-*.bak"))
+    assert any("it was left as it is" in text for text in messages(w))
+    assert resource_events(w) == []
+
+
+@pytest.mark.parametrize(
+    "state", ["PENDING", "RUNNING", "COMPLETED", "CANCELLED by 1000", "UNKNOWN"]
+)
+def test_only_unsubmitted_jobs_get_new_cpus_and_memory(workflow, state):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    receipt_path = w.paths[1].with_suffix(".gjf.inkly.json")
+    original = receipt_path.read_bytes()
+    recorded_job(w, w.paths[1], state, "2")
+    w.calls.clear()
+    with pytest.raises(ValueError, match="Only jobs that have not been submitted"):
+        w.controller.change_resources(w.paths, w.paths, SETTINGS, {"cpus": 8})
+    assert receipt_path.read_bytes() == original
+    assert not list(w.paths[0].parent.glob("*.resources-*.bak"))
+    assert "prepare" not in actions(w) and "submit" not in actions(w)
+
+
+def test_an_edited_input_must_run_again_before_its_resources_change(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.paths[0].write_bytes(w.paths[0].read_bytes() + b"\n")
+    w.calls.clear()
+    with pytest.raises(ValueError, match="Choose Run again to prepare the edited file"):
+        w.controller.change_resources(w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 8})
+    assert "prepare" not in actions(w)
+
+
+@pytest.mark.parametrize(
+    "changes", [{"cpus": 0}, {"memory_mib": 100}, {}, {"hours": 4}]
+)
+def test_invalid_resource_changes_are_refused_before_connecting(workflow, changes):
+    w = workflow
+    with pytest.raises(ValueError):
+        w.controller.change_resources(w.paths[:1], w.paths[:1], SETTINGS, changes)
+    assert not w.connections and not w.calls
+
+
+def test_run_again_keeps_the_cpus_and_memory_chosen_for_the_earlier_job(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 8, "memory_mib": None}
+    )
+    recorded_job(w, w.paths[0], "FAILED", "7")
+    w.events.clear()
+    w.controller.rerun(w.paths[:1], w.paths[:1], SETTINGS)
+    bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    resources = w.records[bundle]["resources"]
+    assert resources["cpus"] == 8 and resources["cpus_source"] == "explicit override"
+    assert resources["memory_source"] == "TENSOR export plus cluster headroom"
+    assert any(
+        "keeping the 8 CPUs chosen for its earlier job" in text for text in messages(w)
+    )
+
+
+def test_cpus_and_memory_can_change_while_watching(workflow):
+    w = workflow
+    assert "change_resources" in w.controller.WATCH_REQUESTS
+    w.controller.execute("preview", w.paths, SETTINGS)
+    w.controller.execute(
+        "change_resources", [w.paths[0]], w.paths, SETTINGS, {"memory_mib": 2048}
+    )
+    bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    assert w.records[bundle]["resources"]["slurm_memory_mib"] == 2048
+    assert "submit" not in actions(w)
 
 
 @pytest.mark.parametrize(

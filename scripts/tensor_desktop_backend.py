@@ -17,6 +17,18 @@ import tensor_picker as picker
 from inkly.core.desktop_diagnostics import DesktopJournal
 
 
+def resource_text(resources):
+    """'8 CPUs, 16 GB Slurm memory' from a job's resources or a chosen change."""
+    parts = []
+    if "cpus" in resources:
+        cpus = resources["cpus"]
+        parts.append(f"{cpus} CPU" + ("" if cpus == 1 else "s"))
+    memory = resources.get("slurm_memory_mib", resources.get("memory_mib"))
+    if memory is not None:
+        parts.append(f"{round(memory / 1024, 2):g} GB Slurm memory")
+    return ", ".join(parts)
+
+
 class DesktopController:
     def __init__(self, emit, askpass=None, interval=30, journal=None, index=None):
         self.emit = emit
@@ -167,6 +179,8 @@ class DesktopController:
                 "output": str(output) if output else "",
                 # The file was edited after this bundle was prepared.
                 "input_changed": bool(item.get("changed")),
+                # The HPC copy of the job script was edited (newer endpoints).
+                "script_edited": bool(response.get("script_edited")),
             },
         )
 
@@ -601,6 +615,7 @@ class DesktopController:
         "preview",
         "submit",
         "rerun",
+        "change_resources",
         "load_jobs",
         "restore_jobs",
         "history",
@@ -649,7 +664,7 @@ class DesktopController:
             try:
                 if action in {"cancel_jobs", "job_details"}:
                     targets = [self.target_for(args[0], args[1], "resume")]
-                elif action == "rerun":
+                elif action in {"rerun", "change_resources"}:
                     targets = [
                         self.target_for(args[0], args[2], "resume"),
                         self.target_for(args[1], args[2], "preview"),
@@ -683,7 +698,12 @@ class DesktopController:
             except ValueError as error:
                 self.emit("request_error", str(error))
                 continue
-            changed = changed or action in {"preview", "submit", "rerun"}
+            changed = changed or action in {
+                "preview",
+                "submit",
+                "rerun",
+                "change_resources",
+            }
 
     def monitor(self):
         if not self.items or not self.items[0].get("receipt"):
@@ -1136,17 +1156,103 @@ class DesktopController:
         for item in items:
             self.check_stop()
             old_bundle = item["receipt"]["bundle"]
+            chosen = picker.chosen_resources(item["response"]["resources"])
+            if chosen:
+                self.emit(
+                    "message",
+                    f"{item['path'].name}: keeping the {resource_text(chosen)} chosen "
+                    "for its earlier job.",
+                )
             picker.prepare_again(
                 self.session,
                 item,
                 settings,
                 report=lambda value: self.emit("message", value),
+                resources=chosen,
             )
             try:
                 self.index.replaced(old_bundle)
             except Exception:
                 pass
             self.audit("desktop_rerun", {"status": "prepared", "count": 1})
+        # Re-read the whole list so the rows and the approval cover every file.
+        self.preview(paths, settings)
+
+    def change_resources(self, selected, paths, settings, changes):
+        """Prepare selected unsubmitted files again with new CPUs or memory.
+
+        Each changed file gets a new bundle, as Run again does: the old receipt
+        is archived beside the input and nothing is submitted. A value left as
+        None keeps the job's current one.
+        """
+        self.check_stop()
+        changes = picker.resource_changes(changes)
+        self.review_id = None
+        self.emit("review", None)
+        settings, items, _ = self.selected_items(
+            selected, settings, "Select the rows to change first."
+        )
+        # Check every selected file before changing any receipt.
+        for item in items:
+            response = item["response"]
+            state = picker.state_name(response.get("state", response["submission"]))
+            if item.get("changed"):
+                raise ValueError(
+                    f"{item['path'].name} was edited after it was prepared, so its CPUs "
+                    "and memory were not changed. Choose Run again to prepare the "
+                    "edited file first."
+                )
+            if state != "PREPARED":
+                raise ValueError(
+                    f"{item['path'].name} is {state}, so its CPUs and memory were not "
+                    "changed. Only jobs that have not been submitted can be changed; "
+                    "for an ended job, choose Run again first."
+                )
+        plans = []
+        for item in items:
+            current = item["response"]["resources"]
+            wanted = {
+                **picker.chosen_resources(current),
+                **{key: value for key, value in changes.items() if value is not None},
+            }
+            if (
+                wanted.get("cpus", current["cpus"]) == current["cpus"]
+                and wanted.get("memory_mib", current["slurm_memory_mib"])
+                == current["slurm_memory_mib"]
+            ):
+                self.emit(
+                    "message",
+                    f"{item['path'].name} already uses {resource_text(current)}; "
+                    "it was left as it is.",
+                )
+                continue
+            plans.append((item, wanted))
+        if not plans:
+            self.preview(paths, settings)
+            return
+        self.audit("desktop_resources", {"status": "approved", "count": len(plans)})
+        for item, wanted in plans:
+            self.check_stop()
+            old_bundle = item["receipt"]["bundle"]
+            before = resource_text(item["response"]["resources"])
+            picker.prepare_again(
+                self.session,
+                item,
+                settings,
+                report=lambda value: self.emit("message", value),
+                resources=wanted,
+                label="resources",
+            )
+            try:
+                self.index.replaced(old_bundle)
+            except Exception:
+                pass
+            self.audit("desktop_resources", {"status": "prepared", "count": 1})
+            self.emit(
+                "message",
+                f"{item['path'].name}: now {resource_text(item['response']['resources'])}"
+                f" (was {before}). Nothing was submitted.",
+            )
         # Re-read the whole list so the rows and the approval cover every file.
         self.preview(paths, settings)
 
@@ -1170,6 +1276,8 @@ class DesktopController:
                 self.job_details(*args)
             elif action == "rerun":
                 self.rerun(*args)
+            elif action == "change_resources":
+                self.change_resources(*args)
             elif action in {"load_jobs", "restore_jobs", "history", "search_jobs"}:
                 getattr(self, action)(*args)
             elif action == "close":
