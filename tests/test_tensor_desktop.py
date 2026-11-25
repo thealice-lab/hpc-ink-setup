@@ -3661,3 +3661,67 @@ def test_native_framed_sections_and_checkboxes_match_the_window(
             assert styled[name]["background"] == window, name
     finally:
         app.close()
+
+
+@native_display
+def test_native_watched_jobs_that_finish_notify_once_per_check(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w = workflow
+    first, second = (str(path) for path in w.paths)
+    shown, in_front = [], {"value": False}
+    monkeypatch.setattr(
+        app.notifier,
+        "show",
+        lambda title, text, warning=False: shown.append((title, text, warning)),
+    )
+    monkeypatch.setattr(app.notifier, "foreground", lambda: in_front["value"])
+
+    def rows(*changes):
+        for path, state in changes:
+            job = "1" if path == first else "2"
+            app.events.put(("row", {**app.rows[path], "state": state, "job_id": job}))
+        app.drain()
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        assert app.notify_jobs.get() is True  # On unless turned off.
+        # Not watching: a finished state shown by a preview or a load is quiet.
+        rows((first, "RETURNED"))
+        assert shown == []
+
+        app.busy, app.action = True, "monitor"
+        rows((first, "RUNNING"), (second, "RUNNING"))
+        assert shown == []
+        rows((first, "RETURNED"), (second, "OUT_OF_MEMORY"))
+        assert len(shown) == 1  # One notification for the whole check.
+        title, text, warning = shown[0]
+        assert title == "Inkly: 1 returned and 1 ended without a result"
+        assert "Returned: sample_1.gjf" in text
+        assert "No result: sample_2.gjf (OUT_OF_MEMORY)" in text
+        assert "All watched jobs are done." in text and warning
+        rows((first, "RETURNED"))  # The same state again is not news.
+        assert len(shown) == 1
+
+        # With Desktop in front, the table already shows it.
+        rows((first, "RUNNING"))
+        in_front["value"] = True
+        rows((first, "RETURNED"))
+        assert len(shown) == 1
+
+        # Turned off, nothing is shown, and the choice is kept for next time.
+        in_front["value"] = False
+        app.notify_jobs.set(False)
+        app.save_notify_choice()
+        rows((first, "RUNNING"))
+        rows((first, "RETURNED"))
+        assert len(shown) == 1
+        assert gui.notify.load_preference(tmp_path) is False
+    finally:
+        app.busy = False
+        app.close()

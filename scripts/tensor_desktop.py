@@ -24,6 +24,7 @@ if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tensor_desktop_jobs as jobs
+import tensor_desktop_notify as notify
 import tensor_desktop_setup as hpc_setup
 import tensor_desktop_status as status
 import tensor_picker as picker
@@ -171,6 +172,10 @@ class DesktopApp:
         # job was added to the list (then it ends with one preview).
         self.load_context = {"settings": None, "added": False}
         self.jobs_index = jobs.Index()
+        # Watched jobs that returned or ended without a result since the last
+        # notification; one notification covers each batch of events.
+        self.notifier = notify.Notifier(self.root)
+        self.finished = {"returned": [], "failed": []}
         self.history_window = None
         self.history_listing = None
         # Inkly on the HPC: what Test connection last found, and the offers
@@ -430,6 +435,14 @@ class DesktopApp:
         ttk.Label(activity_bar, text="Activity", font=("Segoe UI", 11, "bold")).pack(
             side="left"
         )
+        self.notify_jobs = tk.BooleanVar(value=notify.load_preference(self.path.parent))
+        self.notify_button = ttk.Checkbutton(
+            activity_bar,
+            text="Notify me when watched jobs finish",
+            variable=self.notify_jobs,
+            command=self.save_notify_choice,
+        )
+        self.notify_button.pack(side="left", padx=(16, 0))
         self.results_button = ttk.Button(
             activity_bar, text="Open results folder", command=self.open_results
         )
@@ -521,7 +534,18 @@ class DesktopApp:
             elif kind == "history":
                 self.show_history(data)
             elif kind == "row":
+                previous = self.rows.get(data["path"])
                 self.rows[data["path"]] = data
+                if self.watching():
+                    finished = notify.outcome(
+                        previous.get("state") if previous else None, data["state"]
+                    )
+                    if finished == "returned":
+                        self.finished["returned"].append(data["name"])
+                    elif finished == "failed":
+                        self.finished["failed"].append(
+                            (data["name"], notify.state_name(data["state"]))
+                        )
                 if self.table.exists(data["path"]):
                     r = data["resources"]
                     self.table.item(
@@ -617,6 +641,7 @@ class DesktopApp:
             if not self.busy and self.after_done and not self.closed:
                 step, self.after_done = self.after_done, None
                 step()
+        self.announce()
         if (
             self.recovery_request
             and (not self.busy or self.watching())
@@ -767,6 +792,7 @@ class DesktopApp:
             "script": self.script_button,
             "results": self.results_button,
             "details": self.details_button,
+            "notify": self.notify_button,
             "load_jobs": self.load_button,
             "history": self.history_button,
             "status": self.status,
@@ -2092,6 +2118,29 @@ class DesktopApp:
                 parent=self.root,
             )
 
+    def announce(self):
+        """One Windows notification for the watched jobs that just finished."""
+        returned, failed = self.finished["returned"], self.finished["failed"]
+        if not returned and not failed:
+            return
+        self.finished = {"returned": [], "failed": []}
+        if self.closed or not self.notify_jobs.get() or self.notifier.foreground():
+            return  # In front, the table already shows it.
+        watching = sum(
+            1
+            for row in self.rows.values()
+            if row.get("job_id")
+            and notify.state_name(row.get("state")) not in notify.DONE_STATES
+        )
+        title, text = notify.message(returned, failed, watching)
+        self.notifier.show(title, text, warning=bool(failed))
+
+    def save_notify_choice(self):
+        try:
+            notify.save_preference(self.path.parent, self.notify_jobs.get())
+        except OSError as error:
+            self.log(f"Could not save the notification choice: {error}")
+
     def close(self):
         if self.busy and not messagebox.askyesno(
             "Close Inkly Desktop?",
@@ -2108,6 +2157,7 @@ class DesktopApp:
         self.root.after_cancel(self.timer)
         if self.stop_deadline:
             self.root.after_cancel(self.stop_deadline)
+        self.notifier.close()
         self.root.destroy()
         # Free the closed window here, on the Tk thread. Automatic collection
         # stays off: this window's threads may still be finishing.
