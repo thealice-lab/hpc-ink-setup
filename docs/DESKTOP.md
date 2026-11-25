@@ -211,6 +211,17 @@ succeed.
    choose **Open results folder**, then import the logs in TENSOR's
    **Analysis & 3D view → Add logs**, or use the researcher's analysis tools.
 
+While the app watches, Windows shows a notification when a job returns or
+ends without a result (failed, timed out, out of memory and similar), and the
+taskbar button flashes until you bring Desktop forward. Jobs that finish at the
+same check share one notification. Nothing is shown while Desktop is the window
+in front, because the table already shows it, and cancelled jobs never notify.
+Notifications name the input files, and Windows' own notification settings
+apply. To turn them off, untick **Notify me when watched jobs finish** beside
+Activity; the choice is kept in `%LOCALAPPDATA%\Inkly\desktop-preferences.json`.
+After the first notification, Desktop's icon stays in the notification area
+until the app closes.
+
 You can keep working while the app watches. **Add files** or **Add folder**,
 then **Preview files** and **Submit prepared jobs** for the new inputs; **Run
 again** and **Cancel job** work too. These run on the connection that is
