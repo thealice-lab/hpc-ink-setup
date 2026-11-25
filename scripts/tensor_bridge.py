@@ -20,7 +20,59 @@ import time
 import uuid
 
 
-def _ssh_args(receipt, ssh, session=False):
+class MissingBundleError(ValueError):
+    """The HPC no longer has the bundle referenced by a saved receipt."""
+
+
+class MissingLauncherError(ValueError):
+    """The configured Inkly launcher is missing or broken on the HPC."""
+
+
+class HostKeyError(ValueError):
+    """This computer does not trust the HPC's SSH host key yet."""
+
+
+SETUP_PREFIX = b"INKLY-SETUP "
+# Windows allows 32,767 characters per command line; keep room for ssh options.
+SETUP_COMMAND_LIMIT = 30000
+# Progress lines keep the setup alive; the first one also waits for sign-in.
+SETUP_IDLE_SECONDS = 300
+SETUP_TOTAL_SECONDS = 1200
+
+LOST_CONNECTION = (
+    "Lost the connection to the HPC, for example because this computer slept or "
+    "the network changed. Submitted jobs keep running on the HPC. Sign in again "
+    "to continue, for example with Check & return results."
+)
+
+
+def setup_command(
+    script, *, commit, version, repository, mode="auto", shared_logging=True
+):
+    """Remote command that runs the setup script, then the session, on one login."""
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("HPC setup needs a full 40-character commit")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("HPC setup needs a release version such as 0.6.0")
+    if mode not in {"auto", "repair"}:
+        raise ValueError("Unknown HPC setup mode")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/@+-]*", repository):
+        raise ValueError("Unsupported repository address for HPC setup")
+    payload = base64.b64encode(script).decode("ascii")
+    # Only base64 and the values checked above go inside the single quotes, so
+    # bash, sh, zsh, csh and tcsh login shells all pass the command on unchanged.
+    # eval keeps SSH's stdin attached for the session that follows.
+    command = (
+        f"/bin/bash -c 'C={commit}; V={version}; R={repository}; M={mode}; "
+        f"S={1 if shared_logging else 0}; P={payload}; "
+        'eval "$(printf %s "$P" | base64 -d)"\''
+    )
+    if len(command) > SETUP_COMMAND_LIMIT:
+        raise ValueError("The HPC setup script is too large to send in one command")
+    return command
+
+
+def _ssh_args(receipt, ssh, session=False, remote=None):
     host = receipt["host"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", host):
         raise ValueError("Use an OpenSSH host alias or user@host")
@@ -30,6 +82,8 @@ def _ssh_args(receipt, ssh, session=False):
     command = (
         '"$HOME"/' + shlex.quote(ink[2:]) if ink.startswith("~/") else shlex.quote(ink)
     ) + (" tensor --session" if session else " tensor")
+    if remote is not None:
+        command = remote  # The setup script ends by starting this same session.
     options = []
     if receipt.get("auth") == "keyboard-interactive":
         options = [
@@ -64,7 +118,10 @@ def _response(raw, receipt):
     if not isinstance(response, dict):
         raise ValueError("Expected an Inkly response object")
     if not response.get("ok"):
-        raise ValueError(response.get("error", "Remote operation failed"))
+        error = response.get("error", "Remote operation failed")
+        if error == "Unknown bundle; prepare a new input first":
+            raise MissingBundleError(error)
+        raise ValueError(error)
     if response.get("bundle") != receipt["bundle"]:
         raise ValueError("Response bundle does not match the receipt")
     return response
@@ -94,15 +151,20 @@ def exchange(receipt, request, ssh):
 class Session:
     """Use one authenticated SSH connection for preview, decision and monitoring."""
 
-    def __init__(self, receipt, ssh):
+    def __init__(self, receipt, ssh, remote=None):
         self.receipt = receipt
+        self.diagnostics = None
         self.process = subprocess.Popen(
-            _ssh_args(receipt, ssh, session=True),
+            _ssh_args(receipt, ssh, session=True, remote=remote),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.responses = queue.Queue()
+        # Once the HPC has answered, a closed stream means the connection was
+        # lost (sleep, network change), not a login or version problem.
+        self.answered = False
         self.error_tail = b""
         self.error_reader = threading.Thread(target=self._read_errors, daemon=True)
         self.error_reader.start()
@@ -128,8 +190,17 @@ class Session:
         finally:
             self.responses.put(None)
 
-    def exchange(self, request):
-        request = {**request, "bundle": self.receipt["bundle"]}
+    def exchange(self, request, *, receipt=None):
+        receipt = receipt or self.receipt
+        if any(
+            receipt.get(key) != self.receipt.get(key)
+            for key in ("host", "ink_path", "auth")
+        ):
+            raise ValueError("One SSH session cannot mix connection settings")
+        request = {**request, "bundle": receipt["bundle"]}
+        metadata = self._diagnostic_batch()
+        if metadata:
+            request["desktop_diagnostics"] = metadata
         # Cover a blocked input transfer/authentication as well as response reads.
         deadline = threading.Timer(180, self.process.kill)
         deadline.daemon = True
@@ -145,31 +216,132 @@ class Session:
         finally:
             deadline.cancel()
         if raw is None:
-            self.error_reader.join(timeout=1)
-            error = self.error_tail.lower()
-            if b"could not resolve hostname" in error:
-                raise ValueError(
-                    "Cannot resolve SSH host; check the network/VPN and resume"
-                )
-            if b"permission denied" in error:
-                raise ValueError(
-                    "SSH authentication denied; complete the local sign-in and resume"
-                )
-            if b"host key verification failed" in error:
-                raise ValueError(
-                    "SSH host key is not trusted; verify it through the established site procedure"
-                )
-            raise ValueError(
-                "SSH closed; check login and matching HPC version, then resume"
+            raise self._closed(
+                LOST_CONNECTION
+                if self.answered
+                else "SSH closed; check login and matching HPC version, then resume"
             )
+        self.answered = True
         if len(raw) > 96 * 1024 * 1024:
             raise ValueError("Response exceeds transfer limit")
-        return _response(raw, self.receipt)
+        return _response(raw, receipt)
+
+    def _closed(self, default):
+        """Explain a closed connection without echoing the remote's own text."""
+        self.error_reader.join(timeout=1)
+        error = self.error_tail.lower()
+        ink = self.receipt.get("ink_path", "")
+        path = (ink[2:] if ink.startswith("~/") else ink).lower().encode()
+        # bash: ".../ink: No such file or directory"; csh: ".../ink: Command not
+        # found."; a deleted Python environment: ".../ink: ...: bad interpreter".
+        missing = path and (
+            path + b": no such file or directory" in error
+            or path + b": command not found" in error
+            or (path + b": " in error and b"bad interpreter" in error)
+        )
+        if missing:
+            return MissingLauncherError(
+                f"Inkly is not installed at {ink} on the HPC, or that copy is "
+                "incomplete. Use Set up Inkly on the HPC in Connection settings."
+            )
+        if b"could not resolve hostname" in error:
+            return ValueError(
+                "Cannot resolve SSH host; check the network/VPN and resume"
+            )
+        if b"permission denied" in error:
+            return ValueError(
+                "SSH authentication denied; complete the local sign-in and resume"
+            )
+        if b"host key verification failed" in error:
+            return HostKeyError(
+                "SSH host key is not trusted; verify it through the established site procedure"
+            )
+        return ValueError(default)
+
+    def run_setup(self, progress):
+        """Read setup progress until "done"; the stream then speaks the session protocol.
+
+        Lines before the first progress line (a login banner) are ignored.
+        Returns the final frame, or raises with the setup's own plain message.
+        """
+        started = time.monotonic()
+        seen = False
+        while True:
+            left = SETUP_TOTAL_SECONDS - (time.monotonic() - started)
+            try:
+                if left <= 0:
+                    raise queue.Empty
+                raw = self.responses.get(timeout=min(SETUP_IDLE_SECONDS, left))
+            except queue.Empty:
+                self.process.kill()
+                raise ValueError(
+                    "HPC setup stopped responding and was disconnected. Running "
+                    "setup again is safe."
+                ) from None
+            if raw is None:
+                raise self._closed(
+                    "SSH closed before HPC setup finished. Running setup again is safe."
+                )
+            if not raw.startswith(SETUP_PREFIX):
+                if not seen:
+                    continue
+                self.process.kill()
+                raise ValueError(
+                    "Unexpected output from the HPC setup; it was stopped."
+                )
+            seen = True
+            try:
+                frame = json.loads(raw[len(SETUP_PREFIX) :])
+            except (ValueError, UnicodeError):
+                frame = None
+            if not isinstance(frame, dict):
+                self.process.kill()
+                raise ValueError("Invalid progress from the HPC setup; it was stopped.")
+            if frame.get("done") is True:
+                if frame.get("ok") is True:
+                    self.answered = True
+                    return frame
+                error = frame.get("error")
+                raise ValueError(
+                    error[:600]
+                    if isinstance(error, str) and error
+                    else "HPC setup failed"
+                )
+            progress(frame)
+
+    def _diagnostic_batch(self):
+        try:
+            return self.diagnostics.take() if self.diagnostics is not None else []
+        except Exception:
+            return []
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
+        metadata = self._diagnostic_batch()
+        if metadata:
+            # Final metadata uses the already authenticated stream. Its response
+            # is intentionally ignored because the stream closes immediately.
+            # A stuck log transfer may terminate only this closing connection.
+            deadline = threading.Timer(1, self.process.kill)
+            deadline.daemon = True
+            deadline.start()
+            try:
+                self.process.stdin.write(
+                    json.dumps(
+                        {
+                            "action": "desktop_diagnostics",
+                            "desktop_diagnostics": metadata,
+                        }
+                    ).encode()
+                    + b"\n"
+                )
+                self.process.stdin.flush()
+            except (OSError, ValueError):
+                pass
+            finally:
+                deadline.cancel()
         try:
             self.process.stdin.close()
         except OSError:
@@ -207,7 +379,7 @@ def retrieve(response, output):
     return path
 
 
-def _prepare(args):
+def _prepare(args, report=print):
     with args.input.open("rb") as source:
         data = source.read(5 * 1024 * 1024 + 1)
     if not data or len(data) > 5 * 1024 * 1024:
@@ -228,7 +400,7 @@ def _prepare(args):
         json.dump(receipt, out)
         out.flush()
         os.fsync(out.fileno())
-    print(f"Recovery receipt: {path}")
+    report(f"Recovery receipt: {path}")
     return receipt, {
         "action": "prepare",
         "name": args.input.name,

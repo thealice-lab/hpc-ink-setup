@@ -131,6 +131,31 @@ def test_tensor_command_bypasses_model_and_conversation(monkeypatch):
     assert ink_core.main() == 42
 
 
+def test_missing_remote_bundle_has_a_specific_recovery_error():
+    receipt = {
+        "host": "cluster",
+        "ink_path": "/bin/ink",
+        "bundle": "a" * 32,
+    }
+    raw = json.dumps(
+        {"ok": False, "error": "Unknown bundle; prepare a new input first"}
+    ).encode()
+    with pytest.raises(bridge.MissingBundleError, match="Unknown bundle"):
+        bridge._response(raw, receipt)
+
+
+def test_other_remote_errors_are_not_classified_as_missing_bundles():
+    receipt = {
+        "host": "cluster",
+        "ink_path": "/bin/ink",
+        "bundle": "a" * 32,
+    }
+    raw = json.dumps({"ok": False, "error": "SSH authentication denied"}).encode()
+    with pytest.raises(ValueError, match="authentication denied") as error:
+        bridge._response(raw, receipt)
+    assert not isinstance(error.value, bridge.MissingBundleError)
+
+
 @pytest.mark.parametrize(
     "stdout,code", [(b"[]", 0), (b"not JSON", 255), (b'{"ok":true}', 255)]
 )
@@ -183,6 +208,51 @@ def test_session_reports_auth_failure_without_echoing_remote_stderr(monkeypatch)
         with pytest.raises(ValueError, match="authentication denied") as error:
             session.exchange({"action": "status"})
     assert "private-marker" not in str(error.value)
+
+
+def test_a_connection_lost_after_answers_is_not_reported_as_a_login_problem(
+    monkeypatch,
+):
+    # The HPC answers once, then the connection drops (sleep, network change).
+    peer = (
+        "import json, sys\n"
+        "line = sys.stdin.buffer.readline()\n"
+        "print(json.dumps({'ok': True, **json.loads(line)}), flush=True)\n"
+        "sys.stderr.write('client_loop: send disconnect: Connection reset')\n"
+        "sys.exit(255)\n"
+    )
+    receipt = fake_remote(monkeypatch, peer)
+    with bridge.Session(receipt, "ssh") as session:
+        assert session.exchange({"action": "status"})["action"] == "status"
+        with pytest.raises(ValueError) as error:
+            session.exchange({"action": "status"})
+    assert str(error.value) == bridge.LOST_CONNECTION
+    assert "Submitted jobs keep running" in str(error.value)
+    assert "matching HPC version" not in str(error.value)
+
+
+def test_a_connection_that_never_answers_still_points_to_login_and_version(
+    monkeypatch,
+):
+    receipt = fake_remote(monkeypatch, "import sys; sys.exit(1)")
+    with bridge.Session(receipt, "ssh") as session:
+        with pytest.raises(ValueError, match="check login and matching HPC version"):
+            session.exchange({"action": "version"})
+
+
+def test_a_connection_lost_after_setup_finished_is_reported_as_lost(monkeypatch):
+    frames = [{"done": True, "ok": True, "version": "0.6.0", "commit": "a" * 40}]
+    peer = (
+        "import json, sys\n"
+        f"print('INKLY-SETUP ' + json.dumps({frames[0]!r}), flush=True)\n"
+        "sys.exit(255)\n"
+    )
+    receipt = fake_remote(monkeypatch, peer)
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        session.run_setup(lambda frame: None)
+        with pytest.raises(ValueError) as error:
+            session.exchange({"action": "version"})
+    assert str(error.value) == bridge.LOST_CONNECTION
 
 
 def test_cuttlefish_auth_matches_existing_keyboard_interactive_helper():
@@ -348,3 +418,198 @@ def test_interrupt_keeps_receipt_and_does_not_submit(guided, monkeypatch):
     assert bridge.main(["run", str(source), "--host", "cluster"]) == 130
     assert source.with_suffix(".gjf.inkly.json").exists()
     assert [c["action"] for c in calls] == ["prepare"]
+
+
+SETUP_SCRIPT = (
+    Path(__file__).resolve().parents[1] / "scripts/desktop_hpc_setup.sh"
+).read_bytes()
+
+
+def setup_remote(**overrides):
+    values = {
+        "commit": "a" * 40,
+        "version": "0.6.0",
+        "repository": "https://github.com/thealice-lab/hpc-ink-setup.git",
+        **overrides,
+    }
+    return bridge.setup_command(SETUP_SCRIPT, **values)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"commit": "a" * 39},
+        {"commit": "A" * 40},
+        {"version": "0.6"},
+        {"version": "0.6.0; rm"},
+        {"mode": "force"},
+        {"repository": "https://x/y.git'; touch z"},
+        {"repository": "$(id)"},
+    ],
+)
+def test_setup_command_refuses_values_that_are_not_shell_safe(overrides):
+    with pytest.raises(ValueError):
+        setup_remote(**overrides)
+
+
+def test_setup_command_is_one_single_quoted_word_for_any_login_shell():
+    command = setup_remote(mode="repair", shared_logging=False)
+    assert command.startswith("/bin/bash -c '") and command.endswith("'")
+    assert command.count("'") == 2 and "\n" not in command
+    assert " M=repair; S=0; " in command
+    assert len(command) < bridge.SETUP_COMMAND_LIMIT
+
+
+def test_setup_command_refuses_a_script_too_large_for_windows():
+    with pytest.raises(ValueError, match="too large"):
+        bridge.setup_command(
+            b"#" * 25000,
+            commit="a" * 40,
+            version="0.6.0",
+            repository="https://github.com/o/r.git",
+        )
+
+
+def test_setup_command_survives_windows_argument_parsing():
+    """ssh.exe parses its command line as this child does (list2cmdline on Windows)."""
+    receipt = {"host": "alice@cluster", "ink_path": "~/.inkly/bin/ink"}
+    remote = setup_remote()
+    args = bridge._ssh_args(receipt, sys.executable, session=True, remote=remote)
+    assert args[-2:] == ["alice@cluster", remote]
+    echo = "import json, sys; sys.stdout.write(json.dumps(sys.argv[1:]))"
+    result = subprocess.run(
+        [sys.executable, "-c", echo, *args[1:]],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == args[1:]
+
+
+def fake_remote(monkeypatch, peer):
+    popen = subprocess.Popen
+    monkeypatch.setattr(
+        bridge.subprocess,
+        "Popen",
+        lambda args, **kwargs: popen([sys.executable, "-u", "-c", peer], **kwargs),
+    )
+    return {"host": "cluster", "ink_path": "~/.inkly/bin/ink", "bundle": "a" * 32}
+
+
+SETUP_PEER = r"""
+import json, sys
+print("Welcome to the cluster")
+for frame in FRAMES:
+    print("INKLY-SETUP " + json.dumps(frame), flush=True)
+for line in sys.stdin.buffer:
+    print(json.dumps({"ok": True, **json.loads(line)}), flush=True)
+"""
+
+
+def test_run_setup_skips_the_banner_reports_progress_then_hands_over(monkeypatch):
+    frames = [
+        {"stage": "preflight", "line": "bash 5.1"},
+        {"stage": "install", "line": "Installing Inkly"},
+        {"done": True, "ok": True, "version": "0.6.0", "commit": "a" * 40},
+    ]
+    receipt = fake_remote(monkeypatch, f"FRAMES = {frames!r}\n" + SETUP_PEER)
+    seen = []
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        done = session.run_setup(seen.append)
+        assert session.exchange({"action": "version"})["action"] == "version"
+    assert seen == frames[:2]
+    assert done == frames[2]
+
+
+def test_run_setup_raises_the_setup_scripts_own_message(monkeypatch):
+    frames = [
+        {"stage": "code", "line": "Updating"},
+        {"done": True, "ok": False, "stage": "code", "error": "has local changes"},
+    ]
+    receipt = fake_remote(monkeypatch, f"FRAMES = {frames!r}\n" + SETUP_PEER)
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        with pytest.raises(ValueError, match="^has local changes$"):
+            session.run_setup(lambda frame: None)
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        (
+            "print('INKLY-SETUP {\"stage\": \"code\"}'); print('stray')",
+            "Unexpected output",
+        ),
+        ("print('INKLY-SETUP [1, 2]')", "Invalid progress"),
+        ("print('INKLY-SETUP not json')", "Invalid progress"),
+        (
+            'print(\'INKLY-SETUP {"stage": "code"}\')',
+            "closed before HPC setup finished",
+        ),
+    ],
+)
+def test_run_setup_stops_on_broken_progress(monkeypatch, body, message):
+    receipt = fake_remote(monkeypatch, body + "\nimport time; time.sleep(0.5)")
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        with pytest.raises(ValueError, match=message):
+            session.run_setup(lambda frame: None)
+
+
+def test_run_setup_gives_up_when_the_hpc_goes_quiet(monkeypatch):
+    monkeypatch.setattr(bridge, "SETUP_IDLE_SECONDS", 0.5)
+    receipt = fake_remote(monkeypatch, "import time; time.sleep(30)")
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        with pytest.raises(ValueError, match="stopped responding"):
+            session.run_setup(lambda frame: None)
+    assert session.process.returncode is not None
+
+
+def test_run_setup_explains_a_failed_sign_in(monkeypatch):
+    receipt = fake_remote(
+        monkeypatch,
+        "import sys; sys.stderr.write('Permission denied private-marker'); sys.exit(255)",
+    )
+    with bridge.Session(receipt, "ssh", remote=setup_remote()) as session:
+        with pytest.raises(ValueError, match="authentication denied") as error:
+            session.run_setup(lambda frame: None)
+    assert "private-marker" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "stderr, kind",
+    [
+        (b"bash: /home/alice/.inkly/bin/ink: No such file or directory\n", "missing"),
+        (b"/home/alice/.inkly/bin/ink: Command not found.\n", "missing"),
+        (
+            b"bash: /home/alice/.inkly/bin/ink: /home/alice/.inkly/venv/bin/python: "
+            b"bad interpreter: No such file or directory\n",
+            "missing",
+        ),
+        # A Python error about some other file is not a missing launcher.
+        (b"FileNotFoundError: [Errno 2] No such file or directory: 'x.db'\n", "other"),
+        (b"Host key verification failed.\n", "host"),
+    ],
+)
+def test_closed_session_tells_a_missing_launcher_and_an_untrusted_host_apart(
+    monkeypatch, stderr, kind
+):
+    popen = subprocess.Popen
+    peer = f"import sys; sys.stderr.buffer.write({stderr!r}); sys.exit(127)"
+    monkeypatch.setattr(
+        bridge.subprocess,
+        "Popen",
+        lambda args, **kwargs: popen([sys.executable, "-c", peer], **kwargs),
+    )
+    receipt = {"host": "cluster", "ink_path": "~/.inkly/bin/ink", "bundle": "a" * 32}
+    with bridge.Session(receipt, "ssh") as session:
+        with pytest.raises(ValueError) as error:
+            session.exchange({"action": "version"})
+    expected = {
+        "missing": bridge.MissingLauncherError,
+        "host": bridge.HostKeyError,
+        "other": ValueError,
+    }[kind]
+    assert type(error.value) is expected
+    if kind == "missing":
+        assert "Set up Inkly on the HPC" in str(error.value)
+    assert "alice" not in str(error.value)

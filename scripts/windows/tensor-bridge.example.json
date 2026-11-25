@@ -1,0 +1,5 @@
+{
+  "host": "YOUR_USERNAME@YOUR_HPC_HOST",
+  "ink_path": "~/.inkly/bin/ink",
+  "auth": "keyboard-interactive"
+}

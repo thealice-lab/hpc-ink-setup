@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import hashlib
 import json
@@ -12,15 +13,33 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from inkly.cluster_profile import resolve_cluster_profile
 from inkly.core.storage import history_lock, private_directory, private_open
 from inkly.gaussian.job_spec import GaussianJobSpec
+from inkly.gaussian.job_insights import job_details
+from inkly.gaussian.job_list import list_jobs
 from inkly.gaussian.sbatch import generate_sbatch
 
 
 MAX_INPUT = 5 * 1024 * 1024
 MAX_OUTPUT = 64 * 1024 * 1024
+# Desktop asks for these before using newer operations; older endpoints reply
+# "Unsupported operation" to "version" and keep the session open.
+CAPABILITIES = (
+    "prepare",
+    "submit",
+    "status",
+    "fetch",
+    "cancel",
+    "version",
+    "job_details",
+    "jobs",
+    "input",
+)
+# Slurm accounting can lag scancel by a moment; re-read briefly, never retry it.
+CANCEL_STATUS_READS = 5
 
 
 def _read(path, limit=MAX_OUTPUT):
@@ -190,6 +209,45 @@ def _state(directory, receipt):
     return {"state": "UNKNOWN", "exit_code": None}
 
 
+def _base_state(status):
+    """Group scheduler detail such as "CANCELLED by 1234" under its state."""
+    words = str(status.get("state") or "").split()
+    return words[0].upper() if words else "UNKNOWN"
+
+
+def _cancel(directory, receipt, request):
+    """Cancel only a still-PENDING job recorded for this bundle; never resubmit."""
+    if request.get("confirm") is not True:
+        raise ValueError("Cancellation requires explicit confirmation")
+    job = receipt.get("job_id")
+    if not job:
+        raise ValueError("No Slurm job is recorded for this input; nothing to cancel")
+    current = _base_state(_state(directory, receipt))
+    if current != "PENDING":
+        raise ValueError(
+            f"Only PENDING jobs can be cancelled; Slurm reports {current} for job {job}"
+        )
+    # Record the request before Slurm acts, as submission does. A lost reply
+    # then still shows that a cancellation was asked for.
+    receipt.setdefault("cancel_requested", []).append(
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    _save(directory / "receipt.json", receipt)
+    # --state=PENDING: a job that started in the meantime is left running.
+    result = _scheduler(["scancel", "--state=PENDING", job], directory)
+    if result.returncode != 0:
+        raise ValueError(
+            f"Cancellation of job {job} is unconfirmed; check its status before trying again"
+        )
+    status = _state(directory, receipt)
+    for _ in range(CANCEL_STATUS_READS - 1):
+        if _base_state(status) != "PENDING":
+            break
+        time.sleep(1)
+        status = _state(directory, receipt)
+    return {**receipt, **status}
+
+
 def handle(request, root=None):
     """Process exactly one explicit operation; never retry a submission."""
     if os.name != "posix":
@@ -200,8 +258,29 @@ def handle(request, root=None):
     if not isinstance(bundle, str) or not re.fullmatch(r"[0-9a-f]{32}", bundle):
         raise ValueError("Invalid bundle ID")
     action = request.get("action")
-    if action not in {"prepare", "submit", "status", "fetch"}:
+    if action not in CAPABILITIES:
         raise ValueError("Unsupported operation")
+    if action == "version":
+        # Read-only and bundle-independent: no files, locks or Slurm calls.
+        from inkly import __version__
+
+        return {
+            "bundle": bundle,
+            "version": __version__,
+            "capabilities": list(CAPABILITIES),
+        }
+    if action == "jobs":
+        # Read-only listing of recorded handoffs; never creates the store.
+        return {
+            "bundle": bundle,
+            **list_jobs(
+                _scheduler, Path.home(), root or Path.home() / ".inkly" / "tensor"
+            ),
+        }
+    if action == "job_details":
+        return job_details(
+            root or Path.home() / ".inkly" / "tensor", bundle, _scheduler
+        )
     root = private_directory(root or Path.home() / ".inkly" / "tensor")
     directory = root / bundle
     if action == "prepare":
@@ -259,7 +338,10 @@ def handle(request, root=None):
             # not allow a second sbatch, even if its response was never received.
             receipt["submission"] = "SUBMISSION_UNKNOWN"
             _save(directory / "receipt.json", receipt)
-            result = _scheduler(["sbatch", "--parsable", "job.sbatch"], directory)
+            result = _scheduler(
+                ["sbatch", "--parsable", f"--comment=inkly:{bundle}", "job.sbatch"],
+                directory,
+            )
             match = re.fullmatch(r"([0-9]+)(?:;[A-Za-z0-9_.-]+)?\s*", result.stdout)
             if result.returncode != 0 or not match:
                 raise ValueError(
@@ -268,6 +350,22 @@ def handle(request, root=None):
             receipt.update(job_id=match[1], submission="SUBMITTED")
             _save(directory / "receipt.json", receipt)
             return receipt
+        if action == "cancel":
+            return _cancel(directory, receipt, request)
+        if action == "input":
+            # The researcher's own prepared input, unchanged, so Desktop on
+            # another computer can keep a copy beside the returned result.
+            data = _read(directory / receipt["name"], MAX_INPUT)
+            if hashlib.sha256(data).hexdigest() != receipt["sha256"]:
+                raise ValueError(
+                    "The prepared input changed on the HPC; it was not copied"
+                )
+            return {
+                "bundle": bundle,
+                "name": receipt["name"],
+                "sha256": receipt["sha256"],
+                "data": base64.b64encode(data).decode("ascii"),
+            }
         status = _state(directory, receipt)
         response = {**receipt, **status}
         if action == "status":
@@ -293,12 +391,22 @@ def handle(request, root=None):
         }
 
 
-def _reply(raw):
+def _reply(raw, diagnostics=None):
     try:
         if len(raw) > 8 * 1024 * 1024:
             raise ValueError("Request exceeds transfer limit")
         request = json.loads(raw)
-        response = handle(request)
+        if isinstance(request, dict) and diagnostics is not None:
+            try:
+                diagnostics.accept(request.get("desktop_diagnostics"))
+            except Exception:
+                pass  # Metadata never changes an operation or causes its retry.
+        response = (
+            {}
+            if isinstance(request, dict)
+            and request.get("action") == "desktop_diagnostics"
+            else handle(request)
+        )
         print(json.dumps({"ok": True, **response}), flush=True)
         return 0
     except (
@@ -315,18 +423,24 @@ def _reply(raw):
 
 
 def main(session=False):
+    from inkly.core.desktop_diagnostics import RemoteDesktopDiagnostics
+
+    diagnostics = RemoteDesktopDiagnostics()
     limit = 8 * 1024 * 1024 + 1
-    if not session:
-        return _reply(sys.stdin.buffer.read(limit))
-    # A single authenticated OpenSSH process carries the explicit operations.
-    # Closing it does not cancel a submitted job or discard its durable receipt.
-    while True:
-        raw = sys.stdin.buffer.readline(limit)
-        if not raw:
-            return 0
-        result = _reply(raw)
-        if len(raw) >= limit:
-            return result
+    try:
+        if not session:
+            return _reply(sys.stdin.buffer.read(limit), diagnostics)
+        # A single authenticated OpenSSH process carries the explicit operations.
+        # Closing it does not cancel a submitted job or discard its durable receipt.
+        while True:
+            raw = sys.stdin.buffer.readline(limit)
+            if not raw:
+                return 0
+            result = _reply(raw, diagnostics)
+            if len(raw) >= limit:
+                return result
+    finally:
+        diagnostics.close()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,25 @@ Inkly is designed for command-line use in shared research environments and can b
 - an SSH-tunneled Ollama server
 - a local `ollama run` workflow
 
+## Windows Desktop: one double-click from this checkout
+
+Double-click [Get-InklyDesktop-Test.cmd](Get-InklyDesktop-Test.cmd). It downloads
+[Inkly Desktop 0.6.0 (preview)](https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.6.0)
+from this repository's Releases, checks the EXE's exact SHA-256, runs a
+local-only smoke test and opens the app. No GitHub sign-in is needed, and the
+EXE is **not inside Git**.
+
+This is an **unsigned pre-release**, built by GitHub Actions from `6f95d03`.
+Its EXE SHA-256 is
+`5813D970CEDA56656BCDEFC2A0BEC5760ADF3EBAC35475629019777A3A357CD5`.
+Windows PowerShell 5.1 and Windows OpenSSH Client are required; Python is
+bundled. Actual HPC use also needs the site's network/VPN, verified host key
+and an authorized account. From Inkly Desktop 0.6.0, Desktop can install or
+update Inkly on your HPC account itself (Connection settings → **Set up Inkly
+on the HPC**); earlier builds need a matching Inkly HPC endpoint. See
+[Desktop download and testing instructions](docs/DESKTOP.md#download-and-open-inkly-desktop)
+for the install location, troubleshooting and standalone helper use.
+
 ## What Inkly Does
 
 Inkly helps users interact with an HPC system in a more natural and productive way.
@@ -146,8 +165,28 @@ ink
 
 ## Requirements
 
-For the Windows TENSOR export → HPC Inkly → TENSOR analysis workflow, see
-[the TENSOR handoff guide](docs/TENSOR.md).
+For the Windows TENSOR export → HPC Inkly → TENSOR analysis workflow, follow
+[TENSOR files from a Windows laptop](#tensor-files-from-a-windows-laptop) below
+and [the complete TENSOR handoff guide](docs/TENSOR.md).
+
+On Windows, [Inkly Desktop](docs/DESKTOP.md) provides file selection, resource
+preview, confirmed submission and result monitoring in an application window.
+Open `InklyDesktop.exe` or double-click `Inkly Desktop.pyw` when running from source.
+Its job summary follows each file's latest status after submission. While it
+watches, you can add, preview and submit more inputs on the same connection,
+and Stop watching keeps the connection so watching can resume. **Load my jobs**
+fills the list with pending, running and recently finished jobs without
+choosing files, and **Job history** lists older jobs with state, date and name
+filters; see [Load my jobs and Job history](docs/DESKTOP.md#load-my-jobs-and-job-history). Select
+rows to **Cancel job** (pending jobs only, also while Desktop is watching) or **Run again** (cancelled, failed or
+edited files, prepared as new jobs and never submitted without confirmation);
+see [Cancel a pending job or run a file again](docs/DESKTOP.md#cancel-a-pending-job-or-run-a-file-again).
+For questions or issues, use the contact line under the window title
+(rrv9177@uncw.edu).
+
+For a console workflow, run `tensor.cmd` for a file picker that accepts one or several
+TENSOR exports. Connection preferences are saved locally; preview is the default.
+See the [file-picker walkthrough](docs/TENSOR_PICKER.md).
 
 The guided helper reuses consistent exported CPU/memory settings, previews the
 cluster allocation, asks before submission and returns the verified log through
@@ -177,6 +216,16 @@ work; this file workflow does not imply those tasks are complete.
 > **Cuttlefish users:** Follow [`docs/CUTTLEFISH_SETUP.md`](docs/CUTTLEFISH_SETUP.md) for the current Cuttlefish setup and validation procedure.
 
 This section covers the general user-side installation path.
+
+**Using Inkly Desktop?** From Inkly Desktop 0.6.0, you can skip these steps.
+First sign in to your HPC account once the usual way (for example `ssh
+<username>@<host>` in a terminal, as your administrator describes), so this
+computer trusts the HPC and any first-login steps are done. Then open
+Connection settings and choose **Set up Inkly on the HPC**. Desktop signs
+in once, fetches its exact release into `~/.inkly/src/hpc-ink-setup` and runs
+the same `setup.sh`, so the result is the same as the steps below. See
+[Set up Inkly on the HPC](docs/DESKTOP.md#set-up-inkly-on-the-hpc). The
+manual steps stay fully supported.
 
 ### 1. Clone the repository
 
@@ -219,6 +268,104 @@ ink hello
 ```
 
 If configuration and backend routing are correct, Inkly should respond in the terminal.
+
+## TENSOR Files from a Windows Laptop
+
+**You need this repository on your laptop as well as a matching Inkly installation
+on the HPC.** TENSOR exports a Gaussian input locally. The laptop runs
+`scripts/tensor_bridge.py` through the included Windows launcher; that program
+uses native OpenSSH to send the input to HPC-side Inkly and bring the finished
+log back. You then open the returned file in TENSOR yourself.
+
+The laptop needs Windows PowerShell 5.1, Python 3.9+, Git, Windows OpenSSH Client,
+and TENSOR. The HPC needs your own account, Slurm, Gaussian access and the
+matching installed Inkly TENSOR endpoint. Connect to your site's network/VPN if
+required. The current generator supports the verified Cuttlefish profile;
+another cluster needs validated profile/generator support before this workflow
+can be used there. Changing the connection hostname alone does not provide that.
+
+### 1. Get the laptop scripts and fill in your connection
+
+Run these commands in **PowerShell on your laptop**, in the folder where you
+want to keep the source checkout:
+
+```powershell
+git clone https://github.com/thealice-lab/hpc-ink-setup.git
+Set-Location hpc-ink-setup
+Copy-Item .\scripts\windows\tensor-bridge.example.json .\scripts\windows\tensor-bridge.local.json
+notepad .\scripts\windows\tensor-bridge.local.json
+```
+
+Edit the local JSON file with your own details:
+
+```json
+{
+  "host": "YOUR_USERNAME@YOUR_HPC_HOST",
+  "ink_path": "~/.inkly/bin/ink",
+  "auth": "keyboard-interactive"
+}
+```
+
+`host` may also be an existing OpenSSH alias. Use `keyboard-interactive` for
+password/MFA prompts, or `configured` for existing site-approved SSH key/agent
+settings. Never put passwords, private keys or MFA responses in the JSON.
+The local settings file and `*.inkly.json` receipts are Git-ignored. Keep
+scientific inputs and results outside the source checkout.
+
+The repository includes a generic sign-in dialog and launcher; no personal
+`connect_cuttlefish.ps1` file is needed. Check the local prerequisites, then
+connect to verify the server fingerprint through your site's procedure:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action check
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action connect
+```
+
+In the resulting **HPC shell**, complete [the HPC installation](#installation-for-users)
+using the same release/revision as the laptop checkout. Existing HPC installs
+must be updated and reinstalled with `bash setup.sh`; cloning newer source alone
+does not update the installed launcher. Follow [the endpoint readiness checks](docs/TENSOR.md#2-install-and-verify-the-hpc-side)
+before transferring a calculation. Type `exit` to return to the laptop.
+
+### 2. Export, transfer and review
+
+In TENSOR, export a self-contained `.gjf` or `.com` to a research folder on your
+laptop. Replace the example path below with that file. Run in **laptop PowerShell**:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action preview -InputFile "C:\Research\sample_1.gjf" -Hours 2
+```
+
+This authenticates, uploads the input, generates the HPC script and prints the
+resources and recovery receipt; **it does not submit a job**. Choose a suitable
+`-Hours` maximum for your calculation. The default is one hour. Consistent CPU
+and MB/GB memory settings are reused from the export; see the guide for overrides.
+
+### 3. Submit the reviewed calculation and receive its log
+
+Use the receipt printed by the preview, still in **laptop PowerShell**:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\tensor.ps1 -Action resume -Receipt "C:\Research\sample_1.gjf.inkly.json"
+```
+
+Complete sign-in, review the preview, then enter `y` at
+`Submit this calculation? [y/N/s=show SBATCH]` to submit. Leave the laptop awake,
+connected to the network/VPN, and the command running while it watches the job.
+On successful completion it automatically downloads the checksum-verified log
+and prints `Verified output saved: ...`. By default the result is
+`C:\Research\returned\sample_1.log`. In TENSOR choose **Analysis & 3D view → Add logs**
+and select that file.
+
+If the laptop sleeps or SSH disconnects, run the same `resume` command again.
+It monitors the recorded submitted job without submitting another one. Keep the
+receipt; do not start another `run` or `preview` to recover a submitted job.
+Failed calculations stop for inspection instead of returning a successful result.
+
+After setup, `-Action run -InputFile "C:\Research\new_sample.gjf" -Hours 2`
+combines upload, review, confirmation, monitoring and return in one SSH session.
+For custom result locations, read-only status, manual fetch and troubleshooting,
+see [the complete guide](docs/TENSOR.md).
 
 ## Configuration
 
