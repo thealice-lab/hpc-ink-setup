@@ -118,8 +118,14 @@ def workflow(tmp_path, monkeypatch):
                     "state": "PREPARED",
                     "script": "# synthetic SBATCH",
                     "resources": {
-                        "cpus": 2,
-                        "slurm_memory_mib": 1024,
+                        "cpus": request.get("cpus") or 2,
+                        "cpus_source": "explicit override"
+                        if request.get("cpus") is not None
+                        else "TENSOR export",
+                        "slurm_memory_mib": request.get("memory_mib") or 1024,
+                        "memory_source": "explicit Slurm override"
+                        if request.get("memory_mib") is not None
+                        else "TENSOR export plus cluster headroom",
                         "gaussian_memory_mb": 768,
                         "hours": request["hours"],
                     },
@@ -1430,6 +1436,140 @@ def test_run_again_archives_receipt_and_prepares_without_submitting(workflow):
         if e["event_type"] == "desktop_rerun"
     ]
     assert [e["status"] for e in reruns] == ["approved", "prepared"]
+
+
+def resource_events(workflow):
+    workflow.controller.execute("close")
+    return [
+        e["payload"]["status"]
+        for e in workflow.controller.journal.take()
+        if e["event_type"] == "desktop_resources"
+    ]
+
+
+def test_cpus_and_memory_change_prepares_a_new_handoff_without_submitting(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    receipt_path = w.paths[0].with_suffix(".gjf.inkly.json")
+    original = receipt_path.read_bytes()
+    w.calls.clear()
+    w.events.clear()
+    w.controller.change_resources(
+        [w.paths[0]], w.paths, SETTINGS, {"cpus": 8, "memory_mib": 16384}
+    )
+    archives = list(w.paths[0].parent.glob("sample_1.gjf.inkly.json.resources-*.bak"))
+    assert len(archives) == 1 and archives[0].read_bytes() == original
+    new_receipt = json.loads(receipt_path.read_text())
+    assert new_receipt["bundle"] != json.loads(original)["bundle"]
+    resources = w.records[new_receipt["bundle"]]["resources"]
+    assert (resources["cpus"], resources["slurm_memory_mib"]) == (8, 16384)
+    assert resources["cpus_source"] == "explicit override"
+    assert "submit" not in actions(w)
+    assert actions(w)[:2] == ["status", "prepare"]
+    assert actions(w).count("prepare") == 1
+    assert w.controller.review()["count"] == 2
+    assert rows_for(w, w.paths[0])[-1]["resources"]["cpus"] == 8
+    assert any(
+        "now 8 CPUs, 16 GB Slurm memory (was 2 CPUs, 1 GB Slurm memory). "
+        "Nothing was submitted." in text
+        for text in messages(w)
+    )
+    assert resource_events(w) == ["approved", "prepared"]
+
+
+def test_a_blank_value_keeps_an_earlier_choice(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 8, "memory_mib": None}
+    )
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": None, "memory_mib": 4096}
+    )
+    bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    resources = w.records[bundle]["resources"]
+    assert (resources["cpus"], resources["slurm_memory_mib"]) == (8, 4096)
+    assert len(list(w.paths[0].parent.glob("*.resources-*.bak"))) == 2
+
+
+def test_unchanged_resources_prepare_nothing(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.calls.clear()
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 2, "memory_mib": 1024}
+    )
+    assert "prepare" not in actions(w)
+    assert not list(w.paths[0].parent.glob("*.resources-*.bak"))
+    assert any("it was left as it is" in text for text in messages(w))
+    assert resource_events(w) == []
+
+
+@pytest.mark.parametrize(
+    "state", ["PENDING", "RUNNING", "COMPLETED", "CANCELLED by 1000", "UNKNOWN"]
+)
+def test_only_unsubmitted_jobs_get_new_cpus_and_memory(workflow, state):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    receipt_path = w.paths[1].with_suffix(".gjf.inkly.json")
+    original = receipt_path.read_bytes()
+    recorded_job(w, w.paths[1], state, "2")
+    w.calls.clear()
+    with pytest.raises(ValueError, match="Only jobs that have not been submitted"):
+        w.controller.change_resources(w.paths, w.paths, SETTINGS, {"cpus": 8})
+    assert receipt_path.read_bytes() == original
+    assert not list(w.paths[0].parent.glob("*.resources-*.bak"))
+    assert "prepare" not in actions(w) and "submit" not in actions(w)
+
+
+def test_an_edited_input_must_run_again_before_its_resources_change(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.paths[0].write_bytes(w.paths[0].read_bytes() + b"\n")
+    w.calls.clear()
+    with pytest.raises(ValueError, match="Choose Run again to prepare the edited file"):
+        w.controller.change_resources(w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 8})
+    assert "prepare" not in actions(w)
+
+
+@pytest.mark.parametrize(
+    "changes", [{"cpus": 0}, {"memory_mib": 100}, {}, {"hours": 4}]
+)
+def test_invalid_resource_changes_are_refused_before_connecting(workflow, changes):
+    w = workflow
+    with pytest.raises(ValueError):
+        w.controller.change_resources(w.paths[:1], w.paths[:1], SETTINGS, changes)
+    assert not w.connections and not w.calls
+
+
+def test_run_again_keeps_the_cpus_and_memory_chosen_for_the_earlier_job(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 8, "memory_mib": None}
+    )
+    recorded_job(w, w.paths[0], "FAILED", "7")
+    w.events.clear()
+    w.controller.rerun(w.paths[:1], w.paths[:1], SETTINGS)
+    bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    resources = w.records[bundle]["resources"]
+    assert resources["cpus"] == 8 and resources["cpus_source"] == "explicit override"
+    assert resources["memory_source"] == "TENSOR export plus cluster headroom"
+    assert any(
+        "keeping the 8 CPUs chosen for its earlier job" in text for text in messages(w)
+    )
+
+
+def test_cpus_and_memory_can_change_while_watching(workflow):
+    w = workflow
+    assert "change_resources" in w.controller.WATCH_REQUESTS
+    w.controller.execute("preview", w.paths, SETTINGS)
+    w.controller.execute(
+        "change_resources", [w.paths[0]], w.paths, SETTINGS, {"memory_mib": 2048}
+    )
+    bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    assert w.records[bundle]["resources"]["slurm_memory_mib"] == 2048
+    assert "submit" not in actions(w)
 
 
 @pytest.mark.parametrize(
@@ -3015,6 +3155,143 @@ def test_release_versions_compare_by_number(version, than, older):
 
 
 GUI_RELEASE = {"version": "0.6.0", "commit": "f" * 40}
+
+
+@native_display
+def test_native_cpus_and_memory_follow_prepared_selected_rows(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w = workflow
+    first, second = (str(path) for path in w.paths)
+
+    def show(path, **changes):
+        app.events.put(("row", {**app.rows[path], **changes}))
+        app.drain()
+
+    def state():
+        app.buttons()
+        return str(app.resources_button["state"])
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        assert state() == "disabled"  # Nothing selected.
+        app.table.selection_set(first)
+        assert state() == "normal"
+        show(first, input_changed=True)
+        assert state() == "disabled"
+        show(first, input_changed=False, state="PENDING", job_id="123")
+        assert state() == "disabled"
+        show(first, state="PREPARED", job_id="")
+        assert state() == "normal"
+
+        scheduled, asked, questions = [], [], []
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+        monkeypatch.setattr(app, "ask_resources", lambda rows: asked.append(rows))
+        app.resources_button.invoke()
+        assert [row["name"] for row in asked[-1]] == ["sample_1.gjf"]
+        assert not scheduled  # Cancelled.
+        changes = {"cpus": 8, "memory_mib": None}
+        monkeypatch.setattr(app, "ask_resources", lambda rows: dict(changes))
+        app.resources_button.invoke()
+        expected = ("change_resources", [first], [first, second], SETTINGS, changes)
+        assert scheduled == [expected]
+
+        # An edited job script is only discarded after an explicit yes.
+        show(first, script_edited=True)
+
+        def answer(value):
+            def ask(title, text, **kwargs):
+                questions.append((title, text, kwargs.get("default")))
+                return value
+
+            return ask
+
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.resources_button.invoke()
+        assert len(scheduled) == 1
+        assert questions[-1][0] == "Discard script edits?"
+        assert "sample_1.gjf" in questions[-1][1] and questions[-1][2] == "no"
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(True))
+        app.resources_button.invoke()
+        assert scheduled[-1] == expected
+
+        # While watching, the change goes to the watch on its open connection.
+        show(first, script_edited=False)
+        requests = []
+        monkeypatch.setattr(
+            w.controller, "request", lambda *args: requests.append(args)
+        )
+        app.busy, app.action = True, "submit"
+        assert state() == "normal"
+        app.resources_button.invoke()
+        assert requests == [expected]
+        assert len(scheduled) == 2
+    finally:
+        app.busy = False
+        app.close()
+
+
+@native_display
+def test_native_cpus_and_memory_window_reads_and_checks_values(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    row = {"name": "a.gjf", "resources": {"cpus": 4, "slurm_memory_mib": 7680}}
+    try:
+        dialog, values, _, buttons, result = app.resources_dialog([row])
+        assert dialog.title() == "CPUs and memory"
+        assert (values["cpus"].get(), values["memory"].get()) == ("4", "7.5")
+        buttons["apply"].invoke()  # Nothing changed: the window stays open.
+        assert result["changes"] is None and dialog.winfo_exists()
+        values["cpus"].set("eight")
+        buttons["apply"].invoke()
+        assert result["changes"] is None and dialog.winfo_exists()
+        values["cpus"].set("8")
+        values["memory"].set("16 GB")
+        buttons["apply"].invoke()
+        assert result["changes"] == {"cpus": 8, "memory_mib": 16384}
+        assert not dialog.winfo_exists()
+
+        # Rows with different values start blank; Cancel changes nothing.
+        other = {"name": "b.gjf", "resources": {"cpus": 2, "slurm_memory_mib": 7680}}
+        dialog, values, _, buttons, result = app.resources_dialog([row, other])
+        assert (values["cpus"].get(), values["memory"].get()) == ("", "7.5")
+        buttons["cancel"].invoke()
+        assert result["changes"] is None and not dialog.winfo_exists()
+    finally:
+        app.close()
+
+
+@native_display
+@pytest.mark.parametrize(
+    "cpus, memory, expected",
+    [
+        ("8", "", {"cpus": 8, "memory_mib": None}),
+        (" 8 ", "1.5", {"cpus": 8, "memory_mib": 1536}),
+        ("", "16gb", {"cpus": None, "memory_mib": 16384}),
+        ("4", "7.5", "Change the CPUs, the memory or both first"),
+        ("", "", "Change the CPUs, the memory or both first"),
+        ("8.5", "", "CPUs must be a whole number"),
+        ("", "-2", "Memory must be a number of GB"),
+        ("", "nan", "Memory must be a number of GB"),
+        ("", "0.5", "Memory must be from 1 to 4096 GB"),
+        ("2000", "", "CPUs must be a whole number from 1 to 1024"),
+    ],
+)
+def test_native_resource_entries_are_parsed_in_gb(cpus, memory, expected):
+    import tensor_desktop as gui
+
+    prefill = {"cpus": "4", "memory": "7.5"}
+    if isinstance(expected, dict):
+        assert gui.parse_resource_entries(cpus, memory, prefill) == expected
+    else:
+        with pytest.raises(ValueError, match=expected):
+            gui.parse_resource_entries(cpus, memory, prefill)
 
 
 def setup_window(workflow, tmp_path, monkeypatch):

@@ -200,7 +200,8 @@ succeed.
 3. **Preview files** connects through native OpenSSH and prepares the selected
    inputs. Complete the separate password/MFA dialog when prompted. The table
    shows CPU count, Gaussian memory, total Slurm memory, time limit and stage
-   count. **Preview never submits a job.**
+   count. **Preview never submits a job.** To ask for other CPUs or memory, see
+   [Change CPUs and memory](#change-cpus-and-memory-before-submitting).
 4. Select a row and use **View script** to inspect its generated SBATCH script.
    Choose **Submit prepared jobs** to review the job count and combined resource
    request. The confirmation defaults to No. Confirm only the jobs you intend
@@ -213,7 +214,7 @@ succeed.
 
 You can keep working while the app watches. **Add files** or **Add folder**,
 then **Preview files** and **Submit prepared jobs** for the new inputs; **Run
-again** and **Cancel job** work too. These run on the connection that is
+again**, **Cancel job** and **CPUs & memory…** work too. These run on the connection that is
 already open, so there is no new sign-in, and the app keeps watching every
 job, old and new. Adding or removing files keeps the rows already shown and
 marks only new files "Not previewed"; submitting always needs a fresh preview
@@ -233,6 +234,40 @@ Slurm schedules the independent jobs. There is no array or concurrency throttle.
 The table and confirmation show demand if every new job runs simultaneously.
 Original inputs and existing results are never overwritten. Scientific routes,
 structures and analysis stay under the researcher's control.
+
+## Change CPUs and memory before submitting
+
+Preview takes each job's CPUs and memory from the input's own `%nprocshared`
+and `%mem` lines, plus the cluster's memory headroom. To ask for something
+else, select one or more **PREPARED** rows and choose **CPUs & memory…**
+beside Run again:
+- **CPUs:** a whole number from 1 to 1024.
+- **Memory:** the total Slurm memory in GB (1 GB = 1024 MiB, as in the
+  table's **Slurm MiB** column), from 1 to 4096 GB. Gaussian gets the
+  cluster's usual share of it as `%mem`.
+
+Leave a box as it is to keep that value; when the selected rows differ, it
+starts empty. The time limit stays the value in Connection settings. Choose
+**Prepare again**: each changed file is prepared as a **new** job with your
+values, as Run again does. Desktop keeps a copy of the old receipt beside the
+input (`….inkly.json.resources-….bak`), reads the list again and updates the
+table and the combined request. **Nothing is submitted**: review the preview,
+then choose **Submit prepared jobs**. A row that already uses the values you
+entered is left as it is.
+
+Your input file is never changed: the HPC writes the matching `%nprocshared`
+and `%mem` into its own copy of the input when the job starts. Slurm still
+decides whether the cluster can run the request, and one that no node can meet
+fails at submission.
+
+Only rows that have not been submitted can change. For a job that has ended,
+choose **Run again** first; Run again keeps the CPUs and memory you chose for
+the earlier job. For an input edited after preview, choose Run again to prepare
+the edited file first. If a row's job script was edited on the HPC, Desktop
+asks before changing it, because preparing again discards the edit. This works
+with the HPC copy of Inkly you already have, also while the app watches other
+jobs. The earlier, unsubmitted preparation stays on the HPC, where Job history
+can still list it as not submitted.
 
 ## Pending and failed-job details
 
@@ -387,8 +422,8 @@ to Job details, and the other jobs keep being watched.
 
 ## Cancel a pending job or run a file again
 
-**Cancel job** and **Run again** act on the **selected rows**; the other
-buttons use the whole list. Select rows with a click (Ctrl or Shift for
+**Cancel job**, **Run again** and **CPUs & memory…** act on the **selected
+rows**; the other buttons use the whole list. Select rows with a click (Ctrl or Shift for
 several). Each asks for confirmation first, and the confirmation defaults to
 No.
 
@@ -420,7 +455,9 @@ edited after preview. Desktop checks each state on the HPC first and changes
 nothing if a selected job is pending, running, finished or unconfirmed. Then
 it keeps a copy of each old receipt beside the input (`….inkly.json.rerun-….bak`)
 and prepares the file as it is now. The new job keeps the file's original HPC
-connection and results folder and uses your current time-limit setting.
+connection and results folder and uses your current time-limit setting. CPUs
+and memory you [chose yourself](#change-cpus-and-memory-before-submitting) for
+the earlier job are kept; otherwise they come from the input again.
 **Run again never submits:** the list is previewed again, and you choose
 **Submit prepared jobs** as usual. It refuses to run if a returned log with the
 same name already exists, so earlier results are never overwritten. Completed
@@ -561,6 +598,7 @@ state for that.
 
 Cancel and Run again add `desktop_cancel` (approved, requested or unsupported;
 count or job ID) and `desktop_rerun` (approved or prepared; count) events.
+CPUs & memory adds `desktop_resources` (approved or prepared; count).
 Older HPC copies ignore event types they do not know.
 
 The Windows executable and the HPC `inkly` package must be upgraded together

@@ -181,6 +181,8 @@ filters; see [Load my jobs and Job history](docs/DESKTOP.md#load-my-jobs-and-job
 rows to **Cancel job** (pending jobs only, also while Desktop is watching) or **Run again** (cancelled, failed or
 edited files, prepared as new jobs and never submitted without confirmation);
 see [Cancel a pending job or run a file again](docs/DESKTOP.md#cancel-a-pending-job-or-run-a-file-again).
+Before submitting, **CPUs & memory…** sets other CPUs or memory for selected
+prepared files; see [Change CPUs and memory](docs/DESKTOP.md#change-cpus-and-memory-before-submitting).
 For questions or issues, use the contact line under the window title
 (rrv9177@uncw.edu).
 

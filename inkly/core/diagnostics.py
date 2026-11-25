@@ -73,6 +73,7 @@ DESKTOP_FIELDS = {
         "job_id": int,
     },
     "desktop_rerun": {"status": {"approved", "prepared"}, "count": int},
+    "desktop_resources": {"status": {"approved", "prepared"}, "count": int},
     "desktop_jobs": {
         "action": {"load", "restore", "history", "search"},
         "count": int,
