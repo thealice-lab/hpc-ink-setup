@@ -36,6 +36,10 @@ on the HPC**); earlier builds need a matching Inkly HPC endpoint. See
 [Desktop download and testing instructions](docs/DESKTOP.md#download-and-open-inkly-desktop)
 for the install location, troubleshooting and standalone helper use.
 
+The packaged Desktop can notify you when a newer release is available, without
+downloading or installing it. Turn off **Check for new Desktop releases** in
+Connection settings if you prefer not to check.
+
 ## What Inkly Does
 
 Inkly helps users interact with an HPC system in a more natural and productive way.
