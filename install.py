@@ -214,7 +214,12 @@ def configure_shell_path():
 
     if shell_rc.exists():
         rc_text = shell_rc.read_text(encoding="utf-8")
-        if str(STATE_CFG.bin_dir) in rc_text:
+        # Only an active line puts the bin directory on PATH; a commented-out
+        # copy of the line must not stop the installer from adding it again.
+        active = (
+            line for line in rc_text.splitlines() if not line.lstrip().startswith("#")
+        )
+        if any(str(STATE_CFG.bin_dir) in line for line in active):
             return
 
     with shell_rc.open("a", encoding="utf-8") as f:
