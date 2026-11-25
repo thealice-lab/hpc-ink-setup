@@ -43,6 +43,40 @@ RERUNNABLE = {
     "BOOT_FAIL",
     "DEADLINE",
 }
+# Bounds for a researcher's own CPU and memory choice; Slurm still decides
+# whether the cluster can run it.
+MAX_CPUS = 1024
+MIN_MEMORY_MIB = 1024
+MAX_MEMORY_MIB = 4096 * 1024
+
+
+def resource_changes(changes):
+    """Validate new CPUs and total Slurm memory (MiB); None keeps a value."""
+    if not isinstance(changes, dict) or set(changes) - {"cpus", "memory_mib"}:
+        raise ValueError("Only CPUs and memory can be changed here")
+    cpus, memory = changes.get("cpus"), changes.get("memory_mib")
+    if cpus is not None and (type(cpus) is not int or not 1 <= cpus <= MAX_CPUS):
+        raise ValueError(f"CPUs must be a whole number from 1 to {MAX_CPUS}")
+    if memory is not None and (
+        type(memory) is not int or not MIN_MEMORY_MIB <= memory <= MAX_MEMORY_MIB
+    ):
+        raise ValueError(
+            f"Memory must be from {MIN_MEMORY_MIB // 1024} to "
+            f"{MAX_MEMORY_MIB // 1024} GB"
+        )
+    if cpus is None and memory is None:
+        raise ValueError("Enter new CPUs, memory or both")
+    return {"cpus": cpus, "memory_mib": memory}
+
+
+def chosen_resources(resources):
+    """CPUs and memory a researcher set for a job, rather than its export's."""
+    chosen = {}
+    if resources.get("cpus_source") == "explicit override":
+        chosen["cpus"] = resources["cpus"]
+    if resources.get("memory_source") == "explicit Slurm override":
+        chosen["memory_mib"] = resources["slurm_memory_mib"]
+    return chosen
 
 
 class InputChangedError(ValueError):
@@ -300,13 +334,15 @@ def _archive_receipt(item, label="orphaned"):
     raise OSError("Could not create a unique archive for the old recovery receipt")
 
 
-def _replace_receipt(item, settings, label, changed_message):
+def _replace_receipt(item, settings, label, changed_message, resources=None):
     """Archive the saved receipt, then publish a new one for a fresh bundle.
 
     The new receipt keeps the original connection and output folder and uses
-    the current time limit. Returns the prepare request (not yet sent) and the
-    archive path. Nothing is sent to the HPC here.
+    the current time limit. ``resources`` may set CPUs and total Slurm memory
+    (MiB); otherwise they come from the export. Returns the prepare request
+    (not yet sent) and the archive path. Nothing is sent to the HPC here.
     """
+    resources = resources or {}
     old_receipt = item["receipt"]
     archive, original = _archive_receipt(item, label)
     temporary = item["receipt_path"].with_name(
@@ -323,8 +359,8 @@ def _replace_receipt(item, settings, label, changed_message):
                 host=old_receipt["host"],
                 ink_path=old_receipt["ink_path"],
                 auth=old_receipt["auth"],
-                cpus=None,
-                memory_mib=None,
+                cpus=resources.get("cpus"),
+                memory_mib=resources.get("memory_mib"),
                 hours=settings["hours"],
             ),
             report=lambda _message: None,
@@ -364,17 +400,19 @@ def _recover_missing_bundle(session, item, settings, report):
     return response
 
 
-def prepare_again(session, item, settings, report=print):
+def prepare_again(session, item, settings, report=print, resources=None, label="rerun"):
     """Prepare the file's current contents as a new bundle; never submits.
 
     The caller must first confirm on the HPC that the recorded job's state is in
     RERUNNABLE. The old receipt is archived beside the input, not deleted.
+    ``resources`` optionally sets CPUs and total Slurm memory (MiB).
     """
     request, archive = _replace_receipt(
         item,
         settings,
-        "rerun",
+        label,
         "The saved receipt changed while preparing again; no replacement was made",
+        resources,
     )
     item["rerun_from"] = archive
     item.pop("changed", None)

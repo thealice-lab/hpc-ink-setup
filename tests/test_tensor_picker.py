@@ -418,3 +418,45 @@ sys.exit(tensor.main(session=True))
         path.read_text()
         for path in (tmp_path / "bundles").glob("*/synthetic-submit-count")
     ] == ["1", "1"]
+
+
+@pytest.mark.parametrize(
+    "changes, error",
+    [
+        ({"cpus": 0, "memory_mib": None}, "CPUs must be a whole number"),
+        ({"cpus": 1025, "memory_mib": None}, "CPUs must be a whole number"),
+        ({"cpus": "8", "memory_mib": None}, "CPUs must be a whole number"),
+        ({"cpus": None, "memory_mib": 512}, "Memory must be from 1 to 4096 GB"),
+        ({"cpus": None, "memory_mib": 4096 * 1024 + 1}, "Memory must be"),
+        ({"cpus": None, "memory_mib": None}, "Enter new CPUs, memory or both"),
+        ({"cpus": 4, "hours": 2}, "Only CPUs and memory"),
+        ([4, 1024], "Only CPUs and memory"),
+    ],
+)
+def test_resource_changes_are_bounded_and_need_a_value(changes, error):
+    with pytest.raises(ValueError, match=error):
+        picker.resource_changes(changes)
+
+
+def test_resource_changes_keep_missing_values_as_none():
+    assert picker.resource_changes({"cpus": 8}) == {"cpus": 8, "memory_mib": None}
+    assert picker.resource_changes({"memory_mib": 16384}) == {
+        "cpus": None,
+        "memory_mib": 16384,
+    }
+
+
+def test_chosen_resources_are_only_explicit_overrides():
+    exported = {
+        "cpus": 4,
+        "cpus_source": "TENSOR export",
+        "slurm_memory_mib": 8192,
+        "memory_source": "TENSOR export plus cluster headroom",
+    }
+    assert picker.chosen_resources(exported) == {}
+    assert picker.chosen_resources(
+        {**exported, "cpus": 8, "cpus_source": "explicit override"}
+    ) == {"cpus": 8}
+    assert picker.chosen_resources(
+        {**exported, "memory_source": "explicit Slurm override"}
+    ) == {"memory_mib": 8192}
