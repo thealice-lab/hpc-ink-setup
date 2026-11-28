@@ -368,21 +368,40 @@ Full details require a matching endpoint with the `job_details` capability.
 
 New Desktop endpoint submissions carry the Slurm comment `inkly:<bundle>`.
 The bundle is the generated ID in the saved `.inkly.json` receipt; the comment
-contains no input name or file path. If the submission reply is lost, use your
-own read-only Slurm queue to find that exact comment before deciding what to
-do. For example, on the HPC:
+contains no input name or file path.
+
+**When Slurm refuses a job.** If Slurm answers a submission with a clear
+refusal, for example an unknown account or a QOS submit limit, it creates no
+job. The HPC also checks the queue for the bundle's comment. Desktop then shows
+Slurm's reason in Activity and in a notice, the file is **PREPARED** again, and
+the other approved files are still submitted. Fix the file, preview again and
+submit it as usual. A refusal that could be a lost reply instead (a timeout or
+an unreachable controller) is treated as below.
+
+**When the reply is lost.** The row shows **SUBMISSION_UNKNOWN**: Slurm may or
+may not have the job. Inkly never submits it again by itself. Select the row
+and choose **Run again**; after you confirm, the HPC looks for the job:
+
+- in the queue, by the bundle's comment;
+- in Slurm's accounting, by the job's folder (some clusters do not keep job
+  comments in accounting);
+- by the `slurm-<job ID>.out` log that a started job writes in its folder.
+
+If the job is found, Desktop records it and shows its status as usual. If
+nothing is found, the file is **PREPARED** again so you can review and submit
+it. That happens only when the queue and accounting both answered and the
+attempt is at least 2 minutes old; otherwise nothing changes and Activity says
+to try again later. A job that left none of those traces (for example on a
+cluster whose accounting keeps no job folders, with a script that moved its
+log) would run twice if submitted again; the confirmation says so. **Nothing
+is submitted by this step.** It needs the updated HPC copy of Inkly; with an
+older copy, Desktop says so and changes nothing.
+
+You can also look yourself on the HPC:
 
 ```sh
 squeue --me --format='%.18i %.12T %k'
 ```
-
-Compare the entire comment with the bundle in your receipt. Scheduler comment
-visibility and accounting retention depend on cluster configuration. Absence
-from the queue does not prove no job was submitted; completed jobs may already
-have left it. Keep the uncertain receipt and ask the maintainer to inspect
-accounting. Inkly does not automatically resubmit, adopt a matching job, or
-rewrite a receipt based on comments. Existing jobs are not retagged. This
-requires the updated HPC endpoint; the Desktop executable alone cannot add tags.
 
 **Stop watching** ends the watch after the check in progress and keeps the
 connection open, so **Check & return results** starts watching again without a
@@ -522,7 +541,9 @@ the notice includes the `scancel` command you can run on the HPC yourself.
 rows that are **CANCELLED**, **FAILED**, **TIMEOUT**, **OUT_OF_MEMORY**,
 **NODE_FAIL** or **PREEMPTED**, and for **PREPARED** rows whose input was
 edited after preview. Desktop checks each state on the HPC first and changes
-nothing if a selected job is pending, running, finished or unconfirmed. Then
+nothing if a selected job is pending, running or finished. For an unconfirmed
+row, Run again looks for its job instead (see
+[Finding an uncertain submission](#finding-an-uncertain-submission)). Then
 it keeps a copy of each old receipt beside the input (`….inkly.json.rerun-….bak`)
 and prepares the file as it is now. The new job keeps the file's original HPC
 connection and results folder and uses your current time-limit setting. CPUs
@@ -671,6 +692,9 @@ count or job ID) and `desktop_rerun` (approved or prepared; count) events.
 CPUs & memory adds `desktop_resources` (approved or prepared; count).
 Saving a job script adds `desktop_script` (saved, reset or refused, and the
 number of warnings); the script itself is never logged.
+A submission Slurm refused adds `desktop_submission` with status refused, and
+checking unconfirmed submissions adds `desktop_check_submission` (approved,
+found or reopened; count).
 Older HPC copies ignore event types they do not know.
 
 The Windows executable and the HPC `inkly` package must be upgraded together

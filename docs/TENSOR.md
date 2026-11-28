@@ -312,8 +312,26 @@ command to change the destination for that invocation. If the log already exists
 than overwrite it. Separate status/fetch actions authenticate separately.
 
 Unknown, failed or ambiguous states stop with a message; they never trigger a
-retry. `SUBMISSION_UNKNOWN` means a submission may have reached Slurm: inspect
-the queue/accounting with your site support before preparing anything new.
+retry. `SUBMISSION_UNKNOWN` means a submission may have reached Slurm. Two
+things settle it from evidence, and neither ever calls `sbatch`:
+
+- **A clear refusal.** When `sbatch` fails with "Batch job submission failed:"
+  and a validation reason (not a timeout or an unreachable controller), and
+  the queue shows no job with the bundle's comment, `submit` puts the receipt
+  back to `PREPARED`, records the reason as `submit_refused` and reports
+  "Slurm refused the job, so nothing was submitted". Any doubt leaves
+  `SUBMISSION_UNKNOWN`. Every attempt records `submit_attempted_at`.
+- **`check_submission`.** For a `SUBMISSION_UNKNOWN` receipt it looks for the
+  job in the queue (comment `inkly:<bundle>`), in accounting (the job's
+  working directory, or the comment where accounting keeps it), and for a
+  `slurm-<id>.out` in the bundle. A job found is recorded as `SUBMITTED`
+  (`submission_found_at`). With `"reopen": true` and nothing found, the
+  receipt goes back to `PREPARED` (`submission_reopened_at`), but only if the
+  queue and accounting both answered and the attempt is at least 2 minutes
+  old. It is advertised as the `check_submission` capability.
+
+Inkly Desktop's Run again uses `check_submission` for unconfirmed rows, after
+the researcher confirms.
 Failed jobs remain on the HPC for inspection; this bridge does not cancel or
 restart them. An interrupted preparation can leave an unused private bundle;
 no automatic remote deletion or retention policy is added.
