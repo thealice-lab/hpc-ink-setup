@@ -33,7 +33,7 @@ PLUGIN_META = {
         "Why did my job fail?",
         "How efficient were my jobs?",
         "How much memory did my job use?",
-        "Am I requesting too many CPUs for my jobs?",
+        "Am I asking for too many CPUs or too much memory?",
         "Show my jobs from the last week",
     ],
 }

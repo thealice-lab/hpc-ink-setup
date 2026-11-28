@@ -36,6 +36,7 @@ PLUGIN_META = {
         "When will my job start?",
         "How much time is left on my running job?",
         "Show my queued jobs",
+        "What jobs do I have in the queue?",
         "Why is job 123456 still waiting?",
     ],
 }
