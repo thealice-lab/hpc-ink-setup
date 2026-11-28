@@ -216,3 +216,24 @@ def test_job_ids_are_found_in_question_text():
     )
 
     assert found == ["123456", "123460_3"]
+
+
+# Fields that would reveal job names, commands, folders, comments or users.
+PRIVATE_SQUEUE_CODES = ("%j", "%o", "%Z", "%k", "%u", "%U", "%a", "%N")
+PRIVATE_SACCT_FIELDS = ("jobname", "workdir", "submitline", "comment", "user", "uid")
+
+
+def test_no_query_asks_for_job_names_commands_folders_or_users():
+    for name, (program, template) in slurm_readonly.QUERIES.items():
+        fields = template[template.index("--format") + 1]
+        if program == "squeue":
+            assert not any(code in fields for code in PRIVATE_SQUEUE_CODES), name
+        if program == "sacct":
+            names = {field.strip().lower() for field in fields.split(",")}
+            assert not names & set(PRIVATE_SACCT_FIELDS), name
+
+
+def test_per_job_queries_are_always_limited_to_the_user():
+    for name, (program, template) in slurm_readonly.QUERIES.items():
+        if program == "sacct" or "%i" in " ".join(template):
+            assert template[template.index("--user") + 1] == "{uid}", name
