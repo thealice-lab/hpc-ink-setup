@@ -63,7 +63,15 @@ DESKTOP_FIELDS = {
         "stages": int,
     },
     "desktop_approval": {"count": int},
-    "desktop_submission": {"status": {"attempt", "confirmed"}, "job_id": int},
+    "desktop_submission": {
+        "status": {"attempt", "confirmed", "refused"},
+        "job_id": int,
+    },
+    "desktop_script": {"status": {"saved", "reset", "refused"}, "warnings": int},
+    "desktop_check_submission": {
+        "status": {"approved", "found", "reopened"},
+        "count": int,
+    },
     "desktop_job_state": {"state": DESKTOP_STATES, "job_id": int},
     "desktop_retrieval": {"job_id": int},
     "desktop_recovery": {"status": {"required", "approved", "prepared"}, "count": int},
