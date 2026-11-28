@@ -212,11 +212,13 @@ succeed.
    shows CPU count, Gaussian memory, total Slurm memory, time limit and stage
    count. **Preview never submits a job.** To ask for other CPUs or memory, see
    [Change CPUs and memory](#change-cpus-and-memory-before-submitting).
-4. Select a row and use **View script** to inspect its generated SBATCH script.
-   Choose **Submit prepared jobs** to review the job count and combined resource
-   request. The confirmation defaults to No. Confirm only the jobs you intend
-   to run. Every file in the table is included; remove files before preview to
-   narrow the selection. Each input becomes one independent Slurm job.
+4. Select a row and use **View script** to inspect its generated SBATCH script,
+   or to change it before submitting (see
+   [Change a job's script](#change-a-jobs-script)). Choose **Submit prepared
+   jobs** to review the job count and combined resource request. The
+   confirmation defaults to No. Confirm only the jobs you intend to run. Every
+   file in the table is included; remove files before preview to narrow the
+   selection. Each input becomes one independent Slurm job.
 5. The app watches all approved jobs and retrieves successful, checksum-verified
    logs. A **RETURNED** row has a verified local result. Select that row and
    choose **Open results folder**, then import the logs in TENSOR's
@@ -289,6 +291,53 @@ asks before changing it, because preparing again discards the edit. This works
 with the HPC copy of Inkly you already have, also while the app watches other
 jobs. The earlier, unsubmitted preparation stays on the HPC, where Job history
 can still list it as not submitted.
+
+## Change a job's script
+
+**View script** can change the SBATCH script of a **PREPARED** row before it is
+submitted. Any line may change, and **Load from file…** replaces the whole
+script with one of your own. Submitted jobs, and rows whose input was edited
+after preview, can only be viewed.
+
+1. Choose **Edit…** or **Load from file…**. The first time, Desktop explains
+   which of Inkly's lines matter and asks before you go on: they check that
+   the job runs the input you prepared, start Gaussian on the CPUs Slurm gives
+   the job, and write `NAME.log`, the file that **Check & return results**
+   brings back.
+2. Choose **Save on the HPC…**. Desktop shows what changed against the
+   generated script. Nothing is sent until you confirm.
+3. The HPC asks Slurm whether it would accept the script
+   (`sbatch --test-only`; no job is created) and saves it. If Slurm would
+   refuse it, for example because of an unknown partition, nothing is saved
+   and your text stays in the window so you can fix it.
+4. Saved scripts come back with any warnings, for example: the script no
+   longer writes `NAME.log`, so the result cannot come back automatically;
+   `--cpus-per-task` or `--mem` no longer match what Gaussian is started
+   with; the time limit is longer than the partition allows; or `--array`,
+   `--output` or `--chdir` are set. Warnings never stop a save; you decide.
+
+**Reset to generated** brings back the script Inkly prepared. If an edited
+script is already saved on the HPC, it is replaced as soon as you confirm.
+
+Edited rows show **(script edited)** in the table, and the table and the
+**Submit prepared jobs** confirmation show the CPUs, memory and time limit the
+edited script asks for. Where an edited script leaves memory or time to
+Slurm's defaults, Desktop says so instead of a number. **Job details**, **Job
+history** and the Activity line for the submission also mark jobs whose
+script you edited.
+
+For more CPUs or memory, [CPUs & memory…](#change-cpus-and-memory-before-submitting)
+is safer than editing those lines by hand: it keeps Slurm's request and
+Gaussian's own settings in step. It prepares the file again, so on a row whose
+script you edited it asks first (**Discard script edits?**, default No).
+
+**Run again** always prepares a fresh script from the input. If the earlier
+job's script was edited, the confirmation says so; your edits are not carried
+over, and the earlier script stays on the HPC with its job.
+
+Saving a script needs a copy of Inkly on the HPC that supports it. With an
+older copy, Desktop says so and changes nothing; update Inkly on the HPC from
+**Connection settings**.
 
 ## Pending and failed-job details
 
@@ -620,6 +669,8 @@ state for that.
 Cancel and Run again add `desktop_cancel` (approved, requested or unsupported;
 count or job ID) and `desktop_rerun` (approved or prepared; count) events.
 CPUs & memory adds `desktop_resources` (approved or prepared; count).
+Saving a job script adds `desktop_script` (saved, reset or refused, and the
+number of warnings); the script itself is never logged.
 Older HPC copies ignore event types they do not know.
 
 The Windows executable and the HPC `inkly` package must be upgraded together
