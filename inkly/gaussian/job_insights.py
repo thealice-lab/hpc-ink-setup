@@ -168,6 +168,7 @@ def job_details(root, bundle, scheduler):
         "bundle": bundle,
         "name": name,
         "job_id": receipt.get("job_id"),
+        "script_edited": receipt.get("script_edited") is True,
         **status,
         "logs": [],
         "gaussian_error": None,

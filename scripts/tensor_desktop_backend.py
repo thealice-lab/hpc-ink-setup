@@ -16,6 +16,27 @@ import tensor_desktop_setup as setup
 import tensor_picker as picker
 from inkly.core.desktop_diagnostics import DesktopJournal
 
+# How the HPC words a submission Slurm refused outright: no job was created and
+# the file is prepared again (inkly.gaussian.submission.REFUSED).
+SLURM_REFUSED = "Slurm refused the job, so nothing was submitted"
+# check_submission answers that change nothing and are worth trying later.
+CHECK_LATER = (
+    "The submission was attempted less than 2 minutes ago",
+    "Slurm's queue or accounting could not be checked",
+)
+
+
+def resource_text(resources):
+    """'8 CPUs, 16 GB Slurm memory' from a job's resources or a chosen change."""
+    parts = []
+    if "cpus" in resources:
+        cpus = resources["cpus"]
+        parts.append(f"{cpus} CPU" + ("" if cpus == 1 else "s"))
+    memory = resources.get("slurm_memory_mib", resources.get("memory_mib"))
+    if memory is not None:
+        parts.append(f"{round(memory / 1024, 2):g} GB Slurm memory")
+    return ", ".join(parts)
+
 
 class DesktopController:
     def __init__(self, emit, askpass=None, interval=30, journal=None, index=None):
@@ -161,14 +182,38 @@ class DesktopController:
                 "elapsed": response.get("elapsed"),
                 "exit_code": response.get("exit_code"),
                 "observed_at": response.get("observed_at"),
-                "resources": deepcopy(response["resources"]),
+                "resources": self.requested(response),
                 "stages": response["stages"],
                 "script": response.get("script", ""),
+                "script_sha256": response.get("script_sha256"),
+                "generated_script": response.get("generated_script", ""),
                 "output": str(output) if output else "",
                 # The file was edited after this bundle was prepared.
                 "input_changed": bool(item.get("changed")),
+                # The HPC copy of the job script was edited (newer endpoints).
+                "script_edited": bool(response.get("script_edited")),
             },
         )
+
+    @staticmethod
+    def requested(response):
+        """What the job asks Slurm for: an edited script's own values, if any.
+
+        None means the script leaves that value to Slurm's or the partition's
+        default. The receipt's own resources stay as Inkly prepared them.
+        """
+        resources = deepcopy(response["resources"])
+        edited = response.get("script_resources")
+        if response.get("script_edited") is True and isinstance(edited, dict):
+            resources.update(
+                # Slurm gives one CPU per task when --cpus-per-task is absent.
+                cpus=edited.get("cpus") or 1,
+                slurm_memory_mib=edited.get("slurm_memory_mib"),
+                hours=edited.get("hours"),
+                gaussian_memory_mb=None,  # Set by the script itself.
+                script_edited=True,
+            )
+        return resources
 
     @staticmethod
     def job_metadata(response):
@@ -189,6 +234,8 @@ class DesktopController:
         "cancel": "Cancel job",
         "job_details": "Job details",
         "jobs": "Load my jobs and Job history",
+        "revise_script": "Edit job scripts",
+        "check_submission": "Check unconfirmed submissions",
     }
 
     def hpc_install(self, state, settings=None, version=None, offer=False):
@@ -508,17 +555,18 @@ class DesktopController:
 
     def review(self):
         ready = [item for item in self.items if self.ready(item)]
+        jobs = [
+            {"name": item["path"].name, **self.requested(item["response"])}
+            for item in ready
+        ]
         return {
             "id": self.review_id,
             "count": len(ready),
-            "cpus": sum(item["response"]["resources"]["cpus"] for item in ready),
-            "memory_mib": sum(
-                item["response"]["resources"]["slurm_memory_mib"] for item in ready
-            ),
-            "jobs": [
-                {"name": item["path"].name, **item["response"]["resources"]}
-                for item in ready
-            ],
+            "cpus": sum(job["cpus"] for job in jobs),
+            "memory_mib": sum(job["slurm_memory_mib"] or 0 for job in jobs),
+            # Edited scripts that leave memory to Slurm are not in the total.
+            "memory_unknown": sum(job["slurm_memory_mib"] is None for job in jobs),
+            "jobs": jobs,
             "recovered": [item["path"].name for item in ready if item.get("recovered")],
         }
 
@@ -575,13 +623,27 @@ class DesktopController:
         )
         self.emit("review", None)
         self.refresh_before_submit()
+        refused = []
         for item in self.items:
             self.check_stop()
             if self.ready(item):
                 self.audit("desktop_submission", {"status": "attempt"})
-                response = self.session.exchange(
-                    {"action": "submit", "confirm": True}, receipt=item["receipt"]
-                )
+                try:
+                    response = self.session.exchange(
+                        {"action": "submit", "confirm": True}, receipt=item["receipt"]
+                    )
+                except ValueError as error:
+                    if not str(error).startswith(SLURM_REFUSED):
+                        raise  # Unconfirmed, or the connection was lost: stop.
+                    # Slurm said no and created no job; the HPC prepared it again.
+                    self.audit("desktop_submission", {"status": "refused"})
+                    item["response"] = self.session.exchange(
+                        {"action": "status"}, receipt=item["receipt"]
+                    )
+                    self.row(item)
+                    self.emit("message", f"{item['path'].name}: {error}")
+                    refused.append(item["path"].name)
+                    continue
                 item["response"].update(response)
                 self.audit(
                     "desktop_submission",
@@ -590,8 +652,21 @@ class DesktopController:
                 self.row(item, state="SUBMITTED")
                 self.emit(
                     "message",
-                    f"Submitted {item['path'].name}: job {response['job_id']}",
+                    f"Submitted {item['path'].name}: job {response['job_id']}"
+                    + (
+                        " (with your edited job script)"
+                        if item["response"].get("script_edited") is True
+                        else ""
+                    ),
                 )
+        if refused:
+            self.emit(
+                "notice",
+                f"Slurm refused {len(refused)} job(s), so they were not submitted: "
+                + ", ".join(refused)
+                + ". Each is still prepared; Activity has Slurm's reason. Change "
+                "them, preview again and submit when ready.",
+            )
         if watch:
             self.monitor()
 
@@ -601,6 +676,9 @@ class DesktopController:
         "preview",
         "submit",
         "rerun",
+        "change_resources",
+        "revise_script",
+        "check_submissions",
         "load_jobs",
         "restore_jobs",
         "history",
@@ -649,7 +727,9 @@ class DesktopController:
             try:
                 if action in {"cancel_jobs", "job_details"}:
                     targets = [self.target_for(args[0], args[1], "resume")]
-                elif action == "rerun":
+                elif action == "revise_script":
+                    targets = [self.target_for([args[0]], args[3], "resume")]
+                elif action in {"rerun", "change_resources", "check_submissions"}:
                     targets = [
                         self.target_for(args[0], args[2], "resume"),
                         self.target_for(args[1], args[2], "preview"),
@@ -683,7 +763,14 @@ class DesktopController:
             except ValueError as error:
                 self.emit("request_error", str(error))
                 continue
-            changed = changed or action in {"preview", "submit", "rerun"}
+            changed = changed or action in {
+                "preview",
+                "submit",
+                "rerun",
+                "change_resources",
+                "revise_script",
+                "check_submissions",
+            }
 
     def monitor(self):
         if not self.items or not self.items[0].get("receipt"):
@@ -1136,17 +1223,264 @@ class DesktopController:
         for item in items:
             self.check_stop()
             old_bundle = item["receipt"]["bundle"]
+            chosen = picker.chosen_resources(item["response"]["resources"])
+            if chosen:
+                self.emit(
+                    "message",
+                    f"{item['path'].name}: keeping the {resource_text(chosen)} chosen "
+                    "for its earlier job.",
+                )
             picker.prepare_again(
                 self.session,
                 item,
                 settings,
                 report=lambda value: self.emit("message", value),
+                resources=chosen,
             )
             try:
                 self.index.replaced(old_bundle)
             except Exception:
                 pass
             self.audit("desktop_rerun", {"status": "prepared", "count": 1})
+        # Re-read the whole list so the rows and the approval cover every file.
+        self.preview(paths, settings)
+
+    def change_resources(self, selected, paths, settings, changes):
+        """Prepare selected unsubmitted files again with new CPUs or memory.
+
+        Each changed file gets a new bundle, as Run again does: the old receipt
+        is archived beside the input and nothing is submitted. A value left as
+        None keeps the job's current one.
+        """
+        self.check_stop()
+        changes = picker.resource_changes(changes)
+        self.review_id = None
+        self.emit("review", None)
+        settings, items, _ = self.selected_items(
+            selected, settings, "Select the rows to change first."
+        )
+        # Check every selected file before changing any receipt.
+        for item in items:
+            response = item["response"]
+            state = picker.state_name(response.get("state", response["submission"]))
+            if item.get("changed"):
+                raise ValueError(
+                    f"{item['path'].name} was edited after it was prepared, so its CPUs "
+                    "and memory were not changed. Choose Run again to prepare the "
+                    "edited file first."
+                )
+            if state != "PREPARED":
+                raise ValueError(
+                    f"{item['path'].name} is {state}, so its CPUs and memory were not "
+                    "changed. Only jobs that have not been submitted can be changed; "
+                    "for an ended job, choose Run again first."
+                )
+        plans = []
+        for item in items:
+            current = item["response"]["resources"]
+            wanted = {
+                **picker.chosen_resources(current),
+                **{key: value for key, value in changes.items() if value is not None},
+            }
+            if (
+                wanted.get("cpus", current["cpus"]) == current["cpus"]
+                and wanted.get("memory_mib", current["slurm_memory_mib"])
+                == current["slurm_memory_mib"]
+            ):
+                self.emit(
+                    "message",
+                    f"{item['path'].name} already uses {resource_text(current)}; "
+                    "it was left as it is.",
+                )
+                continue
+            plans.append((item, wanted))
+        if not plans:
+            self.preview(paths, settings)
+            return
+        self.audit("desktop_resources", {"status": "approved", "count": len(plans)})
+        for item, wanted in plans:
+            self.check_stop()
+            old_bundle = item["receipt"]["bundle"]
+            before = resource_text(item["response"]["resources"])
+            picker.prepare_again(
+                self.session,
+                item,
+                settings,
+                report=lambda value: self.emit("message", value),
+                resources=wanted,
+                label="resources",
+            )
+            try:
+                self.index.replaced(old_bundle)
+            except Exception:
+                pass
+            self.audit("desktop_resources", {"status": "prepared", "count": 1})
+            self.emit(
+                "message",
+                f"{item['path'].name}: now {resource_text(item['response']['resources'])}"
+                f" (was {before}). Nothing was submitted.",
+            )
+        # Re-read the whole list so the rows and the approval cover every file.
+        self.preview(paths, settings)
+
+    def revise_script(self, path, script, expected_sha256, settings):
+        """Save the researcher's own job script for one prepared file.
+
+        Never submits. A refusal from the HPC (for example Slurm would not
+        accept the script) goes back to the script window and keeps the
+        connection and the current preview; a lost connection still stops.
+        """
+        self.check_stop()
+        settings, items, _ = self.selected_items(
+            [path], settings, "Select the row whose job script you changed first."
+        )
+        item = items[0]
+        name = item["path"].name
+        state = picker.state_name(
+            item["response"].get("state", item["response"]["submission"])
+        )
+        if state != "PREPARED" or item.get("changed"):
+            self.emit(
+                "script_result",
+                {
+                    "path": path,
+                    "status": "refused",
+                    "message": f"{name} is {state}"
+                    + (" and its input was edited" if item.get("changed") else "")
+                    + ", so its job script was not changed. Only a prepared job "
+                    "that has not been submitted can have its script changed.",
+                },
+            )
+            return
+        if not self.endpoint_supports("revise_script", item["receipt"]):
+            self.emit(
+                "script_result",
+                {
+                    "path": path,
+                    "status": "unsupported",
+                    "message": "The Inkly copy on the HPC is too old to save job "
+                    "script changes. Update Inkly on the HPC from Connection "
+                    "settings, then try again. Nothing was changed.",
+                },
+            )
+            return
+        try:
+            response = self.session.exchange(
+                {
+                    "action": "revise_script",
+                    "script": script,
+                    "expected_sha256": expected_sha256,
+                },
+                receipt=item["receipt"],
+            )
+        except bridge.MissingBundleError:
+            raise
+        except bridge.RemoteRefusal as error:
+            self.audit("desktop_script", {"status": "refused"})
+            self.emit(
+                "script_result",
+                {"path": path, "status": "refused", "message": str(error)},
+            )
+            return
+        warnings = [w for w in response.pop("warnings", ()) if isinstance(w, str)]
+        if response.get("name") != name:
+            raise ValueError("The HPC returned a different input filename")
+        item["response"] = response
+        self.sync_items([item])
+        self.row(item)
+        edited = response.get("script_edited") is True
+        self.audit(
+            "desktop_script",
+            {"status": "saved" if edited else "reset", "warnings": len(warnings)},
+        )
+        if self.review_id:
+            self.emit("review", self.review())
+        self.emit(
+            "script_result",
+            {
+                "path": path,
+                "status": "saved",
+                "edited": edited,
+                "script": response.get("script", ""),
+                "script_sha256": response.get("script_sha256"),
+                "generated_script": response.get("generated_script", ""),
+                "warnings": warnings,
+            },
+        )
+        self.emit(
+            "message",
+            (
+                f"Saved your job script for {name} on the HPC"
+                + (
+                    f" ({len(warnings)} warning(s); see View script)"
+                    if warnings
+                    else ""
+                )
+                if edited
+                else f"Restored the generated job script for {name}"
+            )
+            + ". Nothing was submitted.",
+        )
+
+    def check_submissions(self, selected, paths, settings):
+        """Settle submissions whose outcome was never confirmed.
+
+        For each file the HPC looks for its job in the queue, in Slurm's
+        accounting and in its job folder. A job found is recorded and watched
+        as usual; with none found, the file is prepared again so it can be
+        reviewed and submitted. Nothing is submitted here.
+        """
+        self.check_stop()
+        self.review_id = None
+        self.emit("review", None)
+        settings, items, _ = self.selected_items(
+            selected, settings, "Select the unconfirmed rows to check first."
+        )
+        for item in items:
+            response = item["response"]
+            state = picker.state_name(response.get("state", response["submission"]))
+            if state != "SUBMISSION_UNKNOWN":
+                raise ValueError(
+                    f"{item['path'].name} is {state}; only a submission Desktop "
+                    "could not confirm can be checked."
+                )
+        if not self.endpoint_supports("check_submission", items[0]["receipt"]):
+            raise ValueError(
+                "The Inkly copy on the HPC is too old to check unconfirmed "
+                "submissions. Update Inkly on the HPC from Connection settings, "
+                "then try again. Nothing was changed."
+            )
+        self.audit(
+            "desktop_check_submission", {"status": "approved", "count": len(items)}
+        )
+        for item in items:
+            self.check_stop()
+            name = item["path"].name
+            try:
+                response = self.session.exchange(
+                    {"action": "check_submission", "reopen": True},
+                    receipt=item["receipt"],
+                )
+            except ValueError as error:
+                if not str(error).startswith(CHECK_LATER):
+                    raise
+                self.emit("message", f"{name}: {error}.")
+                continue
+            item["response"] = response
+            found = response.get("found") is True
+            self.audit(
+                "desktop_check_submission",
+                {"status": "found" if found else "reopened", "count": 1},
+            )
+            self.emit(
+                "message",
+                f"{name}: found job {response.get('job_id')}, so it was submitted "
+                "after all. Nothing new was submitted."
+                if found
+                else f"{name}: no job was found in the queue, in Slurm's accounting "
+                "or in its job folder, so it is prepared again. Nothing was "
+                "submitted; review it and submit when ready.",
+            )
         # Re-read the whole list so the rows and the approval cover every file.
         self.preview(paths, settings)
 
@@ -1170,6 +1504,12 @@ class DesktopController:
                 self.job_details(*args)
             elif action == "rerun":
                 self.rerun(*args)
+            elif action == "change_resources":
+                self.change_resources(*args)
+            elif action == "revise_script":
+                self.revise_script(*args)
+            elif action == "check_submissions":
+                self.check_submissions(*args)
             elif action in {"load_jobs", "restore_jobs", "history", "search_jobs"}:
                 getattr(self, action)(*args)
             elif action == "close":

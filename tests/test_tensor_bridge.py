@@ -159,6 +159,25 @@ def test_other_remote_errors_are_not_classified_as_missing_bundles():
 @pytest.mark.parametrize(
     "stdout,code", [(b"[]", 0), (b"not JSON", 255), (b'{"ok":true}', 255)]
 )
+def test_only_answered_refusals_are_remote_refusals(monkeypatch, stdout, code):
+    """A refusal leaves the session usable; a broken reply never looks like one."""
+    receipt = {"host": "cluster", "ink_path": "/bin/ink", "bundle": "a" * 32}
+    raw = json.dumps({"ok": False, "error": "Slurm would refuse this script"})
+    with pytest.raises(bridge.RemoteRefusal, match="refuse this script"):
+        bridge._response(raw.encode(), receipt)
+    monkeypatch.setattr(
+        bridge.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, code, stdout),
+    )
+    with pytest.raises(ValueError) as error:
+        bridge.exchange(receipt, {}, "ssh")
+    assert not isinstance(error.value, bridge.RemoteRefusal)
+
+
+@pytest.mark.parametrize(
+    "stdout,code", [(b"[]", 0), (b"not JSON", 255), (b'{"ok":true}', 255)]
+)
 def test_invalid_or_failed_ssh_response_is_reported(monkeypatch, stdout, code):
     monkeypatch.setattr(
         bridge.subprocess,

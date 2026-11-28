@@ -20,6 +20,8 @@ from inkly.core.storage import history_lock, private_directory, private_open
 from inkly.gaussian.job_spec import GaussianJobSpec
 from inkly.gaussian.job_insights import job_details
 from inkly.gaussian.job_list import list_jobs
+from inkly.gaussian import script_revision
+from inkly.gaussian import submission
 from inkly.gaussian.sbatch import generate_sbatch
 
 
@@ -37,6 +39,8 @@ CAPABILITIES = (
     "job_details",
     "jobs",
     "input",
+    "revise_script",
+    "check_submission",
 )
 # Slurm accounting can lag scancel by a moment; re-read briefly, never retry it.
 CANCEL_STATUS_READS = 5
@@ -248,6 +252,143 @@ def _cancel(directory, receipt, request):
     return {**receipt, **status}
 
 
+def _revise(directory, receipt, request):
+    """Store the researcher's own script for a job that was never submitted.
+
+    Nothing is locked: the researcher may change or replace any line. Only a
+    script Slurm cannot accept is refused; anything else comes back as
+    warnings. The first generated script is kept so it can be restored.
+    """
+    if receipt["submission"] != "PREPARED":
+        raise ValueError(
+            "Only a prepared job that has not been submitted can have its script changed"
+        )
+    current = _read(directory / "job.sbatch", script_revision.MAX_SCRIPT * 4)
+    if (
+        request.get("expected_sha256") != receipt["script_sha256"]
+        or hashlib.sha256(current).hexdigest() != receipt["script_sha256"]
+    ):
+        raise ValueError(
+            "The script changed since it was opened; open View script again"
+        )
+    text = script_revision.normalize(request.get("script"))
+    original = directory / "job.sbatch.generated"
+    if not receipt.get("script_edited"):
+        # job.sbatch is still the generated script; keep that copy once.
+        if not original.exists():
+            _write(original, current)
+        receipt["generated_script_sha256"] = receipt["script_sha256"]
+    generated = _read(original, script_revision.MAX_SCRIPT * 4)
+    if hashlib.sha256(generated).hexdigest() != receipt["generated_script_sha256"]:
+        raise ValueError("The saved generated script changed; prepare again")
+    data = text.encode()
+    temporary = directory / f".revise-{os.urandom(8).hex()}.sbatch"
+    try:
+        _write(temporary, data)
+        if data == generated:
+            # Back to what Inkly generated: nothing for Slurm to check.
+            warnings = []
+            for key in ("script_edited_at", "script_resources"):
+                receipt.pop(key, None)
+            receipt["script_edited"] = False
+        else:
+            resources, warnings = script_revision.check(
+                text,
+                generated.decode("utf-8"),
+                _scheduler,
+                directory,
+                temporary.name,
+                f"inkly:{receipt['bundle']}",
+                resolve_cluster_profile(),
+            )
+            receipt.update(
+                script_edited=True,
+                script_edited_at=datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                script_resources=resources,
+            )
+        os.replace(temporary, directory / "job.sbatch")
+    finally:
+        temporary.unlink(missing_ok=True)
+    receipt["script_sha256"] = hashlib.sha256(data).hexdigest()
+    _save(directory / "receipt.json", receipt)
+    return {
+        **receipt,
+        **_state(directory, receipt),
+        "script": text,
+        "generated_script": generated.decode("utf-8"),
+        "warnings": warnings,
+    }
+
+
+def _now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _refused(directory, receipt, result):
+    """Reopen a submission Slurm clearly refused; otherwise leave it unknown.
+
+    Slurm creates no job when it answers with a validation error. The queue
+    is still checked for the bundle's comment first; any doubt keeps
+    SUBMISSION_UNKNOWN, which is never submitted again automatically.
+    """
+    reason = submission.refusal(result)
+    if not reason:
+        return
+    try:
+        queue = _scheduler(
+            ["squeue", "--noheader", "--user", str(os.getuid()), "--format", "%A|%k"],
+            directory,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    comment = f"inkly:{receipt['bundle']}"
+    listed = [line.strip().partition("|")[2] for line in queue.stdout.splitlines()]
+    if queue.returncode != 0 or comment in {note.strip() for note in listed}:
+        return
+    receipt.update(
+        submission="PREPARED", submit_refused={"at": _now(), "reason": reason}
+    )
+    _save(directory / "receipt.json", receipt)
+    raise ValueError(
+        f"{submission.REFUSED}: {reason}. It is still prepared; change it and "
+        "submit again."
+    )
+
+
+def _check_submission(directory, receipt, request):
+    """Settle SUBMISSION_UNKNOWN from evidence; reopen only when asked.
+
+    A job found in the queue, in accounting or by its Slurm log is recorded
+    as submitted. With nothing found, the receipt goes back to PREPARED only
+    when the request says reopen, every place could be checked, and the
+    attempt is old enough for accounting to have caught up.
+    """
+    if receipt["submission"] != "SUBMISSION_UNKNOWN":
+        raise ValueError("Only an unconfirmed submission can be checked")
+    attempted = submission.attempted_at(directory, receipt)
+    job, answered = submission.find_job(_scheduler, directory, receipt, attempted)
+    if job:
+        receipt.update(job_id=job, submission="SUBMITTED", submission_found_at=_now())
+        _save(directory / "receipt.json", receipt)
+        return {**receipt, **_state(directory, receipt), "found": True}
+    if request.get("reopen") is not True:
+        return {**receipt, **_state(directory, receipt), "found": False}
+    if not answered:
+        raise ValueError(
+            "Slurm's queue or accounting could not be checked; nothing was changed"
+        )
+    if datetime.now(timezone.utc) - attempted < submission.SETTLE:
+        raise ValueError(
+            "The submission was attempted less than 2 minutes ago; check again "
+            "in a few minutes"
+        )
+    receipt.update(submission="PREPARED", submission_reopened_at=_now())
+    _save(directory / "receipt.json", receipt)
+    return {**receipt, **_state(directory, receipt), "found": False}
+
+
 def handle(request, root=None):
     """Process exactly one explicit operation; never retry a submission."""
     if os.name != "posix":
@@ -337,6 +478,7 @@ def handle(request, root=None):
             # Persist uncertainty BEFORE calling Slurm. A disconnect/timeout must
             # not allow a second sbatch, even if its response was never received.
             receipt["submission"] = "SUBMISSION_UNKNOWN"
+            receipt["submit_attempted_at"] = _now()
             _save(directory / "receipt.json", receipt)
             result = _scheduler(
                 ["sbatch", "--parsable", f"--comment=inkly:{bundle}", "job.sbatch"],
@@ -344,14 +486,20 @@ def handle(request, root=None):
             )
             match = re.fullmatch(r"([0-9]+)(?:;[A-Za-z0-9_.-]+)?\s*", result.stdout)
             if result.returncode != 0 or not match:
+                _refused(directory, receipt, result)
                 raise ValueError(
                     "Submission unconfirmed; inspect squeue before any new attempt"
                 )
             receipt.update(job_id=match[1], submission="SUBMITTED")
+            receipt.pop("submit_refused", None)
             _save(directory / "receipt.json", receipt)
             return receipt
         if action == "cancel":
             return _cancel(directory, receipt, request)
+        if action == "revise_script":
+            return _revise(directory, receipt, request)
+        if action == "check_submission":
+            return _check_submission(directory, receipt, request)
         if action == "input":
             # The researcher's own prepared input, unchanged, so Desktop on
             # another computer can keep a copy beside the returned result.
@@ -371,6 +519,10 @@ def handle(request, root=None):
         if action == "status":
             if receipt["submission"] == "PREPARED":
                 response["script"] = _read(directory / "job.sbatch").decode("utf-8")
+                if receipt.get("script_edited"):
+                    response["generated_script"] = _read(
+                        directory / "job.sbatch.generated"
+                    ).decode("utf-8")
             return response
         if status != {"state": "COMPLETED", "exit_code": "0:0"}:
             raise ValueError(

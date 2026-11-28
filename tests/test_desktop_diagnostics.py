@@ -325,3 +325,55 @@ def test_unavailable_shared_storage_keeps_private_fallback(tmp_path):
         v["event_type"] == "desktop_session_start"
         for v in records(tmp_path / "private", worker=remote.worker)
     )
+
+
+def _audits(source):
+    """(event type, payload node) for every self.audit("...", ...) call."""
+    import ast
+
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "audit"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            yield node.args[0].value, node.args[1] if len(node.args) > 1 else None
+
+
+def _constant_strings(node):
+    import ast
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.IfExp):
+        return _constant_strings(node.body) + _constant_strings(node.orelse)
+    return []
+
+
+def test_every_desktop_activity_event_is_one_the_journal_keeps():
+    """An event or value missing from DESKTOP_FIELDS is silently dropped."""
+    import ast
+
+    from inkly.core.diagnostics import DESKTOP_FIELDS
+
+    source = Path(__file__).resolve().parents[1] / "scripts/tensor_desktop_backend.py"
+    seen = list(_audits(source.read_text(encoding="utf-8")))
+    assert len(seen) > 20
+    for event_type, payload in seen:
+        assert event_type in DESKTOP_FIELDS, event_type
+        if not isinstance(payload, ast.Dict):
+            continue
+        allowed = DESKTOP_FIELDS[event_type]
+        for key, value in zip(payload.keys, payload.values):
+            if key is None:
+                continue  # A **mapping spread; its keys are checked at run time.
+            name = key.value
+            assert name in allowed, (event_type, name)
+            for text in _constant_strings(value):
+                assert allowed[name] is not int and text in allowed[name], (
+                    event_type,
+                    name,
+                    text,
+                )

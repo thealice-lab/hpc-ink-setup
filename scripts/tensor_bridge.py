@@ -20,7 +20,14 @@ import time
 import uuid
 
 
-class MissingBundleError(ValueError):
+class RemoteRefusal(ValueError):
+    """The HPC copy of Inkly answered and refused the request.
+
+    The connection is still usable, unlike a lost or timed-out session.
+    """
+
+
+class MissingBundleError(RemoteRefusal):
     """The HPC no longer has the bundle referenced by a saved receipt."""
 
 
@@ -121,7 +128,7 @@ def _response(raw, receipt):
         error = response.get("error", "Remote operation failed")
         if error == "Unknown bundle; prepare a new input first":
             raise MissingBundleError(error)
-        raise ValueError(error)
+        raise RemoteRefusal(error)
     if response.get("bundle") != receipt["bundle"]:
         raise ValueError("Response bundle does not match the receipt")
     return response

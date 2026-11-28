@@ -12,6 +12,7 @@ from .embedding import TfidfEmbedder, cosine_similarity
 #
 # Example:
 # - "queue-status" is associated with words like queue, running, pending, squeue
+# - "my-jobs" is associated with words like my, why, pending, start, efficiency
 # - "documentation" is associated with words like docs, examples, modules, gaussian
 #
 # The classifier compares the user's query against these prototype texts
@@ -23,10 +24,16 @@ DEFAULT_CATEGORY_PROTOTYPES: Dict[str, str] = {
     ),
     "queue-status": (
         "current queue running jobs pending jobs cluster load queue status "
-        "squeue sinfo availability"
+        "squeue sinfo availability busy idle free nodes cpus now usage"
     ),
     "node-info": (
-        "node partition hardware limits resources gpu cpu memory cluster nodes"
+        "node nodes partition partitions hardware limits resources gpu gpus cpu "
+        "cpus memory cluster time limit walltime maximum default"
+    ),
+    "my-jobs": (
+        "my job my jobs mine i me queued running pending waiting why when start "
+        "expected time left recent last finished failed fail efficiency "
+        "efficient memory used cpu use requesting asking exit code"
     ),
     "documentation": (
         "documentation usage guide software examples gaussian cuda modules docs"
