@@ -349,6 +349,56 @@ Fetch requires Slurm `COMPLETED / 0:0`, sufficient normal Gaussian terminations
 for the linked stages, no error termination and a matching SHA-256 checksum.
 Logs are limited to 64 MiB and saved atomically without overwriting results.
 
+### Changing the generated script
+
+A bundle that is prepared but not yet submitted can have its SBATCH script
+replaced through the endpoint's `revise_script` operation. The endpoint
+reports it in `version` capabilities; older HPC copies do not have it. The
+request carries the new `script` and `expected_sha256`, the hash of the
+script the editor started from, so an out-of-date copy cannot overwrite a
+newer one.
+
+Any line may change, and the script may be replaced entirely. A save is
+refused only when the script cannot be used as a batch script: it is not
+UTF-8 text, contains NUL bytes, is larger than 64 KiB, lacks a `#!` first
+line, or `sbatch --test-only` rejects it. `--test-only` asks Slurm whether it
+would accept the script, without creating a job, and Slurm's reason is shown:
+for example an unknown partition, or more CPUs or memory than any node has.
+Clusters differ in what it checks; some accept an unknown account or QOS here
+and refuse it only at submission. If that check cannot run (no `sbatch`, a timeout, or a Slurm
+controller that does not answer), the script is saved with a warning that
+Slurm could not check it; only a partition that `sinfo` does not list is
+still refused. Windows
+line endings are converted to Unix ones.
+
+Everything else is saved with warnings, for example:
+
+- Inkly's own lines changed: the input checksum check, the
+  `exec 3> NAME.log` output that fetch returns, or the `g16 -c` launch on
+  one CPU per physical core. Fetch still returns a result only from
+  `NAME.log` in the bundle, with enough normal terminations.
+- `--cpus-per-task` below `REQUESTED_CPUS` (the job stops before Gaussian
+  starts), above it (unused CPUs), or `--mem` too small for
+  `GAUSSIAN_MEM_MB` plus Inkly's headroom. Preparing again with explicit
+  CPUs and memory changes these values together.
+- A time limit longer than the partition allows, or more CPUs or memory than
+  any node in the partition has, according to `sinfo`.
+- An `--account` or `--qos` that Slurm's accounting (`sacctmgr`) does not list
+  for you. Clusters that enforce accounts refuse those in `--test-only`;
+  others accept any name and run the job anyway.
+- `--array`, `--chdir`, `--output`, `--error`, more than one node or task,
+  or no `--hint=nomultithread`.
+
+The first generated script is kept beside the bundle as
+`job.sbatch.generated`. Sending it back unchanged restores it without any
+Slurm call. The receipt records `script_edited`, `script_edited_at`,
+`generated_script_sha256` and `script_resources` (CPUs, Slurm memory, time
+limit, hours and partition read from the saved script; `null` where Slurm's
+default applies). `resources` keeps the values Inkly prepared, and
+`script_sha256` is updated, so `submit` accepts the saved script and refuses
+any later change to it. `status` on an edited, unsubmitted bundle also
+returns `generated_script`; `jobs` and `job_details` report `script_edited`.
+
 ## Troubleshooting and lower-level CLI
 
 | Symptom | What to check |

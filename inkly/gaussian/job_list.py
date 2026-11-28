@@ -125,6 +125,8 @@ def _receipt(entry):
         "job_id": job or "",
         "submission": submission,
         "prepared_at": datetime.fromtimestamp(prepared, timezone.utc).isoformat(),
+        # The researcher changed the generated job script before submitting.
+        "script_edited": record.get("script_edited") is True,
     }
 
 

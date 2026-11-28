@@ -263,3 +263,18 @@ def test_input_copy_is_exact_and_refuses_a_changed_file(tmp_path, monkeypatch):
         tensor.handle({"action": "input", "bundle": "a" * 32}, root)
     with pytest.raises(ValueError, match="Unknown bundle"):
         tensor.handle({"action": "input", "bundle": "b" * 32}, root)
+
+
+def test_rows_say_whether_the_job_script_was_edited(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_list.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    root = tmp_path / "handoffs"
+    for bundle, edited in [("a" * 32, True), ("b" * 32, "yes"), ("c" * 32, None)]:
+        directory = handoff(root, bundle, None, "PREPARED")
+        if edited is not None:
+            record = json.loads((directory / "receipt.json").read_text())
+            record["script_edited"] = edited
+            (directory / "receipt.json").write_text(json.dumps(record))
+    response = job_list.list_jobs(scheduler_for(), tmp_path, root)
+    edited = {row["bundle"][0]: row["script_edited"] for row in response["jobs"]}
+    # Only a recorded true marks an edit; anything else reads as unedited.
+    assert edited == {"a": True, "b": False, "c": False}
