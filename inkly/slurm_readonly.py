@@ -98,7 +98,7 @@ QUERIES = MappingProxyType(
                 "--parsable2",
                 "--format",
                 "JobIDRaw,JobID,State,ExitCode,Partition,Elapsed,Timelimit,"
-                "AllocCPUS,NNodes,TotalCPU,AllocTRES",
+                "AllocCPUS,ReqCPUS,NNodes,TotalCPU,AllocTRES",
             ),
         ),
         # CPU time and peak memory of the steps of some of the user's jobs.

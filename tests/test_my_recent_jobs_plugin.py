@@ -7,22 +7,22 @@ from tests.slurm_fakes import FAILED, install_fake_slurm
 
 
 # Made-up sacct allocation rows:
-# JobIDRaw|JobID|State|ExitCode|Partition|Elapsed|Timelimit|AllocCPUS|NNodes|
-# TotalCPU|AllocTRES
+# JobIDRaw|JobID|State|ExitCode|Partition|Elapsed|Timelimit|AllocCPUS|ReqCPUS|
+# NNodes|TotalCPU|AllocTRES
 ALLOCATIONS = "\n".join(
     [
-        "200090|200090|COMPLETED|0:0|general|02:00:00|1-00:00:00|4|1|07:20:00|"
+        "200090|200090|COMPLETED|0:0|general|02:00:00|1-00:00:00|4|4|1|07:20:00|"
         "billing=4,cpu=4,mem=16G,node=1",
-        "200091|200091|OUT_OF_MEMORY|0:125|general|00:40:00|1-00:00:00|8|1|04:00:00|"
+        "200091|200091|OUT_OF_MEMORY|0:125|general|00:40:00|1-00:00:00|8|8|1|04:00:00|"
         "billing=8,cpu=8,mem=8G,node=1",
-        "200092|200092|FAILED|1:0|general|00:10:00|1-00:00:00|8|1|00:30:00|"
+        "200092|200092|FAILED|1:0|general|00:10:00|1-00:00:00|8|8|1|00:30:00|"
         "billing=8,cpu=8,mem=32G,node=1",
-        "200093|200093|CANCELLED by 4242|0:15|gpu|00:00:00|02:00:00|2|1|00:00:00|",
-        "200094|200089_3|TIMEOUT|0:0|general|1-00:00:00|1-00:00:00|4|1|1-20:00:00|"
+        "200093|200093|CANCELLED by 4242|0:15|gpu|00:00:00|02:00:00|2|2|1|00:00:00|",
+        "200094|200089_3|TIMEOUT|0:0|general|1-00:00:00|1-00:00:00|4|4|1|1-20:00:00|"
         "billing=4,cpu=4,mem=4000M,node=1",
-        "200095|200095|RUNNING|0:0|general|00:30:00|1-00:00:00|4|1|00:00:00|"
+        "200095|200095|RUNNING|0:0|general|00:30:00|1-00:00:00|4|4|1|00:00:00|"
         "billing=4,cpu=4,mem=16G,node=1",
-        "200096|200096|PENDING|0:0|general|00:00:00|1-00:00:00|4|1|00:00:00|",
+        "200096|200096|PENDING|0:0|general|00:00:00|1-00:00:00|4|4|1|00:00:00|",
     ]
 )
 # JobIDRaw|TotalCPU|MaxRSS for the steps of the finished jobs.
@@ -140,9 +140,9 @@ def test_unavailable_accounting(monkeypatch, missing, outputs, message):
 # Accounting that does not gather usage: zero CPU time, blank or zero MaxRSS.
 NO_USAGE_ALLOCATIONS = "\n".join(
     [
-        "300001|300001|COMPLETED|0:0|general|02:00:00|1-00:00:00|4|1|00:00:00|"
+        "300001|300001|COMPLETED|0:0|general|02:00:00|1-00:00:00|4|4|1|00:00:00|"
         "billing=4,cpu=4,mem=16G,node=1",
-        "300002|300002|FAILED|1:0|general|00:30:00|1-00:00:00|8|1|00:00:00|"
+        "300002|300002|FAILED|1:0|general|00:30:00|1-00:00:00|8|8|1|00:00:00|"
         "billing=8,cpu=8,mem=8G,node=1",
     ]
 )
@@ -175,7 +175,7 @@ def test_disabled_accounting_makes_efficiency_unavailable_not_zero(monkeypatch, 
 @pytest.mark.parametrize("max_rss", ["", "0", "0K"])
 def test_blank_max_rss_makes_memory_unavailable_not_zero(monkeypatch, max_rss):
     allocations = NO_USAGE_ALLOCATIONS.replace(
-        "|02:00:00|1-00:00:00|4|1|00:00:00|", "|02:00:00|1-00:00:00|4|1|06:00:00|"
+        "|02:00:00|1-00:00:00|4|4|1|00:00:00|", "|02:00:00|1-00:00:00|4|4|1|06:00:00|"
     )
     install_fake_slurm(
         monkeypatch,
@@ -195,3 +195,26 @@ def test_blank_max_rss_makes_memory_unavailable_not_zero(monkeypatch, max_rss):
     assert "0% of the request" not in output
     assert "Memory peak is unavailable: Slurm recorded no memory use" in output
     assert "largest step's sampled maximum" not in output
+
+
+def test_cpu_use_is_measured_against_the_request_when_slurm_allocates_more(
+    monkeypatch,
+):
+    # 16 CPUs requested; Slurm allocated 32 (whole cores, two threads each).
+    install_fake_slurm(
+        monkeypatch,
+        {
+            "my_recent_jobs": "400001|400001|COMPLETED|0:0|general|01:00:00|02:00:00|"
+            "32|16|1|15:00:00|billing=32,cpu=32,mem=40G,node=1",
+            "my_job_steps": "400001.batch|15:00:00|4G",
+        },
+    )
+
+    output = my_recent_jobs.run("")
+
+    assert (
+        "- 400001: completed; general, 16 CPUs requested (32 allocated), 40.0 GiB; "
+        "ran 1 h of 2 h; CPU use 94%;"
+    ) in output
+    assert "requested more CPUs than it used" not in output
+    assert "CPU use is measured against the CPUs requested." in output

@@ -41,7 +41,11 @@ Your jobs from the last 7 days, or the number of days the question names
 ones with:
 
 - the end state, exit code or signal, and run time against the time limit;
-- **CPU use:** CPU time used ÷ (elapsed time × CPUs allocated);
+- **CPU use:** CPU time used ÷ (elapsed time × CPUs requested). When Slurm
+  allocates more CPUs than requested (for example whole cores with two
+  hardware threads each, or an exclusive node), the answer shows both and
+  measures against the request, so a job that kept its requested cores busy
+  isn't reported as half idle;
 - **memory peak:** the largest step's peak memory ÷ the job's allocated memory.
 
 Jobs shorter than a minute get no percentages. Slurm samples memory, so

@@ -47,7 +47,7 @@ SHOWN_JOBS = 6
 MIN_EFFICIENCY_SECONDS = 60
 LOW_CPU_USE = 0.5
 LOW_MEMORY_USE = 0.25
-FIELD_COUNT = 11
+FIELD_COUNT = 12
 
 ACTIVE_STATES = {
     "PENDING",
@@ -89,6 +89,7 @@ class RecentJob:
     elapsed: str
     limit: str
     cpus: str
+    requested_cpus: str
     nodes: str
     total_cpu: str
     alloc_tres: str
@@ -112,9 +113,25 @@ class RecentJob:
     def elapsed_seconds(self) -> int | None:
         return parse_duration(self.elapsed)
 
+    @property
+    def allocated_more_cpus(self) -> bool:
+        """Slurm gave more CPUs than asked for (whole cores, exclusive nodes)."""
+        if not (self.cpus.isdigit() and self.requested_cpus.isdigit()):
+            return False
+        return 0 < int(self.requested_cpus) < int(self.cpus)
+
+    @property
+    def cpu_basis(self) -> int:
+        """CPUs that CPU use is measured against: the request when Slurm
+        allocated more, since the extra (often a core's second hardware
+        thread) is not something the job could have used or not asked for."""
+        if self.allocated_more_cpus:
+            return int(self.requested_cpus)
+        return int(self.cpus) if self.cpus.isdigit() else 0
+
     def cpu_use(self) -> float | None:
         elapsed = self.elapsed_seconds
-        cpus = int(self.cpus) if self.cpus.isdigit() else 0
+        cpus = self.cpu_basis
         if not elapsed or elapsed < MIN_EFFICIENCY_SECONDS or not cpus:
             return None
         # Zero CPU time means Slurm did not record it, not an idle job.
@@ -195,7 +212,10 @@ def _job_line(job: RecentJob) -> str:
     exit_words = _exit_words(job.exit_code)
     if exit_words:
         head.append(exit_words)
-    resources = f"{job.cpus} CPUs"
+    if job.allocated_more_cpus:
+        resources = f"{job.requested_cpus} CPUs requested ({job.cpus} allocated)"
+    else:
+        resources = f"{job.cpus} CPUs"
     if job.memory_mib:
         resources += f", {human_memory(job.memory_mib)}"
     parts = [
@@ -251,6 +271,12 @@ def _efficiency_lines(shown: list[RecentJob]) -> list[str]:
         job for job in shown if (job.elapsed_seconds or 0) >= MIN_EFFICIENCY_SECONDS
     ]
     lines = []
+    if any(job.allocated_more_cpus for job in shown):
+        lines.append(
+            "Slurm allocated more CPUs than requested for some jobs (for example "
+            "whole cores with two hardware threads each); CPU use is measured "
+            "against the CPUs requested."
+        )
     if cpu or memory:
         figures = []
         if cpu:
