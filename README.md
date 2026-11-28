@@ -46,6 +46,8 @@ Inkly helps users interact with an HPC system in a more natural and productive w
 
 Examples of what it can do:
 - explain Slurm usage and queue behavior
+- answer questions about your own jobs and the cluster from live, read-only
+  Slurm data ([details](docs/INK_SLURM.md))
 - summarize node and partition information
 - surface cluster-specific documentation snippets
 - provide historical job-intelligence summaries
@@ -111,6 +113,14 @@ In interactive terminal use, Inkly can display:
 
 This makes the CLI feel more responsive while still preserving the full response for runtime use.
 
+### 6. Live, read-only Slurm answers
+
+`ink` can answer "why is my job pending?", "how efficient were my jobs?" or
+"how many idle nodes are there?" from live `squeue`, `sinfo` and `sacct`
+data. It runs only fixed, read-only commands, shows job details only for your
+own jobs, never reads job names, and lists the commands it used after the
+answer. See [Live Slurm answers in `ink`](docs/INK_SLURM.md).
+
 ## Architecture Overview
 
 At a high level, Inkly works like this:
@@ -140,6 +150,7 @@ A simplified view of the important pieces:
 inkly/
   config.py
   ink_core.py
+  slurm_readonly.py
   db.py
   jobs.py
   llm/
@@ -152,6 +163,8 @@ inkly/
     manager.py
     queue_status.py
     node_info.py
+    my_jobs.py
+    my_recent_jobs.py
     jobs_summary.py
     docs_gaussian.py
   retrieval/
