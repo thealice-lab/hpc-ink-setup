@@ -3319,6 +3319,96 @@ def activity(app):
 
 
 @native_display
+def test_native_release_notice_and_connection_preference(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    monkeypatch.delenv("INKLY_DESKTOP_UPDATE_CHECK", raising=False)
+    opened = []
+    monkeypatch.setattr(gui.webbrowser, "open", lambda url: opened.append(url) or True)
+    try:
+        assert app.check_releases.get() is True
+        assert app.release_worker is None  # Unpackaged source and tests stay offline.
+        assert app.release_notice.winfo_manager() != "pack"
+        release = gui.updates.release_info("desktop-v99.0.0")
+        app.events.put(("release", release))
+        app.drain()
+        assert app.release_notice.winfo_manager() == "pack"
+        assert app.release_notice.master is app.banner
+        assert "99.0.0 is available" in app.release_notice.cget("text")
+        assert "99.0.0 is available" in activity(app)
+        assert app.open_release() == "break"
+        assert opened == [release["url"]]
+
+        # Preferences can be changed without saving HPC credentials.
+        app.configure()
+        assert app.release_check_button.cget("text") == "Check for new Desktop releases"
+        app.release_check_button.invoke()
+        assert not gui.preferences.load(tmp_path, gui.updates.PREFERENCE)
+        assert gui.notify.load_preference(tmp_path)
+        assert app.release_notice.winfo_manager() != "pack"
+        app.events.put(("release", release))  # An already-running check finished.
+        app.drain()
+        assert app.release_notice.winfo_manager() != "pack"
+        assert app.open_release() == "break" and len(opened) == 1
+        app.notify_jobs.set(False)
+        app.save_notify_choice()
+        app.release_check_button.invoke()
+        assert gui.preferences.load(tmp_path, gui.updates.PREFERENCE)
+        assert not gui.notify.load_preference(tmp_path)
+    finally:
+        app.close()
+
+
+@native_display
+def test_native_release_check_runs_in_background_and_respects_saved_choice(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    monkeypatch.delenv("INKLY_DESKTOP_UPDATE_CHECK", raising=False)
+    calls = []
+    release = gui.updates.release_info("desktop-v99.0.0")
+    monkeypatch.setattr(
+        gui.updates, "check", lambda path: calls.append(path) or release
+    )
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+        check_updates=True,
+    )
+    try:
+        assert app.release_worker is not None
+        app.release_worker.join(timeout=2)
+        app.drain()
+        assert calls == [tmp_path]
+        assert app.release_url == release["url"]
+        app.check_releases.set(False)
+        app.save_release_choice()
+    finally:
+        app.close()
+
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+        check_updates=True,
+    )
+    try:
+        assert not app.check_releases.get()
+        assert app.release_worker is None
+        assert calls == [tmp_path]
+    finally:
+        app.close()
+
+
+@native_display
 def test_native_connection_settings_offer_set_up_update_and_repair(
     workflow, tmp_path, monkeypatch
 ):

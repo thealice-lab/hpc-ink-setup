@@ -25,8 +25,10 @@ if not getattr(sys, "frozen", False):
 
 import tensor_desktop_jobs as jobs
 import tensor_desktop_notify as notify
+import tensor_desktop_preferences as preferences
 import tensor_desktop_setup as hpc_setup
 import tensor_desktop_status as status
+import tensor_desktop_updates as updates
 import tensor_picker as picker
 from tensor_desktop_backend import DesktopController, resource_text
 
@@ -121,7 +123,13 @@ STOP_GRACE_MS = 20000
 
 
 class DesktopApp:
-    def __init__(self, root, controller_factory=DesktopController, settings_path=None):
+    def __init__(
+        self,
+        root,
+        controller_factory=DesktopController,
+        settings_path=None,
+        check_updates=None,
+    ):
         # Tk objects may only be freed on the thread that created them. Python's
         # cyclic garbage collector runs on whichever thread triggers it, and here
         # the worker and diagnostics threads allocate constantly; Tcl aborts the
@@ -187,6 +195,16 @@ class DesktopApp:
         self.host_untrusted = False
         self.events = queue.Queue()
         self.commands = queue.Queue()
+        # Packaged apps check for new releases. Source runs and the packaged
+        # smoke test stay offline unless a test explicitly enables the check.
+        self.release_checks_allowed = (
+            getattr(sys, "frozen", False) if check_updates is None else check_updates
+        )
+        self.check_releases = tk.BooleanVar(
+            value=preferences.load(self.path.parent, updates.PREFERENCE)
+        )
+        self.release_worker = None
+        self.release_url = None
         self.controller = controller_factory(
             lambda kind, data: self.events.put((kind, data)), askpass=bundled_askpass()
         )
@@ -197,6 +215,7 @@ class DesktopApp:
         self.timer = self.root.after(80, self.drain)
         if self.load_error:
             self.log("Saved connection needs attention: " + self.load_error)
+        self.start_release_check()
 
     def build(self):
         style = ttk.Style(self.root)
@@ -274,6 +293,19 @@ class DesktopApp:
         self.contact.pack(anchor="w", pady=(2, 0))
         for sequence in ("<Button-1>", "<Return>", "<space>"):
             self.contact.bind(sequence, self.contact_support)
+        self.release_notice = tk.Label(
+            banner,
+            background="#142b45",
+            foreground="#ffdb8a",
+            font=("Segoe UI", 10, "underline"),
+            cursor="hand2",
+            takefocus=1,
+            highlightthickness=1,
+            highlightbackground="#142b45",
+            highlightcolor="white",
+        )
+        for sequence in ("<Button-1>", "<Return>", "<space>"):
+            self.release_notice.bind(sequence, self.open_release)
         tools = ttk.Frame(self.root, padding=(22, 14))
         tools.grid(row=1, column=0, sticky="ew")
         tools.columnconfigure(0, weight=1)
@@ -523,6 +555,8 @@ class DesktopApp:
             kind, data = self.events.get_nowait()
             if kind == "message":
                 self.log(data)
+            elif kind == "release":
+                self.show_release(data)
             elif kind == "job_details":
                 self.show_job_details(data)
             elif kind == "jobs_found":
@@ -751,6 +785,89 @@ class DesktopApp:
                 parent=self.root,
             )
         return "break"
+
+    def start_release_check(self):
+        """Check in the background and deliver the result on the Tk thread."""
+        if (
+            not self.release_checks_allowed
+            or not self.check_releases.get()
+            or not updates.enabled()
+            or self.closed
+            or (self.release_worker and self.release_worker.is_alive())
+        ):
+            return
+        directory, events = self.path.parent, self.events
+
+        def check():
+            # No Tk objects are read or written by this worker.
+            try:
+                release = updates.check(directory)
+            except Exception:
+                release = None
+            events.put(("release", release))
+
+        self.release_worker = threading.Thread(target=check, daemon=True)
+        self.release_worker.start()
+
+    def hide_release(self):
+        self.release_url = None
+        self.release_notice.pack_forget()
+
+    def show_release(self, release):
+        info = updates.newer(
+            updates.release_info(release.get("tag")) if release else None,
+            updates.__version__,
+        )
+        if (
+            self.closed
+            or not self.check_releases.get()
+            or not updates.enabled()
+            or not info
+        ):
+            self.hide_release()
+            return
+        changed = self.release_url != info["url"]
+        self.release_url = info["url"]
+        self.release_notice.configure(
+            text=f"Inkly Desktop {info['version']} is available: open the download page"
+        )
+        self.release_notice.pack(anchor="w", pady=(2, 0))
+        if changed:
+            self.log(
+                f"Inkly Desktop {info['version']} is available (this Desktop is "
+                f"{updates.__version__}). After downloading it, Connection settings "
+                "can update Inkly on the HPC."
+            )
+
+    def open_release(self, event=None):
+        if not self.release_url:
+            return "break"
+        try:
+            opened = webbrowser.open(self.release_url)
+        except (OSError, webbrowser.Error):
+            opened = False
+        if not opened:
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(self.release_url)
+                self.log(
+                    "The release download page address was copied to the clipboard."
+                )
+            except tk.TclError:
+                self.log(f"Open the release page: {self.release_url}")
+        return "break"
+
+    def save_release_choice(self):
+        try:
+            preferences.save(
+                self.path.parent, updates.PREFERENCE, self.check_releases.get()
+            )
+        except OSError as error:
+            self.log(f"Could not save the release-check choice: {error}")
+        if self.check_releases.get():
+            self.start_release_check()
+        else:
+            self.hide_release()
 
     def layout_report(self):
         """Geometry evidence for the packaged smoke test and scaled-font tests."""
@@ -1311,9 +1428,18 @@ class DesktopApp:
             wraplength=510,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
+        self.release_check_button = ttk.Checkbutton(
+            frame,
+            text="Check for new Desktop releases",
+            variable=self.check_releases,
+            command=self.save_release_choice,
+        )
+        self.release_check_button.grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(0, 12)
+        )
         ttk.Button(
             frame, text="Save settings", command=save, style="Accent.TButton"
-        ).grid(row=7, column=1, sticky="e")
+        ).grid(row=8, column=1, sticky="e")
 
     def hpc_status_text(self):
         state = self.hpc_state or {}
@@ -2174,7 +2300,7 @@ def main(argv=None):
     # External OpenSSH/PowerShell must use system DLL lookup, not frozen DLLs.
     if os.name == "nt" and getattr(sys, "frozen", False):
         ctypes.windll.kernel32.SetDllDirectoryW(None)
-    app = DesktopApp(root)
+    app = DesktopApp(root, check_updates=False if args.smoke_test else None)
     if args.smoke_test:
         # Local build verification only: draw the real window and invoke no SSH.
         for _ in range(5):

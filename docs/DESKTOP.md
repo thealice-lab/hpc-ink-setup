@@ -67,6 +67,16 @@ Do not override Windows security warnings for an unverified source. Opening
 warning because the build is not Authenticode-signed; the helper checks the
 EXE's exact SHA-256 before running it.
 
+**Newer releases:** the packaged app checks the public GitHub release list in
+the background, at most once a day. If a newer Desktop release is available
+(including a preview), a link under the contact line opens that release's
+download page. Nothing is downloaded or installed automatically. The check
+needs no GitHub sign-in or HPC connection and is silent when unavailable.
+To turn it off, untick **Check for new Desktop releases** in Connection
+settings; the choice is saved immediately on this computer. Administrators can
+also set `INKLY_DESKTOP_UPDATE_CHECK=0`. Source runs and the packaged smoke
+test do not check for releases.
+
 Maintainers: after publishing a new release (see **Publish a release** below),
 update the helper's version, source commit and EXE SHA-256 (from the release's
 `SHA256SUMS.txt`) together, along with this page, the README and
