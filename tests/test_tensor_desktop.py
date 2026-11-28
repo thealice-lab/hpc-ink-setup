@@ -2501,6 +2501,7 @@ def test_native_job_history_filters_and_adds_selected_jobs(
             hpc_job("e" * 32, "COMPLETED", "old.gjf", ended_days=60),
         ]
         w.endpoint["jobs"][1]["submitted_at"] = w.endpoint["jobs"][1]["ended_at"]
+        w.endpoint["jobs"][1]["script_edited"] = True
         # Well away from the 30-day boundary, so the clock tick cannot matter.
         w.endpoint["jobs"][3]["submitted_at"] = w.endpoint["jobs"][3]["ended_at"]
         app.history_button.invoke()
@@ -2509,6 +2510,8 @@ def test_native_job_history_filters_and_adds_selected_jobs(
         # Default view: finished and cancelled jobs from the last 30 days.
         assert table.get_children() == ("b" * 32, "a" * 32)
         assert "Showing 2 of 4" in app.history_summary.cget("text")
+        assert table.item("a" * 32)["values"][1] == "water.gjf (edited script)"
+        assert table.item("b" * 32)["values"][1] == "ethanol.gjf"
         assert str(tmp_path / "copies") in app.copies_label.cget("text")
         app.history_state.set("All")
         app.history_period.set("All time")
@@ -4138,6 +4141,121 @@ def test_native_refused_script_keeps_text_and_connection(
         monkeypatch.setattr(job_script.messagebox, "askyesno", answer(True))
         window.close()
         assert app.script_window is None
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+def test_job_details_mark_an_edited_script():
+    import tensor_desktop_status as wording
+
+    details = wording.job_details_text(
+        {"name": "sample.gjf", "state": "COMPLETED", "script_edited": True}
+    )
+    assert "Job script: edited by you before submitting" in details
+    assert "edited" not in wording.job_details_text(
+        {"name": "sample.gjf", "state": "COMPLETED"}
+    )
+
+
+@native_display
+def test_native_run_again_says_edited_scripts_are_not_carried_over(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first = workflow, str(workflow.paths[0])
+    questions = []
+
+    def answer(value):
+        def ask(title, text, **kwargs):
+            questions.append((title, text))
+            return value
+
+        return ask
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.table.selection_set(first)
+        # Run again on a job whose script was edited says the edits stay behind.
+        app.events.put(
+            (
+                "row",
+                {
+                    **app.rows[first],
+                    "state": "CANCELLED by 1000",
+                    "script_edited": True,
+                },
+            )
+        )
+        app.drain()
+        app.buttons()
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.rerun_button.invoke()
+        assert not [e for e in w.events if e[0] == "error"]
+        assert "EDITED JOB SCRIPT: sample_1.gjf was" in questions[-1][1]
+        assert "not carried over" in questions[-1][1]
+        app.table.selection_set(str(w.paths[1]))
+        app.events.put(
+            ("row", {**app.rows[str(w.paths[1])], "state": "CANCELLED by 1000"})
+        )
+        app.drain()
+        app.buttons()
+        app.rerun_button.invoke()
+        assert "EDITED JOB SCRIPT" not in questions[-1][1]
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+@native_display
+def test_native_saved_script_edit_makes_cpus_and_memory_ask_once(
+    workflow, tmp_path, monkeypatch
+):
+    """A script saved through View script reaches #60's discard prompt."""
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first, second = workflow, *(str(path) for path in workflow.paths)
+    questions, scheduled = [], []
+
+    def answer(value):
+        def ask(title, text, **kwargs):
+            questions.append((title, text, kwargs.get("default")))
+            return value
+
+        return ask
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        script_endpoint(w)
+        w.controller.revise_script(first, EDITED_SCRIPT, "abc", SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        assert app.rows[first]["script_edited"] is True
+        assert app.rows[second]["script_edited"] is False
+        changes = {"cpus": 8, "memory_mib": None}
+        monkeypatch.setattr(app, "ask_resources", lambda rows: dict(changes))
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+        app.table.selection_set(first)
+        app.buttons()
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.resources_button.invoke()
+        # One prompt, defaulting to No; nothing is prepared again.
+        assert [question[0] for question in questions] == ["Discard script edits?"]
+        assert "sample_1.gjf" in questions[0][1] and questions[0][2] == "no"
+        assert scheduled == []
+        # An unedited row is changed without that prompt.
+        app.table.selection_set(second)
+        app.buttons()
+        app.resources_button.invoke()
+        assert len(questions) == 1
+        assert scheduled == [
+            ("change_resources", [second], [first, second], SETTINGS, changes)
+        ]
     finally:
         app.busy, app.action = False, None
         app.close()

@@ -1117,6 +1117,17 @@ class DesktopApp:
             f"limit ({self.settings['hours']} hour(s)). Nothing is submitted: review "
             "the preview, then choose Submit prepared jobs."
         )
+        edited = [row["name"] for _, row in rows if row.get("script_edited")]
+        if edited:
+            text += (
+                "\n\nEDITED JOB SCRIPT: "
+                + ", ".join(edited)
+                + (" was" if len(edited) == 1 else " were")
+                + " set up with a job script you edited. The new job gets a fresh "
+                "script generated from the input; your edits are not carried over. "
+                "The earlier script stays on the HPC with its old job. Open View "
+                "script on the new row to edit it again."
+            )
         if messagebox.askyesno(
             "Run again as new jobs", text, parent=self.root, default="no"
         ):
@@ -2117,7 +2128,8 @@ class DesktopApp:
                 iid=job["bundle"],
                 values=(
                     jobs.local_time(job.get("submitted_at") or job.get("prepared_at")),
-                    job["name"],
+                    job["name"]
+                    + (" (edited script)" if job.get("script_edited") else ""),
                     job.get("job_id") or "—",
                     status.state_name(job.get("state")),
                     job.get("exit_code") or "",

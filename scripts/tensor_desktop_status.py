@@ -160,6 +160,8 @@ def job_details_text(details):
     lines = [
         f"{details['name']} | Job {details.get('job_id') or 'not submitted'} | {state}"
     ]
+    if details.get("script_edited"):
+        lines.append("Job script: edited by you before submitting")
     lines += [
         f"Exit code: {details.get('exit_code') or 'Unavailable'}",
         f"Elapsed run time: {details.get('elapsed') or 'Unavailable'}",
