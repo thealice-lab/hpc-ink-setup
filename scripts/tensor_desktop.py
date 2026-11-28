@@ -26,6 +26,7 @@ if not getattr(sys, "frozen", False):
 import tensor_desktop_jobs as jobs
 import tensor_desktop_notify as notify
 import tensor_desktop_preferences as preferences
+import tensor_desktop_script as job_script
 import tensor_desktop_setup as hpc_setup
 import tensor_desktop_status as status
 import tensor_desktop_updates as updates
@@ -186,6 +187,9 @@ class DesktopApp:
         self.finished = {"returned": [], "failed": []}
         self.history_window = None
         self.history_listing = None
+        self.script_window = None
+        # Learned when a save reaches an HPC copy without revise_script.
+        self.script_unsupported = False
         # Inkly on the HPC: what Test connection last found, and the offers
         # (set up, switch the launcher, first sign-in) shown once idle.
         self.hpc_state = None
@@ -539,6 +543,7 @@ class DesktopApp:
                 "rerun": "Preparing the selected files again (nothing is submitted)…",
                 "change_resources": "Preparing the selected files again with new CPUs "
                 "and memory (nothing is submitted)…",
+                "revise_script": "Saving the job script on the HPC (nothing is submitted)…",
                 "load_jobs": "Finding your recent jobs on the HPC…",
                 "restore_jobs": "Copying jobs that are not on this computer…",
                 "search_jobs": "Looking for your input files in the chosen folder…",
@@ -581,7 +586,10 @@ class DesktopApp:
                             (data["name"], notify.state_name(data["state"]))
                         )
                 if self.table.exists(data["path"]):
-                    r = data["resources"]
+                    r = {
+                        key: "—" if value is None else value
+                        for key, value in data["resources"].items()
+                    }
                     self.table.item(
                         data["path"],
                         values=(
@@ -592,7 +600,8 @@ class DesktopApp:
                             r["hours"],
                             data["stages"],
                             data["state"]
-                            + (" (input edited)" if data.get("input_changed") else ""),
+                            + (" (input edited)" if data.get("input_changed") else "")
+                            + (" (script edited)" if data.get("script_edited") else ""),
                             data["job_id"],
                         ),
                     )
@@ -602,6 +611,8 @@ class DesktopApp:
             elif kind == "review":
                 self.review = data
                 self.refresh_overview()
+            elif kind == "script_result":
+                self.script_result(data)
             elif kind == "recovery_required":
                 self.recovery_request = data
             elif kind == "target":
@@ -619,6 +630,7 @@ class DesktopApp:
                     self.log("HPC setup: " + data["line"])
             elif kind == "setup_result":
                 self.setup_done = data
+                self.script_unsupported = False
                 if self.settings["ink_path"] == data["launcher"]:
                     self.hpc_state = {
                         "state": "current",
@@ -629,6 +641,8 @@ class DesktopApp:
                     }
             elif kind == "request_error":
                 # Something asked for during the watch was not done; watching continues.
+                if self.script_window:
+                    self.script_window.finished()
                 self.log(data)
                 messagebox.showerror("Not done", data, parent=self.root)
             elif kind == "notice":
@@ -656,6 +670,8 @@ class DesktopApp:
                 else:
                     messagebox.showerror("Handoff stopped", data, parent=self.root)
             elif kind == "done":
+                if data == "revise_script" and self.script_window:
+                    self.script_window.finished()
                 if self.stop_deadline:
                     self.root.after_cancel(self.stop_deadline)
                     self.stop_deadline = None
@@ -1101,6 +1117,17 @@ class DesktopApp:
             f"limit ({self.settings['hours']} hour(s)). Nothing is submitted: review "
             "the preview, then choose Submit prepared jobs."
         )
+        edited = [row["name"] for _, row in rows if row.get("script_edited")]
+        if edited:
+            text += (
+                "\n\nEDITED JOB SCRIPT: "
+                + ", ".join(edited)
+                + (" was" if len(edited) == 1 else " were")
+                + " set up with a job script you edited. The new job gets a fresh "
+                "script generated from the input; your edits are not carried over. "
+                "The earlier script stays on the HPC with its old job. Open View "
+                "script on the new row to edit it again."
+            )
         if messagebox.askyesno(
             "Run again as new jobs", text, parent=self.root, default="no"
         ):
@@ -1662,12 +1689,16 @@ class DesktopApp:
             return
         review = self.review
         details = "\n".join(
-            f"{job['name']}: {job['cpus']} CPUs, {job['slurm_memory_mib']} MiB, {job['hours']} hour(s)"
-            for job in review["jobs"][:8]
+            f"{job['name']}: {status.job_resources(job)}" for job in review["jobs"][:8]
         )
         if review["count"] > 8:
             details += f"\n…and {review['count'] - 8} more files shown in the table."
         text = f"Submit {review['count']} independent calculations to the HPC?\n\n{details}\n\nIf all run together: {review['cpus']} CPUs and {review['memory_mib']:,} MiB Slurm memory.\nSlurm decides when jobs start. Closing the app does not cancel them."
+        if review.get("memory_unknown"):
+            text += (
+                f"\n{review['memory_unknown']} edited script(s) leave memory to "
+                "Slurm's default, which is not in that total."
+            )
         if review.get("recovered"):
             text += (
                 "\n\nRECOVERED HANDOFF WARNING: "
@@ -2097,7 +2128,8 @@ class DesktopApp:
                 iid=job["bundle"],
                 values=(
                     jobs.local_time(job.get("submitted_at") or job.get("prepared_at")),
-                    job["name"],
+                    job["name"]
+                    + (" (edited script)" if job.get("script_edited") else ""),
                     job.get("job_id") or "—",
                     status.state_name(job.get("state")),
                     job.get("exit_code") or "",
@@ -2218,13 +2250,46 @@ class DesktopApp:
                 parent=self.root,
             )
             return
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Generated SBATCH — " + row["name"])
-        dialog.geometry("900x650")
-        text = tk.Text(dialog, wrap="none", font=("Consolas", 10))
-        text.pack(fill="both", expand=True)
-        text.insert("1.0", row["script"])
-        text.configure(state="disabled")
+        window = self.script_window
+        if window and window.exists():
+            if window.path == selected[0]:
+                window.window.lift()
+                return
+            window.close()
+            if self.script_window:
+                return  # Kept open: its unsaved changes were not discarded.
+        self.script_window = job_script.ScriptWindow(self, selected[0], row)
+
+    def save_script(self, path, script, expected_sha256):
+        """Called by the script window; True when the save was started."""
+        if self.busy and not self.watching():
+            messagebox.showinfo(
+                "Please wait",
+                "Inkly Desktop is busy with another step. Save again when it finishes.",
+                parent=self.root,
+            )
+            return False
+        if not self.settings_ready():
+            return False  # Connection settings opened; nothing was sent.
+        arguments = (path, script, expected_sha256, dict(self.settings))
+        if self.watching():
+            self.controller.request("revise_script", *arguments)
+            self.log(
+                "Saving the job script on the open connection; watching continues."
+            )
+        else:
+            self.start("revise_script", *arguments)
+        return True
+
+    def script_result(self, data):
+        name = Path(data["path"]).name
+        if data["status"] == "unsupported":
+            self.script_unsupported = True
+        if data["status"] != "saved":
+            self.log(f"Job script for {name} was not saved: {data['message']}")
+        window = self.script_window
+        if window and window.exists() and window.path == data["path"]:
+            window.result(data)
 
     def open_results(self):
         selected = set(self.table.selection())

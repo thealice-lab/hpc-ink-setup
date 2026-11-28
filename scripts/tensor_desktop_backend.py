@@ -173,9 +173,11 @@ class DesktopController:
                 "elapsed": response.get("elapsed"),
                 "exit_code": response.get("exit_code"),
                 "observed_at": response.get("observed_at"),
-                "resources": deepcopy(response["resources"]),
+                "resources": self.requested(response),
                 "stages": response["stages"],
                 "script": response.get("script", ""),
+                "script_sha256": response.get("script_sha256"),
+                "generated_script": response.get("generated_script", ""),
                 "output": str(output) if output else "",
                 # The file was edited after this bundle was prepared.
                 "input_changed": bool(item.get("changed")),
@@ -183,6 +185,26 @@ class DesktopController:
                 "script_edited": bool(response.get("script_edited")),
             },
         )
+
+    @staticmethod
+    def requested(response):
+        """What the job asks Slurm for: an edited script's own values, if any.
+
+        None means the script leaves that value to Slurm's or the partition's
+        default. The receipt's own resources stay as Inkly prepared them.
+        """
+        resources = deepcopy(response["resources"])
+        edited = response.get("script_resources")
+        if response.get("script_edited") is True and isinstance(edited, dict):
+            resources.update(
+                # Slurm gives one CPU per task when --cpus-per-task is absent.
+                cpus=edited.get("cpus") or 1,
+                slurm_memory_mib=edited.get("slurm_memory_mib"),
+                hours=edited.get("hours"),
+                gaussian_memory_mb=None,  # Set by the script itself.
+                script_edited=True,
+            )
+        return resources
 
     @staticmethod
     def job_metadata(response):
@@ -203,6 +225,7 @@ class DesktopController:
         "cancel": "Cancel job",
         "job_details": "Job details",
         "jobs": "Load my jobs and Job history",
+        "revise_script": "Edit job scripts",
     }
 
     def hpc_install(self, state, settings=None, version=None, offer=False):
@@ -522,17 +545,18 @@ class DesktopController:
 
     def review(self):
         ready = [item for item in self.items if self.ready(item)]
+        jobs = [
+            {"name": item["path"].name, **self.requested(item["response"])}
+            for item in ready
+        ]
         return {
             "id": self.review_id,
             "count": len(ready),
-            "cpus": sum(item["response"]["resources"]["cpus"] for item in ready),
-            "memory_mib": sum(
-                item["response"]["resources"]["slurm_memory_mib"] for item in ready
-            ),
-            "jobs": [
-                {"name": item["path"].name, **item["response"]["resources"]}
-                for item in ready
-            ],
+            "cpus": sum(job["cpus"] for job in jobs),
+            "memory_mib": sum(job["slurm_memory_mib"] or 0 for job in jobs),
+            # Edited scripts that leave memory to Slurm are not in the total.
+            "memory_unknown": sum(job["slurm_memory_mib"] is None for job in jobs),
+            "jobs": jobs,
             "recovered": [item["path"].name for item in ready if item.get("recovered")],
         }
 
@@ -604,7 +628,12 @@ class DesktopController:
                 self.row(item, state="SUBMITTED")
                 self.emit(
                     "message",
-                    f"Submitted {item['path'].name}: job {response['job_id']}",
+                    f"Submitted {item['path'].name}: job {response['job_id']}"
+                    + (
+                        " (with your edited job script)"
+                        if item["response"].get("script_edited") is True
+                        else ""
+                    ),
                 )
         if watch:
             self.monitor()
@@ -616,6 +645,7 @@ class DesktopController:
         "submit",
         "rerun",
         "change_resources",
+        "revise_script",
         "load_jobs",
         "restore_jobs",
         "history",
@@ -664,6 +694,8 @@ class DesktopController:
             try:
                 if action in {"cancel_jobs", "job_details"}:
                     targets = [self.target_for(args[0], args[1], "resume")]
+                elif action == "revise_script":
+                    targets = [self.target_for([args[0]], args[3], "resume")]
                 elif action in {"rerun", "change_resources"}:
                     targets = [
                         self.target_for(args[0], args[2], "resume"),
@@ -703,6 +735,7 @@ class DesktopController:
                 "submit",
                 "rerun",
                 "change_resources",
+                "revise_script",
             }
 
     def monitor(self):
@@ -1256,6 +1289,105 @@ class DesktopController:
         # Re-read the whole list so the rows and the approval cover every file.
         self.preview(paths, settings)
 
+    def revise_script(self, path, script, expected_sha256, settings):
+        """Save the researcher's own job script for one prepared file.
+
+        Never submits. A refusal from the HPC (for example Slurm would not
+        accept the script) goes back to the script window and keeps the
+        connection and the current preview; a lost connection still stops.
+        """
+        self.check_stop()
+        settings, items, _ = self.selected_items(
+            [path], settings, "Select the row whose job script you changed first."
+        )
+        item = items[0]
+        name = item["path"].name
+        state = picker.state_name(
+            item["response"].get("state", item["response"]["submission"])
+        )
+        if state != "PREPARED" or item.get("changed"):
+            self.emit(
+                "script_result",
+                {
+                    "path": path,
+                    "status": "refused",
+                    "message": f"{name} is {state}"
+                    + (" and its input was edited" if item.get("changed") else "")
+                    + ", so its job script was not changed. Only a prepared job "
+                    "that has not been submitted can have its script changed.",
+                },
+            )
+            return
+        if not self.endpoint_supports("revise_script", item["receipt"]):
+            self.emit(
+                "script_result",
+                {
+                    "path": path,
+                    "status": "unsupported",
+                    "message": "The Inkly copy on the HPC is too old to save job "
+                    "script changes. Update Inkly on the HPC from Connection "
+                    "settings, then try again. Nothing was changed.",
+                },
+            )
+            return
+        try:
+            response = self.session.exchange(
+                {
+                    "action": "revise_script",
+                    "script": script,
+                    "expected_sha256": expected_sha256,
+                },
+                receipt=item["receipt"],
+            )
+        except bridge.MissingBundleError:
+            raise
+        except bridge.RemoteRefusal as error:
+            self.audit("desktop_script", {"status": "refused"})
+            self.emit(
+                "script_result",
+                {"path": path, "status": "refused", "message": str(error)},
+            )
+            return
+        warnings = [w for w in response.pop("warnings", ()) if isinstance(w, str)]
+        if response.get("name") != name:
+            raise ValueError("The HPC returned a different input filename")
+        item["response"] = response
+        self.sync_items([item])
+        self.row(item)
+        edited = response.get("script_edited") is True
+        self.audit(
+            "desktop_script",
+            {"status": "saved" if edited else "reset", "warnings": len(warnings)},
+        )
+        if self.review_id:
+            self.emit("review", self.review())
+        self.emit(
+            "script_result",
+            {
+                "path": path,
+                "status": "saved",
+                "edited": edited,
+                "script": response.get("script", ""),
+                "script_sha256": response.get("script_sha256"),
+                "generated_script": response.get("generated_script", ""),
+                "warnings": warnings,
+            },
+        )
+        self.emit(
+            "message",
+            (
+                f"Saved your job script for {name} on the HPC"
+                + (
+                    f" ({len(warnings)} warning(s); see View script)"
+                    if warnings
+                    else ""
+                )
+                if edited
+                else f"Restored the generated job script for {name}"
+            )
+            + ". Nothing was submitted.",
+        )
+
     def execute(self, action, *args):
         try:
             if action == "test_connection":
@@ -1278,6 +1410,8 @@ class DesktopController:
                 self.rerun(*args)
             elif action == "change_resources":
                 self.change_resources(*args)
+            elif action == "revise_script":
+                self.revise_script(*args)
             elif action in {"load_jobs", "restore_jobs", "history", "search_jobs"}:
                 getattr(self, action)(*args)
             elif action == "close":
