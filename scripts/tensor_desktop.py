@@ -544,6 +544,8 @@ class DesktopApp:
                 "change_resources": "Preparing the selected files again with new CPUs "
                 "and memory (nothing is submitted)…",
                 "revise_script": "Saving the job script on the HPC (nothing is submitted)…",
+                "check_submissions": "Checking unconfirmed submissions on the HPC "
+                "(nothing is submitted)…",
                 "load_jobs": "Finding your recent jobs on the HPC…",
                 "restore_jobs": "Copying jobs that are not on this computer…",
                 "search_jobs": "Looking for your input files in the chosen folder…",
@@ -990,7 +992,9 @@ class DesktopApp:
             state="normal" if self.cancellable() and ready else "disabled"
         )
         self.rerun_button.configure(
-            state="normal" if self.rerunnable() and ready else "disabled"
+            state="normal"
+            if (self.rerunnable() or self.checkable()) and ready
+            else "disabled"
         )
         self.resources_button.configure(
             state="normal" if self.changeable() and ready else "disabled"
@@ -1036,6 +1040,14 @@ class DesktopApp:
                 status.state_name(row.get("state")) != "PREPARED"
                 or row.get("input_changed")
             )
+            for _, row in rows
+        )
+
+    def checkable(self):
+        """Rows whose submission Desktop could not confirm; Run again checks them."""
+        rows = self.selected_rows()
+        return bool(rows) and all(
+            row and status.state_name(row.get("state")) == "SUBMISSION_UNKNOWN"
             for _, row in rows
         )
 
@@ -1100,6 +1112,9 @@ class DesktopApp:
     def run_again(self):
         if self.busy and not self.watching():
             return
+        if self.checkable():
+            self.check_unconfirmed()
+            return
         if not self.rerunnable() or not self.settings_ready():
             return
         rows = self.selected_rows()
@@ -1143,6 +1158,40 @@ class DesktopApp:
                 self.buttons()
             else:
                 self.start("rerun", *arguments)
+
+    def check_unconfirmed(self):
+        """Run again on unconfirmed rows: find their jobs, or prepare them again."""
+        if not self.settings_ready():
+            return
+        rows = self.selected_rows()
+        text = (
+            f"Check {len(rows)} unconfirmed submission(s)?\n\n"
+            + self.listing([row["name"] for _, row in rows])
+            + "\n\nDesktop could not confirm whether these were submitted. It will "
+            "look for each job in the HPC's queue, in Slurm's accounting and in its "
+            "job folder:\n\n"
+            "  •  Found: Desktop records the job and shows its status as usual.\n"
+            "  •  Not found: the file is prepared again, so you can review it and "
+            "submit it. If a job did start without leaving any of those traces, "
+            "submitting again would run a second one.\n\n"
+            "Nothing is submitted by this step."
+        )
+        if not messagebox.askyesno(
+            "Check unconfirmed submissions", text, parent=self.root, default="no"
+        ):
+            return
+        self.review = None
+        arguments = (
+            [path for path, _ in rows],
+            [str(path) for path in self.files],
+            dict(self.settings),
+        )
+        if self.watching():
+            self.controller.request("check_submissions", *arguments)
+            self.log("Checking unconfirmed submissions; watching continues.")
+            self.buttons()
+        else:
+            self.start("check_submissions", *arguments)
 
     def change_resources(self):
         if self.busy and not self.watching():

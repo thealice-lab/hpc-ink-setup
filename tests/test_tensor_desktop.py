@@ -4392,3 +4392,60 @@ def test_check_submissions_refuses_other_rows_and_old_hpc_copies(workflow):
     with pytest.raises(ValueError, match="too old to check unconfirmed"):
         c.check_submissions([first], [first], SETTINGS)
     assert "check_submission" not in actions(workflow)
+
+
+def test_unconfirmed_wording_points_to_run_again():
+    import tensor_desktop_status as wording
+
+    rows = [{"path": "a", "name": "a.gjf", "state": "SUBMISSION_UNKNOWN"}]
+    text = wording.overview_text(None, rows)
+    assert "check your Slurm jobs before submitting again" in text
+    assert "choose Run again: Desktop looks for their jobs" in text
+    rows = [{"path": "a", "name": "a.gjf", "state": "UNKNOWN", "job_id": "5"}]
+    assert "Run again" not in wording.overview_text(None, rows)
+
+
+@native_display
+def test_native_run_again_on_unconfirmed_rows_checks_after_a_warning(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first, second = workflow, *(str(path) for path in workflow.paths)
+    questions, scheduled = [], []
+
+    def answer(value):
+        def ask(title, text, **kwargs):
+            questions.append((title, text, kwargs.get("default")))
+            return value
+
+        return ask
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.events.put(("row", {**app.rows[first], "state": "SUBMISSION_UNKNOWN"}))
+        app.drain()
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+        app.table.selection_set(first)
+        app.buttons()
+        assert str(app.rerun_button["state"]) == "normal"
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.rerun_button.invoke()
+        title, text, default = questions[-1]
+        assert title == "Check unconfirmed submissions" and default == "no"
+        assert "sample_1.gjf" in text and "would run a second one" in text
+        assert "Nothing is submitted by this step." in text
+        assert scheduled == []
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(True))
+        app.rerun_button.invoke()
+        assert scheduled == [("check_submissions", [first], [first, second], SETTINGS)]
+        # A mix of unconfirmed and prepared rows is neither check nor Run again.
+        app.table.selection_set(first, second)
+        app.buttons()
+        assert str(app.rerun_button["state"]) == "disabled"
+    finally:
+        app.busy, app.action = False, None
+        app.close()
