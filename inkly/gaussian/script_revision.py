@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 import os
-import pwd
 import re
 import shlex
 import subprocess
@@ -338,6 +337,8 @@ def _accounting(scheduler, directory, options):
     account, qos = options.get("account"), options.get("qos")
     if not account and not qos:
         return []
+    import pwd  # POSIX only; this runs on the HPC, never on Windows.
+
     user = pwd.getpwuid(os.getuid()).pw_name
     try:
         result = scheduler(

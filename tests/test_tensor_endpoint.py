@@ -945,3 +945,15 @@ def test_edited_jobs_are_marked_in_history_and_details(prepared, monkeypatch):
 def test_version_offers_revise_script(tmp_path):
     result = tensor.handle({"action": "version", "bundle": "d" * 32}, tmp_path)
     assert "revise_script" in result["capabilities"]
+
+
+def test_script_checks_import_without_posix_only_modules(monkeypatch):
+    """Desktop on Windows imports the endpoint package; pwd does not exist there."""
+    import importlib
+    import sys
+
+    from inkly.gaussian import script_revision
+
+    monkeypatch.setitem(sys.modules, "pwd", None)
+    importlib.reload(script_revision)
+    assert script_revision.MAX_SCRIPT == 64 * 1024
