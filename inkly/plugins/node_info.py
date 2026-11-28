@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-import shutil
-import subprocess
+import re
 
+from inkly import slurm_readonly
+from inkly.plugins._slurm_text import (
+    clean,
+    is_unset,
+    partition_label,
+    source_lines,
+    split_fields,
+    time_limit_words,
+)
 from inkly.plugins.common import format_plugin_output, validate_plugin_meta
 
 
@@ -11,7 +19,8 @@ from inkly.plugins.common import format_plugin_output, validate_plugin_meta
 PLUGIN_META = {
     "name": "node_info",
     "description": (
-        "Lists cluster partitions and node resources such as CPUs, memory, and GPU availability "
+        "Lists cluster partitions with node resources (CPUs, memory, GPUs) and "
+        "partition limits (maximum and default time limit, nodes per job) "
         "using sinfo."
     ),
     "category": "node-info",
@@ -20,101 +29,94 @@ PLUGIN_META = {
         "Which nodes have GPUs?",
         "What resources does this cluster have?",
         "How much memory do nodes provide?",
+        "What is the maximum time limit for a job?",
+        "What is the default walltime on each partition?",
     ],
 }
 
 # Validate metadata at import time so invalid plugins fail early.
 validate_plugin_meta(PLUGIN_META)
 
-
-def _command_exists(cmd: str) -> bool:
-    """
-    Check whether a command is available on PATH.
-
-    This is used before calling cluster tools so the plugin can return
-    a clean fallback message instead of failing with a subprocess error.
-    """
-    return shutil.which(cmd) is not None
+ROW_LIMIT = 8
+UNAVAILABLE_LIMITS = (
+    "Not available from sinfo: per-partition memory defaults and QOS limits; "
+    "check the cluster's documentation or ask HPC support."
+)
+_JOB_SIZE = re.compile(r"^(\d+)-(\d+|infinite)$")
 
 
-def _run_capture(cmd: list[str]) -> str | None:
-    """
-    Run a command and return stripped stdout.
-
-    Returns:
-        Command output if successful, otherwise None.
-
-    This keeps subprocess error handling contained in one place so the
-    rest of the plugin logic stays simple.
-    """
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=True,
-        )
-        return result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
+def _gres_words(gres: str) -> str:
+    if is_unset(gres):
+        return "no GPUs"
+    return f"GPUs/GRES {gres}"
 
 
-def _get_node_info_lines(limit: int = 8) -> list[str]:
-    """
-    Collect and format node / partition information from sinfo.
+def _limit_words(time_limit: str, default_time: str, job_size: str) -> str:
+    limit = time_limit_words(time_limit)
+    parts = ["no time limit" if limit == "no limit" else f"time limit {limit}"]
+    if not is_unset(default_time):
+        parts[0] += f" (default {time_limit_words(default_time)})"
 
-    The output is limited so plugin context stays readable and does not
-    overwhelm the runtime prompt.
+    match = _JOB_SIZE.match(clean(job_size))
+    if match and match[2] != "infinite":
+        low, high = match[1], match[2]
+        span = low if low == high else f"{low}-{high}"
+        parts.append(f"jobs may use {span} node{'s' if span != '1' else ''}")
+    return "; ".join(parts)
 
-    Returns:
-        A list of formatted lines describing partitions and resources.
-        If data cannot be collected or parsed, a fallback message is returned.
-    """
-    # sinfo is required for live node and partition information.
-    if not _command_exists("sinfo"):
-        return ["Node information unavailable: sinfo not found."]
 
-    # %P = partition, %D = nodes, %c = CPUs, %m = memory, %G = GRES / GPU info
-    output = _run_capture(["sinfo", "-h", "-o", "%P|%D|%c|%m|%G"])
-    if not output:
+def _get_node_info_lines(result: slurm_readonly.SlurmResult) -> list[str]:
+    """Format sinfo's partition resources and limits."""
+    if not result.ok:
+        reason = slurm_readonly.unavailable_reason(result)
+        return [f"Node information unavailable: {reason}."]
+    if not result.output.strip():
         return ["Node information unavailable: sinfo returned no data."]
 
     lines: list[str] = []
-
-    # Only keep the first few rows so output stays short.
-    for row in output.splitlines()[:limit]:
-        parts = row.split("|")
-        if len(parts) != 5:
+    for row in result.output.splitlines():
+        if not row.strip():
             continue
-
-        partition, nodes, cpus, memory, gres = (part.strip() for part in parts)
-
-        # Clean up GRES / GPU info for partitions without GPUs.
-        if not gres or gres == "(null)":
-            gres = "This partition has no GPUs."
-
+        fields = split_fields(row, 9)
+        if fields is None:
+            continue
+        (
+            partition,
+            availability,
+            nodes,
+            cpus,
+            memory,
+            gres,
+            time_limit,
+            default_time,
+            job_size,
+        ) = fields
         lines.append(
-            f"- {partition}: {nodes} nodes, {cpus} CPUs/node, {memory} MB/node, GPUs: {gres}"
+            f"- {partition_label(partition, availability)}: "
+            f"{nodes} node{'' if nodes == '1' else 's'}, "
+            f"{cpus} CPUs/node, {memory} MB/node, {_gres_words(gres)}; "
+            f"{_limit_words(time_limit, default_time, job_size)}"
         )
 
-    # If nothing valid could be parsed, return a fallback message.
     if not lines:
         return ["Node information unavailable: could not parse sinfo output."]
-
-    return lines
+    if len(lines) > ROW_LIMIT:
+        hidden = len(lines) - ROW_LIMIT
+        lines = lines[:ROW_LIMIT] + [f"- and {hidden} more partition rows"]
+    return [*lines, UNAVAILABLE_LIMITS]
 
 
 def run() -> str:
     """
     Entry point for the node-info plugin.
 
-    This gathers current partition and node resource information, formats it,
-    and returns it as a clean plugin output block.
+    Collects partition resources and limits through the read-only Slurm
+    allowlist and formats them into a plugin output block.
     """
-    body_lines: list[str] = []
+    result = slurm_readonly.run("partition_resources")
 
-    body_lines.append("Partitions and resources:")
-    body_lines.extend(_get_node_info_lines())
+    body_lines = ["Partitions and resources:"]
+    body_lines.extend(_get_node_info_lines(result))
+    body_lines.extend(source_lines(result))
 
     return format_plugin_output("Node / Partition Information", body_lines)

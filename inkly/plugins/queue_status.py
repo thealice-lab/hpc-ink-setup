@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import shutil
-import subprocess
+from collections import Counter
 
+from inkly import slurm_readonly
+from inkly.plugins._slurm_text import partition_label, source_lines, split_fields
 from inkly.plugins.common import format_plugin_output, validate_plugin_meta
 
 
@@ -11,8 +12,10 @@ from inkly.plugins.common import format_plugin_output, validate_plugin_meta
 PLUGIN_META = {
     "name": "queue_status",
     "description": (
-        "Summarizes the current Slurm queue using squeue and sinfo, including "
-        "running jobs, pending jobs, and partition load."
+        "Summarizes the current Slurm queue and cluster load using squeue and "
+        "sinfo: running and pending job counts, and per partition the nodes "
+        "and CPUs in use, idle and unavailable. Counts only, never other "
+        "users' jobs."
     ),
     "category": "queue-status",
     "example_queries": [
@@ -20,102 +23,80 @@ PLUGIN_META = {
         "Are there many pending jobs?",
         "What does the current queue look like?",
         "Is the gpu partition busy?",
+        "How many idle nodes are there?",
+        "How many CPUs are free right now?",
     ],
 }
 
 # Validate metadata at import time so invalid plugins fail early.
 validate_plugin_meta(PLUGIN_META)
 
-
-def _command_exists(cmd: str) -> bool:
-    """
-    Check whether a command is available on PATH.
-
-    This is used before calling Slurm tools so the plugin can return
-    a clean fallback message instead of failing with a subprocess error.
-    """
-    return shutil.which(cmd) is not None
+PARTITION_LIMIT = 8
 
 
-def _run_capture(cmd: list[str]) -> str | None:
-    """
-    Run a command and return stripped stdout.
+def _job_count_lines(result: slurm_readonly.SlurmResult) -> list[str]:
+    """Running and pending counts from one squeue call (states only)."""
+    if not result.ok:
+        reason = slurm_readonly.unavailable_reason(result)
+        return [f"Queue counts unavailable: {reason}."]
 
-    Returns:
-        Command output if successful, otherwise None.
+    states = Counter(line.strip() for line in result.output.splitlines())
+    states.pop("", None)
+    running, pending = states["RUNNING"], states["PENDING"]
+    other = sum(states.values()) - running - pending
 
-    This keeps subprocess error handling in one place so the rest of the
-    plugin logic stays simple.
-    """
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=True,
-        )
-        return result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    lines = [f"Running jobs: {running}", f"Pending jobs: {pending}"]
+    if other:
+        lines.append(f"Jobs in other states (completing, suspended and so on): {other}")
+    if result.truncated:
+        lines.append("The queue is very long, so these counts are a lower bound.")
+    lines.append(
+        "These counts cover the jobs your account can see; on clusters that hide "
+        "other users' jobs they cover only yours."
+    )
+    return lines
+
+
+def _count_pair(text: str) -> tuple[int, int, int, int] | None:
+    """Parse sinfo's allocated/idle/other/total value."""
+    parts = text.split("/")
+    if len(parts) != 4 or not all(part.isdigit() for part in parts):
         return None
+    allocated, idle, other, total = (int(part) for part in parts)
+    return allocated, idle, other, total
 
 
-def _count_jobs_by_state(state: str) -> int | None:
-    """
-    Count jobs in a given Slurm state using squeue.
-
-    Args:
-        state: Slurm job state to query, such as RUNNING or PENDING.
-
-    Returns:
-        Number of jobs in that state, or None if squeue is unavailable or fails.
-    """
-    # squeue is required for live queue counts.
-    if not _command_exists("squeue"):
-        return None
-
-    output = _run_capture(["squeue", "-h", "-t", state])
-    if output is None:
-        return None
-
-    # Count non-empty output lines, where each line represents one job.
-    lines = [line for line in output.splitlines() if line.strip()]
-    return len(lines)
-
-
-def _get_partition_lines(limit: int = 5) -> list[str]:
-    """
-    Collect and format partition summary lines from sinfo.
-
-    The output is limited so plugin context stays readable and does not
-    overwhelm the runtime prompt.
-
-    Returns:
-        A list of formatted partition summary lines.
-        If data cannot be collected or parsed, a fallback message is returned.
-    """
-    # sinfo is required for live partition information.
-    if not _command_exists("sinfo"):
-        return ["Partition summary unavailable: sinfo not found."]
-
-    # %P = partition, %D = node count, %C = CPU allocation summary
-    output = _run_capture(["sinfo", "-h", "-o", "%P|%D|%C"])
-    if not output:
+def _partition_lines(result: slurm_readonly.SlurmResult) -> list[str]:
+    """Per-partition node and CPU load from one sinfo call."""
+    if not result.ok:
+        reason = slurm_readonly.unavailable_reason(result)
+        return [f"Partition summary unavailable: {reason}."]
+    if not result.output.strip():
         return ["Partition summary unavailable: sinfo returned no data."]
 
     lines: list[str] = []
-    for row in output.splitlines()[:limit]:
-        parts = row.split("|")
-        if len(parts) != 3:
+    rows = [row for row in result.output.splitlines() if row.strip()]
+    for row in rows:
+        fields = split_fields(row, 4)
+        if fields is None:
             continue
+        partition, availability, node_text, cpu_text = fields
+        nodes, cpus = _count_pair(node_text), _count_pair(cpu_text)
+        if nodes is None or cpus is None:
+            continue
+        lines.append(
+            f"- {partition_label(partition, availability)}: "
+            f"nodes {nodes[0]} in use, {nodes[1]} idle, {nodes[2]} unavailable, "
+            f"{nodes[3]} total; "
+            f"CPUs {cpus[0]} in use, {cpus[1]} idle, {cpus[2]} unavailable, "
+            f"{cpus[3]} total"
+        )
 
-        partition, nodes, cpu_summary = (part.strip() for part in parts)
-        lines.append(f"- {partition}: {nodes} nodes, CPU summary {cpu_summary}")
-
-    # If nothing valid could be parsed, return a fallback message.
     if not lines:
         return ["Partition summary unavailable: could not parse sinfo output."]
-
+    if len(lines) > PARTITION_LIMIT:
+        hidden = len(lines) - PARTITION_LIMIT
+        lines = lines[:PARTITION_LIMIT] + [f"- and {hidden} more partitions"]
     return lines
 
 
@@ -123,22 +104,15 @@ def run() -> str:
     """
     Entry point for the queue-status plugin.
 
-    This gathers current queue counts and partition summary information,
-    then formats everything into a clean plugin output block.
+    Collects queue counts and per-partition load through the read-only
+    Slurm allowlist and formats them into a plugin output block.
     """
-    body_lines: list[str] = []
+    queue = slurm_readonly.run("queue_states")
+    partitions = slurm_readonly.run("partition_load")
 
-    running_jobs = _count_jobs_by_state("RUNNING")
-    pending_jobs = _count_jobs_by_state("PENDING")
-
-    # If queue counts cannot be collected, return a clean fallback line.
-    if running_jobs is None or pending_jobs is None:
-        body_lines.append("Queue counts unavailable: squeue not found or failed.")
-    else:
-        body_lines.append(f"Running jobs: {running_jobs}")
-        body_lines.append(f"Pending jobs: {pending_jobs}")
-
+    body_lines = _job_count_lines(queue)
     body_lines.append("Partitions:")
-    body_lines.extend(_get_partition_lines())
+    body_lines.extend(_partition_lines(partitions))
+    body_lines.extend(source_lines(queue, partitions))
 
     return format_plugin_output("Queue Status", body_lines)

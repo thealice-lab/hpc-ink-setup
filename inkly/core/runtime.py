@@ -7,6 +7,7 @@ import textwrap
 from inkly.core.conversation import ConversationManager
 from inkly.core.diagnostics import DiagnosticSession
 from inkly.llm.backend import LLMBackend
+from inkly.plugins.common import SOURCE_COMMAND_PREFIX
 from inkly.plugins.manager import PluginManager
 from inkly.plugins.docs_gaussian import external_source_references
 from inkly.retrieval.retriever import PluginRetriever
@@ -106,6 +107,46 @@ class InklyRuntime:
         "cuttlefish",
     )
 
+    # Answers that used live Slurm data end with the commands that produced it,
+    # added here rather than by the model so the list is always exact.
+    SOURCE_NOTE_HEADER = "From these read-only Slurm commands:"
+    HISTORY_HEADER = "=== CONVERSATION HISTORY ==="
+
+    @staticmethod
+    def _split_source_commands(
+        plugin_outputs: dict[str, str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Separate plugins' "Slurm command:" lines from the prompt context."""
+        cleaned: dict[str, str] = {}
+        commands: list[str] = []
+        for name, output in plugin_outputs.items():
+            kept = []
+            for line in (output or "").splitlines():
+                if line.startswith(SOURCE_COMMAND_PREFIX):
+                    command = line[len(SOURCE_COMMAND_PREFIX) :].strip()
+                    if command and command not in commands:
+                        commands.append(command)
+                else:
+                    kept.append(line)
+            cleaned[name] = "\n".join(kept)
+        return cleaned, commands
+
+    @classmethod
+    def _with_source_note(cls, response: str, commands: list[str]) -> str:
+        if not commands or not response.strip():
+            return response
+        lines = [cls.SOURCE_NOTE_HEADER, *(f"  {command}" for command in commands)]
+        return f"{response.rstrip()}\n\n" + "\n".join(lines)
+
+    @classmethod
+    def split_source_note(cls, response: str) -> tuple[str, str]:
+        """Return (answer, source note); the note is empty when there is none."""
+        marker = f"\n\n{cls.SOURCE_NOTE_HEADER}\n"
+        answer, found, commands = response.rpartition(marker)
+        if not found:
+            return response, ""
+        return answer, f"{cls.SOURCE_NOTE_HEADER}\n{commands}"
+
     def _build_contract_section(self) -> str:
         """
         Build the base instruction section that defines the assistant's behavior.
@@ -129,10 +170,26 @@ class InklyRuntime:
 
         return "\n".join(
             [
-                "=== CONVERSATION HISTORY ===",
+                self.HISTORY_HEADER,
                 *history_lines,
             ]
         )
+
+    def _fit_history_section(self, history_lines: list[str], budget: int) -> str:
+        """Build the history section within budget, dropping the oldest lines."""
+        header = self.HISTORY_HEADER
+        if not history_lines or budget < len(header) + 2:
+            return ""
+
+        kept = list(history_lines)
+        while kept and len(header) + sum(len(line) + 1 for line in kept) > budget:
+            kept.pop(0)
+        if kept:
+            return "\n".join([header, *kept])
+
+        # Even the newest line is too long: keep as much of it as fits.
+        room = budget - len(header) - 1
+        return f"{header}\n{history_lines[-1][:room]}".rstrip()
 
     def _build_plugin_section(self, plugin_outputs: dict[str, str]) -> str:
         """
@@ -283,7 +340,9 @@ class InklyRuntime:
         2. conversation history
         3. plugin context
         4. current user query
-        Truncates the prompt if it exceeds the configured max length.
+        Truncates the prompt if it exceeds the configured max length. Plugin
+        context (often live cluster data) keeps priority over history, and
+        history loses its oldest lines first.
         """
         contract_section = self._build_contract_section()
         query_section = self._build_query_section(query)
@@ -302,21 +361,20 @@ class InklyRuntime:
                 return contract_section[:contract_budget].rstrip("\n") + query_suffix
             return (query_section.strip() + "\n")[-max_length:]
 
-        optional_sections = [
-            self._build_history_section(history_lines),
-            self._build_plugin_section(plugin_outputs),
-        ]
-        optional_content = "\n\n".join(
-            section for section in optional_sections if section.strip()
-        )
-        if not optional_content:
-            return required_prompt
-
         optional_budget = max_length - len(required_prompt) - 2
         if optional_budget <= 0:
             return required_prompt
 
-        optional_content = optional_content[:optional_budget].rstrip()
+        plugin_section = self._build_plugin_section(plugin_outputs)
+        plugin_section = plugin_section[:optional_budget].rstrip()
+        history_budget = optional_budget - len(plugin_section)
+        if plugin_section:
+            history_budget -= 2
+        history_section = self._fit_history_section(history_lines, history_budget)
+
+        optional_content = "\n\n".join(
+            section for section in (history_section, plugin_section) if section.strip()
+        )
         if not optional_content:
             return required_prompt
 
@@ -426,6 +484,12 @@ class InklyRuntime:
                     )
                     plugin_outputs[plugin_name] = f"Plugin error: {exc}"
 
+            # Commands named by live Slurm plugins are listed after the answer,
+            # not shown to the model.
+            plugin_outputs, source_commands = self._split_source_commands(
+                plugin_outputs
+            )
+
             # When the Gaussian documentation plugin explicitly says that local
             # instructions are unavailable, do not ask a generative model to fill in
             # the missing cluster facts. Return the bounded deterministic answer.
@@ -469,6 +533,7 @@ class InklyRuntime:
                 )
                 raise
 
-            # Add the assistant's response to the conversation
+            # History keeps the model's answer; the command list is a footer
+            # for the reader, so the model never sees it and never copies it.
             self.conversation.append_turn(user_id, "assistant", response)
-            return response
+            return self._with_source_note(response, source_commands)

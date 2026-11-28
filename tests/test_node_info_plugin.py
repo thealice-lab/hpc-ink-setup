@@ -1,54 +1,61 @@
 from __future__ import annotations
 
 from inkly.plugins import node_info
+from tests.slurm_fakes import FAILED, install_fake_slurm
 
 
-def test_run_reports_partition_resources(monkeypatch):
-    def fake_command_exists(cmd: str) -> bool:
-        return cmd == "sinfo"
+RESOURCES = (
+    "general*|up|10|32|128000|(null)|7-00:00:00|1-00:00:00|1-4\n"
+    "gpu|up|4|64|256000|gpu:4|2-00:00:00|n/a|1-infinite\n"
+    "scavenge|down|1|16|64000|(null)|infinite|n/a|1-1\n"
+)
 
-    def fake_run_capture(cmd: list[str]) -> str | None:
-        if cmd == ["sinfo", "-h", "-o", "%P|%D|%c|%m|%G"]:
-            return "general|10|32|128000|(null)\ngpu|4|64|256000|gpu:4"
-        return None
 
-    monkeypatch.setattr(node_info, "_command_exists", fake_command_exists)
-    monkeypatch.setattr(node_info, "_run_capture", fake_run_capture)
+def test_run_reports_partition_resources_and_limits(monkeypatch):
+    install_fake_slurm(monkeypatch, {"partition_resources": RESOURCES})
 
     output = node_info.run()
 
-    assert "Node / Partition Information" in output
+    assert output.startswith("Node / Partition Information")
     assert "Partitions and resources:" in output
     assert (
-        "- general: 10 nodes, 32 CPUs/node, 128000 MB/node, GPUs: This partition has no GPUs."
-        in output
-    )
-    assert "- gpu: 4 nodes, 64 CPUs/node, 256000 MB/node, GPUs: gpu:4" in output
+        "- general (default, up): 10 nodes, 32 CPUs/node, 128000 MB/node, "
+        "no GPUs; time limit 7 d (default 1 d); jobs may use 1-4 nodes"
+    ) in output
+    assert (
+        "- gpu (up): 4 nodes, 64 CPUs/node, 256000 MB/node, GPUs/GRES gpu:4; "
+        "time limit 2 d"
+    ) in output
+    assert "gpu:4; time limit 2 d\n" in output
+    assert "- scavenge (down): 1 node, 16 CPUs/node" in output
+    assert "no time limit; jobs may use 1 node" in output
+    assert "per-partition memory defaults and QOS limits" in output
+    assert "Slurm command: sinfo --format '%P|%a|%D|%c|%m|%G|%l|%L|%s'" in output
 
 
 def test_run_handles_missing_sinfo(monkeypatch):
-    monkeypatch.setattr(node_info, "_command_exists", lambda cmd: False)
+    install_fake_slurm(monkeypatch, {}, missing={"sinfo"})
 
     output = node_info.run()
 
-    assert "Node / Partition Information" in output
     assert "Partitions and resources:" in output
-    assert "Node information unavailable: sinfo not found." in output
+    assert "Node information unavailable: `sinfo` is not installed here" in output
+    assert "Slurm command:" not in output
+
+
+def test_run_handles_sinfo_failure(monkeypatch):
+    install_fake_slurm(monkeypatch, {"partition_resources": FAILED})
+
+    output = node_info.run()
+
+    assert "Node information unavailable: `sinfo` failed" in output
 
 
 def test_run_handles_unparseable_sinfo_output(monkeypatch):
-    def fake_command_exists(cmd: str) -> bool:
-        return cmd == "sinfo"
-
-    def fake_run_capture(cmd: list[str]) -> str | None:
-        if cmd == ["sinfo", "-h", "-o", "%P|%D|%c|%m|%G"]:
-            return "bad output with no separators"
-        return None
-
-    monkeypatch.setattr(node_info, "_command_exists", fake_command_exists)
-    monkeypatch.setattr(node_info, "_run_capture", fake_run_capture)
+    install_fake_slurm(
+        monkeypatch, {"partition_resources": "general|10|32|128000|(null)\n"}
+    )
 
     output = node_info.run()
 
-    assert "Node / Partition Information" in output
     assert "Node information unavailable: could not parse sinfo output." in output

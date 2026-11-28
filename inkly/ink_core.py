@@ -101,8 +101,15 @@ def main() -> int:
         # Deterministic runtime responses do not, so render those explicitly.
         if not sys.stdout.isatty() or not _response_was_streamed(runtime, response):
             print(response)
-        elif response and not response.endswith("\n"):
-            print()
+        else:
+            # The model's answer is already on screen; the list of Slurm
+            # commands behind it is added by the runtime and printed here.
+            answer, source_note = runtime.split_source_note(response)
+            if answer and not answer.endswith("\n"):
+                print()
+            if source_note:
+                print()
+                print(source_note)
 
         return 0
     except Exception as exc:
