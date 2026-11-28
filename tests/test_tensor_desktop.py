@@ -279,7 +279,16 @@ def record_for(workflow, path):
 def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
     c = workflow.controller
     before = {path: path.read_bytes() for path in workflow.paths}
-    every = ["prepare", "submit", "status", "fetch", "cancel", "job_details", "jobs"]
+    every = [
+        "prepare",
+        "submit",
+        "status",
+        "fetch",
+        "cancel",
+        "job_details",
+        "jobs",
+        "revise_script",
+    ]
     workflow.endpoint["capabilities"] = every
     if probe == "older-release":
         # A compatible HPC copy from an earlier release is not a warning.
@@ -3815,3 +3824,160 @@ def test_native_watched_jobs_that_finish_notify_once_per_check(
     finally:
         app.busy = False
         app.close()
+
+
+EDITED_SCRIPT = (
+    "#!/bin/bash\n#SBATCH --cpus-per-task=4\n#SBATCH --time=3:00:00\nhostname\n"
+)
+
+
+def script_endpoint(workflow):
+    """Imitate revise_script on the preview's session; records what was sent."""
+    workflow.endpoint["capabilities"].append("revise_script")
+    sent = []
+    session = workflow.controller.session
+    original = session.exchange
+
+    def exchange(request, *, receipt):
+        if request["action"] != "revise_script":
+            return original(request, receipt=receipt)
+        workflow.calls.append((receipt["bundle"], "revise_script"))
+        sent.append(request)
+        record = workflow.records[receipt["bundle"]]
+        if "REFUSE" in request["script"]:
+            raise backend.bridge.RemoteRefusal(
+                "Slurm would refuse this script: Invalid partition name specified"
+            )
+        if request["expected_sha256"] != record["script_sha256"]:
+            raise backend.bridge.RemoteRefusal(
+                "The script changed since it was opened; open View script again"
+            )
+        generated = record.get("generated_script") or record["script"]
+        edited = request["script"] != generated
+        record.update(
+            script=request["script"],
+            script_sha256=hashlib.sha256(request["script"].encode()).hexdigest(),
+            script_edited=edited,
+            generated_script=generated,
+        )
+        if edited:
+            record["script_resources"] = {
+                "cpus": 4,
+                "slurm_memory_mib": None,
+                "time_limit": "3:00:00",
+                "hours": 3,
+                "partition": None,
+            }
+        else:
+            record.pop("script_resources", None)
+        return {
+            **record,
+            "resources": dict(record["resources"]),
+            "warnings": ["Inkly no longer writes Gaussian's output to sample_1.log."]
+            if edited
+            else [],
+        }
+
+    session.exchange = exchange
+    return sent
+
+
+def script_results(workflow):
+    return [data for kind, data in workflow.events if kind == "script_result"]
+
+
+def test_saved_script_updates_row_review_and_submits_on_one_connection(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    review = c.review_id
+    sent = script_endpoint(workflow)
+    c.revise_script(str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    assert sent[0]["script"] == EDITED_SCRIPT and sent[0]["expected_sha256"] == "abc"
+    result = script_results(workflow)[-1]
+    assert result["status"] == "saved" and result["edited"] is True
+    assert "sample_1.log" in result["warnings"][0]
+    row = rows_for(workflow, path)[-1]
+    assert row["script_edited"] is True
+    assert row["resources"]["cpus"] == 4
+    assert row["resources"]["slurm_memory_mib"] is None
+    assert row["resources"]["hours"] == 3
+    # The approval now shows what the edited script asks for.
+    latest = [data for kind, data in workflow.events if kind == "review"][-1]
+    assert c.review_id == review == latest["id"]
+    assert latest["cpus"] == 4 + 2
+    assert latest["memory_mib"] == 1024 and latest["memory_unknown"] == 1
+    assert "1 warning(s)" in messages(workflow)[-1]
+    assert "Nothing was submitted" in messages(workflow)[-1]
+    assert "submit" not in actions(workflow)
+    c.submit(review, True, watch=False)
+    assert "with your edited job script" in " ".join(messages(workflow))
+    assert len(workflow.connections) == 1
+
+
+def test_refused_script_keeps_connection_preview_and_receipt(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    review, sidecar = c.review_id, path.with_suffix(".gjf.inkly.json").read_bytes()
+    script_endpoint(workflow)
+    c.execute("revise_script", str(path), "#!/bin/bash\n# REFUSE\n", "abc", SETTINGS)
+    result = script_results(workflow)[-1]
+    assert result == {
+        "path": str(path),
+        "status": "refused",
+        "message": "Slurm would refuse this script: Invalid partition name specified",
+    }
+    assert not [kind for kind, _ in workflow.events if kind == "error"]
+    assert c.session is not None and c.review_id == review
+    assert path.with_suffix(".gjf.inkly.json").read_bytes() == sidecar
+    c.execute("revise_script", str(path), EDITED_SCRIPT, "stale", SETTINGS)
+    assert "open View script again" in script_results(workflow)[-1]["message"]
+    assert len(workflow.connections) == 1
+
+
+def test_older_hpc_copy_is_told_to_update_and_nothing_is_sent(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    sent = script_endpoint(workflow)
+    workflow.endpoint["capabilities"].remove("revise_script")
+    c.revise_script(str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    assert script_results(workflow)[-1]["status"] == "unsupported"
+    assert "Update Inkly on the HPC" in script_results(workflow)[-1]["message"]
+    assert sent == [] and "revise_script" not in actions(workflow)
+
+
+def test_submitted_job_script_is_never_sent(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    sent = script_endpoint(workflow)
+    c.submit(c.review_id, True, watch=False)
+    c.revise_script(str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    result = script_results(workflow)[-1]
+    assert result["status"] == "refused" and "not been submitted" in result["message"]
+    assert sent == []
+
+
+def test_script_save_while_watching_uses_the_watch_session(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    script_endpoint(workflow)
+    c.request("revise_script", str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    assert c.handle_requests() is True
+    assert script_results(workflow)[-1]["status"] == "saved"
+    assert len(workflow.connections) == 1
+
+
+def test_reset_restores_generated_script_and_prepared_resources(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    script_endpoint(workflow)
+    c.revise_script(str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    saved = script_results(workflow)[-1]
+    c.revise_script(
+        str(path), saved["generated_script"], saved["script_sha256"], SETTINGS
+    )
+    result = script_results(workflow)[-1]
+    assert result["status"] == "saved" and result["edited"] is False
+    row = rows_for(workflow, path)[-1]
+    assert row["script_edited"] is False
+    assert row["resources"]["cpus"] == 2 and row["resources"]["hours"] == 2
+    assert "Restored the generated job script" in messages(workflow)[-1]
