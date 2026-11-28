@@ -72,6 +72,8 @@ def time_limit_words(value: str) -> str:
     text = clean(value)
     if text.casefold() in {"unlimited", "infinite"}:
         return "no limit"
+    if text.casefold() == "partition_limit":
+        return "the partition's limit"
     seconds = parse_duration(text)
     return human_duration(seconds) if seconds is not None else text
 

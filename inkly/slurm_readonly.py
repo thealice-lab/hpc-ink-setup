@@ -83,7 +83,9 @@ QUERIES = MappingProxyType(
                 "%i|%T|%P|%r|%M|%L|%l|%S|%D|%C|%m",
             ),
         ),
-        # The user's own jobs since a start date, one line per job.
+        # The user's own jobs since a start date, one line per job. AllocTRES
+        # gives the job's total allocated memory on every Slurm version
+        # (ReqMem changed meaning in 21.08), so it comes last.
         "my_recent_jobs": (
             "sacct",
             (
@@ -96,7 +98,7 @@ QUERIES = MappingProxyType(
                 "--parsable2",
                 "--format",
                 "JobIDRaw,JobID,State,ExitCode,Partition,Elapsed,Timelimit,"
-                "AllocCPUS,NNodes,ReqMem,TotalCPU",
+                "AllocCPUS,NNodes,TotalCPU,AllocTRES",
             ),
         ),
         # CPU time and peak memory of the steps of some of the user's jobs.
