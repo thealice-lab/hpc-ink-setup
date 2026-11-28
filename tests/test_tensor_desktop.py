@@ -3981,3 +3981,163 @@ def test_reset_restores_generated_script_and_prepared_resources(workflow):
     assert row["script_edited"] is False
     assert row["resources"]["cpus"] == 2 and row["resources"]["hours"] == 2
     assert "Restored the generated job script" in messages(workflow)[-1]
+
+
+def test_edited_script_wording_for_review_and_submit():
+    import tensor_desktop_status as wording
+
+    job = {"cpus": 4, "slurm_memory_mib": None, "hours": None, "script_edited": True}
+    assert wording.job_resources(job) == (
+        "4 CPUs, Slurm's default memory, the partition's time limit (edited script)"
+    )
+    plain = {"cpus": 2, "slurm_memory_mib": 2048, "hours": 3}
+    assert wording.job_resources(plain) == "2 CPUs, 2,048 MiB, 3 hour(s)"
+    review = {"count": 2, "cpus": 6, "memory_mib": 1024, "memory_unknown": 1}
+    assert "1 edited script(s) leave memory" in wording.review_overview(review)
+
+
+def test_script_files_and_differences_are_read_safely(tmp_path):
+    import tensor_desktop_status as job_script
+
+    good = tmp_path / "mine.sh"
+    good.write_bytes(b"\xef\xbb\xbf#!/bin/bash\r\nhostname\r\n")
+    assert job_script.read_script_file(good) == "#!/bin/bash\nhostname\n"
+    big = tmp_path / "big.sh"
+    big.write_bytes(b"#" * (64 * 1024 + 1))
+    with pytest.raises(ValueError, match="64 KiB"):
+        job_script.read_script_file(big)
+    binary = tmp_path / "binary.sh"
+    binary.write_bytes(b"\xff\xfe\x00")
+    with pytest.raises(ValueError, match="UTF-8"):
+        job_script.read_script_file(binary)
+    diff = job_script.diff_text("a\nb\n", "a\nc")
+    assert "-b\n" in diff and "+c\n" in diff
+    assert "No differences" in job_script.diff_text("a\n", "a\n")
+    row = {"state": "PREPARED", "script_sha256": "abc"}
+    assert job_script.editable(row)
+    assert not job_script.editable({**row, "input_changed": True})
+    assert not job_script.editable({**row, "state": "RUNNING"})
+    assert not job_script.editable({"state": "PREPARED"})
+
+
+@native_display
+def test_native_script_window_warns_once_saves_loads_and_resets(
+    workflow, tmp_path, monkeypatch
+):
+    import tensor_desktop_script as job_script
+
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first = workflow, str(workflow.paths[0])
+    questions = []
+
+    def ask(title, text, **kwargs):
+        questions.append((title, text, kwargs.get("default")))
+        return True
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        sent = script_endpoint(w)
+        w.controller.emit = lambda kind, data: app.events.put((kind, data))
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.table.selection_set(first)
+        app.buttons()
+        app.script_button.invoke()
+        window = app.script_window
+        assert window.current() == "# synthetic SBATCH"
+        assert str(window.edit_button["state"]) == "normal"
+        assert str(window.save_button["state"]) == "disabled"
+        assert str(window.reset_button["state"]) == "disabled"
+
+        monkeypatch.setattr(job_script.messagebox, "askyesno", ask)
+        window.edit_button.invoke()
+        assert "sample_1.log" in questions[-1][1] and questions[-1][2] == "no"
+        assert str(window.save_button["state"]) == "normal"
+        window.set_text(EDITED_SCRIPT)
+        window.save_button.invoke()
+        assert window.review_window is not None
+        assert not sent  # Nothing reaches the HPC before the changes are confirmed.
+        window.confirm_button.invoke()
+        pump(app)
+        assert sent[-1]["script"] == EDITED_SCRIPT
+        findings = window.findings.get("1.0", "end-1c")
+        assert "sample_1.log" in findings and "Nothing was submitted" in findings
+        assert str(app.table.item(first)["values"][6]).endswith("(script edited)")
+        assert window.current() == EDITED_SCRIPT and not window.editing
+
+        # The warning is shown once per window; loading a file asks nothing more.
+        mine = tmp_path / "mine.sh"
+        mine.write_bytes(b"#!/bin/bash\r\nhostname\r\n")
+        monkeypatch.setattr(
+            job_script.filedialog, "askopenfilename", lambda **k: str(mine)
+        )
+        asked = len(questions)
+        window.load_button.invoke()
+        assert len(questions) == asked
+        assert window.current() == "#!/bin/bash\nhostname\n"
+
+        # Reset to generated replaces the saved edit on the HPC once confirmed.
+        window.reset_button.invoke()
+        pump(app)
+        assert questions[-1][0] == "Reset to generated"
+        assert sent[-1]["script"] == "# synthetic SBATCH"
+        assert window.current() == "# synthetic SBATCH"
+        assert "edited" not in str(app.table.item(first)["values"][6])
+        assert "Restored" in window.findings.get("1.0", "end-1c")
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+@native_display
+def test_native_refused_script_keeps_text_and_connection(
+    workflow, tmp_path, monkeypatch
+):
+    import tensor_desktop_script as job_script
+
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first = workflow, str(workflow.paths[0])
+    questions = []
+
+    def answer(value):
+        def ask(title, text, **kwargs):
+            questions.append((title, text))
+            return value
+
+        return ask
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        script_endpoint(w)
+        w.controller.emit = lambda kind, data: app.events.put((kind, data))
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.table.selection_set(first)
+        app.buttons()
+        app.script_button.invoke()
+        window = app.script_window
+        monkeypatch.setattr(job_script.messagebox, "askyesno", answer(True))
+        window.edit_button.invoke()
+        window.set_text("#!/bin/bash\n# REFUSE\n")
+        window.save_button.invoke()
+        window.confirm_button.invoke()
+        pump(app)
+        assert "Invalid partition name" in window.findings.get("1.0", "end-1c")
+        assert window.current() == "#!/bin/bash\n# REFUSE\n" and window.editing
+        assert "was not saved" in activity(app)
+        assert w.controller.session is not None
+
+        # Closing with unsaved changes asks first; "no" keeps the window open.
+        monkeypatch.setattr(job_script.messagebox, "askyesno", answer(False))
+        window.close()
+        assert app.script_window is window and window.exists()
+        monkeypatch.setattr(job_script.messagebox, "askyesno", answer(True))
+        window.close()
+        assert app.script_window is None
+    finally:
+        app.busy, app.action = False, None
+        app.close()
