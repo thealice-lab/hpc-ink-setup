@@ -130,6 +130,12 @@ def overview_text(review, rows, unconfirmed=(), submitting=False):
     if states & UNCONFIRMED:
         notes.append(
             "Unconfirmed submissions: check your Slurm jobs before submitting again."
+            + (
+                " Select them and choose Run again: Desktop looks for their jobs "
+                "on the HPC and submits nothing."
+                if "SUBMISSION_UNKNOWN" in states
+                else ""
+            )
         )
     on_hpc = [row for row in rows if state_name(row.get("state")) in ON_HPC]
     if on_hpc:

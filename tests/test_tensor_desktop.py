@@ -288,6 +288,7 @@ def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
         "job_details",
         "jobs",
         "revise_script",
+        "check_submission",
     ]
     workflow.endpoint["capabilities"] = every
     if probe == "older-release":
@@ -4256,6 +4257,195 @@ def test_native_saved_script_edit_makes_cpus_and_memory_ask_once(
         assert scheduled == [
             ("change_resources", [second], [first, second], SETTINGS, changes)
         ]
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+def submission_endpoint(workflow, refuse=(), outcomes=None):
+    """Imitate submit refusals and check_submission on the preview's session."""
+    workflow.endpoint["capabilities"].append("check_submission")
+    session = workflow.controller.session
+    original = session.exchange
+    names = {bundle: record["name"] for bundle, record in workflow.records.items()}
+
+    def exchange(request, *, receipt):
+        bundle = receipt["bundle"]
+        record = workflow.records[bundle]
+        if request["action"] == "submit" and names[bundle] in refuse:
+            workflow.calls.append((bundle, "submit"))
+            record.update(submission="PREPARED", state="PREPARED")
+            raise ValueError(
+                f"{backend.SLURM_REFUSED}: Invalid account or account/partition "
+                "combination specified. It is still prepared; change it and submit "
+                "again."
+            )
+        if request["action"] == "check_submission":
+            workflow.calls.append((bundle, "check_submission"))
+            assert request["reopen"] is True
+            outcome = (outcomes or {})[names[bundle]]
+            if isinstance(outcome, Exception):
+                raise outcome
+            if outcome == "found":
+                record.update(submission="SUBMITTED", state="PENDING", job_id="77")
+            else:
+                record.update(submission="PREPARED", state="PREPARED")
+            return {
+                **record,
+                "resources": dict(record["resources"]),
+                "found": outcome == "found",
+            }
+        return original(request, receipt=receipt)
+
+    session.exchange = exchange
+
+
+def test_refused_submission_is_prepared_again_and_others_still_submit(workflow):
+    from inkly.gaussian import submission
+
+    assert backend.SLURM_REFUSED == submission.REFUSED
+    c, first, second = workflow.controller, *workflow.paths
+    c.preview(workflow.paths, SETTINGS)
+    submission_endpoint(workflow, refuse={"sample_1.gjf"})
+    c.submit(c.review_id, True, watch=False)
+    assert rows_for(workflow, first)[-1]["state"] == "PREPARED"
+    assert rows_for(workflow, second)[-1]["state"] == "SUBMITTED"
+    text = " ".join(messages(workflow))
+    assert "sample_1.gjf: Slurm refused the job, so nothing was submitted" in text
+    assert "Submitted sample_2.gjf: job 123" in text
+    notices = [data for kind, data in workflow.events if kind == "notice"]
+    assert "Slurm refused 1 job(s)" in notices[-1] and "sample_1.gjf" in notices[-1]
+    assert not [kind for kind, _ in workflow.events if kind == "error"]
+    assert c.review_id is None  # Submitting again needs a new preview.
+    assert len(workflow.connections) == 1
+
+
+def test_other_submission_failures_still_stop(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    session = c.session
+    original = session.exchange
+
+    def exchange(request, *, receipt):
+        if request["action"] == "submit":
+            raise ValueError(
+                "Submission unconfirmed; inspect squeue before any new attempt"
+            )
+        return original(request, receipt=receipt)
+
+    session.exchange = exchange
+    with pytest.raises(ValueError, match="Submission unconfirmed"):
+        c.submit(c.review_id, True, watch=False)
+    assert not [kind for kind, _ in workflow.events if kind == "notice"]
+
+
+def unconfirmed_rows(workflow):
+    for record in workflow.records.values():
+        record.update(submission="SUBMISSION_UNKNOWN", state="SUBMISSION_UNKNOWN")
+
+
+def test_check_submissions_records_found_jobs_and_reopens_the_rest(workflow):
+    c, first, second = workflow.controller, *workflow.paths
+    c.preview(workflow.paths, SETTINGS)
+    submission_endpoint(
+        workflow, outcomes={"sample_1.gjf": "found", "sample_2.gjf": "reopened"}
+    )
+    unconfirmed_rows(workflow)
+    paths = [str(path) for path in workflow.paths]
+    c.check_submissions(paths, paths, SETTINGS)
+    assert [a for _, a in workflow.calls].count("check_submission") == 2
+    assert "submit" not in actions(workflow)
+    text = " ".join(messages(workflow))
+    assert "sample_1.gjf: found job 77, so it was submitted after all" in text
+    assert "sample_2.gjf: no job was found" in text and "prepared again" in text
+    assert rows_for(workflow, first)[-1]["state"] == "PENDING"
+    assert rows_for(workflow, second)[-1]["state"] == "PREPARED"
+    # The list is read again, so the reopened file can be approved and submitted.
+    assert c.review_id and c.review()["count"] == 1
+    assert len(workflow.connections) == 1
+
+
+def test_check_submissions_too_soon_changes_nothing_and_continues(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    later = ValueError(
+        "The submission was attempted less than 2 minutes ago; check again in a "
+        "few minutes"
+    )
+    submission_endpoint(
+        workflow, outcomes={"sample_1.gjf": later, "sample_2.gjf": "reopened"}
+    )
+    unconfirmed_rows(workflow)
+    paths = [str(path) for path in workflow.paths]
+    c.check_submissions(paths, paths, SETTINGS)
+    text = " ".join(messages(workflow))
+    assert "sample_1.gjf: The submission was attempted less than 2 minutes ago" in text
+    assert "sample_2.gjf: no job was found" in text
+
+
+def test_check_submissions_refuses_other_rows_and_old_hpc_copies(workflow):
+    c, first = workflow.controller, str(workflow.paths[0])
+    c.preview(workflow.paths, SETTINGS)
+    with pytest.raises(ValueError, match="only a submission Desktop could not confirm"):
+        c.check_submissions([first], [first], SETTINGS)
+    unconfirmed_rows(workflow)
+    with pytest.raises(ValueError, match="too old to check unconfirmed"):
+        c.check_submissions([first], [first], SETTINGS)
+    assert "check_submission" not in actions(workflow)
+
+
+def test_unconfirmed_wording_points_to_run_again():
+    import tensor_desktop_status as wording
+
+    rows = [{"path": "a", "name": "a.gjf", "state": "SUBMISSION_UNKNOWN"}]
+    text = wording.overview_text(None, rows)
+    assert "check your Slurm jobs before submitting again" in text
+    assert "choose Run again: Desktop looks for their jobs" in text
+    rows = [{"path": "a", "name": "a.gjf", "state": "UNKNOWN", "job_id": "5"}]
+    assert "Run again" not in wording.overview_text(None, rows)
+
+
+@native_display
+def test_native_run_again_on_unconfirmed_rows_checks_after_a_warning(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first, second = workflow, *(str(path) for path in workflow.paths)
+    questions, scheduled = [], []
+
+    def answer(value):
+        def ask(title, text, **kwargs):
+            questions.append((title, text, kwargs.get("default")))
+            return value
+
+        return ask
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.events.put(("row", {**app.rows[first], "state": "SUBMISSION_UNKNOWN"}))
+        app.drain()
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+        app.table.selection_set(first)
+        app.buttons()
+        assert str(app.rerun_button["state"]) == "normal"
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.rerun_button.invoke()
+        title, text, default = questions[-1]
+        assert title == "Check unconfirmed submissions" and default == "no"
+        assert "sample_1.gjf" in text and "would run a second one" in text
+        assert "Nothing is submitted by this step." in text
+        assert scheduled == []
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(True))
+        app.rerun_button.invoke()
+        assert scheduled == [("check_submissions", [first], [first, second], SETTINGS)]
+        # A mix of unconfirmed and prepared rows is neither check nor Run again.
+        app.table.selection_set(first, second)
+        app.buttons()
+        assert str(app.rerun_button["state"]) == "disabled"
     finally:
         app.busy, app.action = False, None
         app.close()
