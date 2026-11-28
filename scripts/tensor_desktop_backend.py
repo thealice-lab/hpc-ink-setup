@@ -16,6 +16,15 @@ import tensor_desktop_setup as setup
 import tensor_picker as picker
 from inkly.core.desktop_diagnostics import DesktopJournal
 
+# How the HPC words a submission Slurm refused outright: no job was created and
+# the file is prepared again (inkly.gaussian.submission.REFUSED).
+SLURM_REFUSED = "Slurm refused the job, so nothing was submitted"
+# check_submission answers that change nothing and are worth trying later.
+CHECK_LATER = (
+    "The submission was attempted less than 2 minutes ago",
+    "Slurm's queue or accounting could not be checked",
+)
+
 
 def resource_text(resources):
     """'8 CPUs, 16 GB Slurm memory' from a job's resources or a chosen change."""
@@ -226,6 +235,7 @@ class DesktopController:
         "job_details": "Job details",
         "jobs": "Load my jobs and Job history",
         "revise_script": "Edit job scripts",
+        "check_submission": "Check unconfirmed submissions",
     }
 
     def hpc_install(self, state, settings=None, version=None, offer=False):
@@ -613,13 +623,27 @@ class DesktopController:
         )
         self.emit("review", None)
         self.refresh_before_submit()
+        refused = []
         for item in self.items:
             self.check_stop()
             if self.ready(item):
                 self.audit("desktop_submission", {"status": "attempt"})
-                response = self.session.exchange(
-                    {"action": "submit", "confirm": True}, receipt=item["receipt"]
-                )
+                try:
+                    response = self.session.exchange(
+                        {"action": "submit", "confirm": True}, receipt=item["receipt"]
+                    )
+                except ValueError as error:
+                    if not str(error).startswith(SLURM_REFUSED):
+                        raise  # Unconfirmed, or the connection was lost: stop.
+                    # Slurm said no and created no job; the HPC prepared it again.
+                    self.audit("desktop_submission", {"status": "refused"})
+                    item["response"] = self.session.exchange(
+                        {"action": "status"}, receipt=item["receipt"]
+                    )
+                    self.row(item)
+                    self.emit("message", f"{item['path'].name}: {error}")
+                    refused.append(item["path"].name)
+                    continue
                 item["response"].update(response)
                 self.audit(
                     "desktop_submission",
@@ -635,6 +659,14 @@ class DesktopController:
                         else ""
                     ),
                 )
+        if refused:
+            self.emit(
+                "notice",
+                f"Slurm refused {len(refused)} job(s), so they were not submitted: "
+                + ", ".join(refused)
+                + ". Each is still prepared; Activity has Slurm's reason. Change "
+                "them, preview again and submit when ready.",
+            )
         if watch:
             self.monitor()
 
@@ -646,6 +678,7 @@ class DesktopController:
         "rerun",
         "change_resources",
         "revise_script",
+        "check_submissions",
         "load_jobs",
         "restore_jobs",
         "history",
@@ -696,7 +729,7 @@ class DesktopController:
                     targets = [self.target_for(args[0], args[1], "resume")]
                 elif action == "revise_script":
                     targets = [self.target_for([args[0]], args[3], "resume")]
-                elif action in {"rerun", "change_resources"}:
+                elif action in {"rerun", "change_resources", "check_submissions"}:
                     targets = [
                         self.target_for(args[0], args[2], "resume"),
                         self.target_for(args[1], args[2], "preview"),
@@ -736,6 +769,7 @@ class DesktopController:
                 "rerun",
                 "change_resources",
                 "revise_script",
+                "check_submissions",
             }
 
     def monitor(self):
@@ -1388,6 +1422,68 @@ class DesktopController:
             + ". Nothing was submitted.",
         )
 
+    def check_submissions(self, selected, paths, settings):
+        """Settle submissions whose outcome was never confirmed.
+
+        For each file the HPC looks for its job in the queue, in Slurm's
+        accounting and in its job folder. A job found is recorded and watched
+        as usual; with none found, the file is prepared again so it can be
+        reviewed and submitted. Nothing is submitted here.
+        """
+        self.check_stop()
+        self.review_id = None
+        self.emit("review", None)
+        settings, items, _ = self.selected_items(
+            selected, settings, "Select the unconfirmed rows to check first."
+        )
+        for item in items:
+            response = item["response"]
+            state = picker.state_name(response.get("state", response["submission"]))
+            if state != "SUBMISSION_UNKNOWN":
+                raise ValueError(
+                    f"{item['path'].name} is {state}; only a submission Desktop "
+                    "could not confirm can be checked."
+                )
+        if not self.endpoint_supports("check_submission", items[0]["receipt"]):
+            raise ValueError(
+                "The Inkly copy on the HPC is too old to check unconfirmed "
+                "submissions. Update Inkly on the HPC from Connection settings, "
+                "then try again. Nothing was changed."
+            )
+        self.audit(
+            "desktop_check_submission", {"status": "approved", "count": len(items)}
+        )
+        for item in items:
+            self.check_stop()
+            name = item["path"].name
+            try:
+                response = self.session.exchange(
+                    {"action": "check_submission", "reopen": True},
+                    receipt=item["receipt"],
+                )
+            except ValueError as error:
+                if not str(error).startswith(CHECK_LATER):
+                    raise
+                self.emit("message", f"{name}: {error}.")
+                continue
+            item["response"] = response
+            found = response.get("found") is True
+            self.audit(
+                "desktop_check_submission",
+                {"status": "found" if found else "reopened", "count": 1},
+            )
+            self.emit(
+                "message",
+                f"{name}: found job {response.get('job_id')}, so it was submitted "
+                "after all. Nothing new was submitted."
+                if found
+                else f"{name}: no job was found in the queue, in Slurm's accounting "
+                "or in its job folder, so it is prepared again. Nothing was "
+                "submitted; review it and submit when ready.",
+            )
+        # Re-read the whole list so the rows and the approval cover every file.
+        self.preview(paths, settings)
+
     def execute(self, action, *args):
         try:
             if action == "test_connection":
@@ -1412,6 +1508,8 @@ class DesktopController:
                 self.change_resources(*args)
             elif action == "revise_script":
                 self.revise_script(*args)
+            elif action == "check_submissions":
+                self.check_submissions(*args)
             elif action in {"load_jobs", "restore_jobs", "history", "search_jobs"}:
                 getattr(self, action)(*args)
             elif action == "close":
