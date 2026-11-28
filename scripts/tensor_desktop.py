@@ -6,6 +6,7 @@ import ctypes
 import gc
 import json
 import os
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 import queue
 import re
@@ -23,10 +24,14 @@ if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tensor_desktop_jobs as jobs
+import tensor_desktop_notify as notify
+import tensor_desktop_preferences as preferences
+import tensor_desktop_script as job_script
 import tensor_desktop_setup as hpc_setup
 import tensor_desktop_status as status
+import tensor_desktop_updates as updates
 import tensor_picker as picker
-from tensor_desktop_backend import DesktopController
+from tensor_desktop_backend import DesktopController, resource_text
 
 
 # pip's upgrade advice and already-installed packages are noise for researchers;
@@ -72,6 +77,40 @@ def setup_summary(host, mode, release):
     )
 
 
+def memory_text(mib):
+    """Slurm MiB as the GB figure the CPUs and memory window shows."""
+    return f"{round(mib / 1024, 2):g}"
+
+
+def parse_resource_entries(cpus_text, memory_text_value, prefill):
+    """New CPUs and total Slurm memory (MiB) from the CPUs and memory window.
+
+    An empty box, or one still showing the value it was opened with, keeps the
+    current value. Memory is typed in GB (1 GB = 1024 MiB).
+    """
+    cpus_text, memory_value = cpus_text.strip(), memory_text_value.strip()
+    if memory_value.lower().endswith("gb"):
+        memory_value = memory_value[:-2].strip()
+    cpus = memory = None
+    if cpus_text and cpus_text != prefill.get("cpus"):
+        if not re.fullmatch(r"[0-9]+", cpus_text):
+            raise ValueError("CPUs must be a whole number, for example 8.")
+        cpus = int(cpus_text)
+    if memory_value and memory_value != prefill.get("memory"):
+        try:
+            gb = Decimal(memory_value)
+        except InvalidOperation:
+            raise ValueError(
+                "Memory must be a number of GB, for example 16 or 7.5."
+            ) from None
+        if not gb.is_finite() or gb <= 0:
+            raise ValueError("Memory must be a number of GB, for example 16 or 7.5.")
+        memory = int((gb * 1024).to_integral_value(rounding=ROUND_HALF_UP))
+    if cpus is None and memory is None:
+        raise ValueError("Change the CPUs, the memory or both first.")
+    return picker.resource_changes({"cpus": cpus, "memory_mib": memory})
+
+
 def bundled_askpass():
     root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1] / "build"))
     path = root / "InklySshAskpass.exe"
@@ -85,7 +124,13 @@ STOP_GRACE_MS = 20000
 
 
 class DesktopApp:
-    def __init__(self, root, controller_factory=DesktopController, settings_path=None):
+    def __init__(
+        self,
+        root,
+        controller_factory=DesktopController,
+        settings_path=None,
+        check_updates=None,
+    ):
         # Tk objects may only be freed on the thread that created them. Python's
         # cyclic garbage collector runs on whichever thread triggers it, and here
         # the worker and diagnostics threads allocate constantly; Tcl aborts the
@@ -136,8 +181,15 @@ class DesktopApp:
         # job was added to the list (then it ends with one preview).
         self.load_context = {"settings": None, "added": False}
         self.jobs_index = jobs.Index()
+        # Watched jobs that returned or ended without a result since the last
+        # notification; one notification covers each batch of events.
+        self.notifier = notify.Notifier(self.root)
+        self.finished = {"returned": [], "failed": []}
         self.history_window = None
         self.history_listing = None
+        self.script_window = None
+        # Learned when a save reaches an HPC copy without revise_script.
+        self.script_unsupported = False
         # Inkly on the HPC: what Test connection last found, and the offers
         # (set up, switch the launcher, first sign-in) shown once idle.
         self.hpc_state = None
@@ -147,6 +199,16 @@ class DesktopApp:
         self.host_untrusted = False
         self.events = queue.Queue()
         self.commands = queue.Queue()
+        # Packaged apps check for new releases. Source runs and the packaged
+        # smoke test stay offline unless a test explicitly enables the check.
+        self.release_checks_allowed = (
+            getattr(sys, "frozen", False) if check_updates is None else check_updates
+        )
+        self.check_releases = tk.BooleanVar(
+            value=preferences.load(self.path.parent, updates.PREFERENCE)
+        )
+        self.release_worker = None
+        self.release_url = None
         self.controller = controller_factory(
             lambda kind, data: self.events.put((kind, data)), askpass=bundled_askpass()
         )
@@ -157,6 +219,7 @@ class DesktopApp:
         self.timer = self.root.after(80, self.drain)
         if self.load_error:
             self.log("Saved connection needs attention: " + self.load_error)
+        self.start_release_check()
 
     def build(self):
         style = ttk.Style(self.root)
@@ -234,6 +297,19 @@ class DesktopApp:
         self.contact.pack(anchor="w", pady=(2, 0))
         for sequence in ("<Button-1>", "<Return>", "<space>"):
             self.contact.bind(sequence, self.contact_support)
+        self.release_notice = tk.Label(
+            banner,
+            background="#142b45",
+            foreground="#ffdb8a",
+            font=("Segoe UI", 10, "underline"),
+            cursor="hand2",
+            takefocus=1,
+            highlightthickness=1,
+            highlightbackground="#142b45",
+            highlightcolor="white",
+        )
+        for sequence in ("<Button-1>", "<Return>", "<space>"):
+            self.release_notice.bind(sequence, self.open_release)
         tools = ttk.Frame(self.root, padding=(22, 14))
         tools.grid(row=1, column=0, sticky="ew")
         tools.columnconfigure(0, weight=1)
@@ -286,6 +362,10 @@ class DesktopApp:
         self.cancel_button.pack(side="left", padx=(16, 0))
         self.rerun_button = ttk.Button(bar, text="Run again", command=self.run_again)
         self.rerun_button.pack(side="left", padx=8)
+        self.resources_button = ttk.Button(
+            bar, text="CPUs & memory…", command=self.change_resources
+        )
+        self.resources_button.pack(side="left")
         # Packed last so the file count gives way first in narrow windows.
         self.count = ttk.Label(bar, text="No files added")
         self.count.pack(side="right")
@@ -293,8 +373,8 @@ class DesktopApp:
             content,
             text=(
                 "Add .gjf or .com inputs, or Load my jobs from the HPC. Preview, "
-                "Submit and Check use the whole list; Cancel job and Run again use "
-                "selected rows."
+                "Submit and Check use the whole list; Cancel job, Run again and "
+                "CPUs & memory use selected rows."
             ),
             wraplength=1000,
         )
@@ -391,6 +471,14 @@ class DesktopApp:
         ttk.Label(activity_bar, text="Activity", font=("Segoe UI", 11, "bold")).pack(
             side="left"
         )
+        self.notify_jobs = tk.BooleanVar(value=notify.load_preference(self.path.parent))
+        self.notify_button = ttk.Checkbutton(
+            activity_bar,
+            text="Notify me when watched jobs finish",
+            variable=self.notify_jobs,
+            command=self.save_notify_choice,
+        )
+        self.notify_button.pack(side="left", padx=(16, 0))
         self.results_button = ttk.Button(
             activity_bar, text="Open results folder", command=self.open_results
         )
@@ -453,6 +541,11 @@ class DesktopApp:
                 "job_details": "Reading job details…",
                 "cancel_jobs": "Cancelling the selected pending jobs…",
                 "rerun": "Preparing the selected files again (nothing is submitted)…",
+                "change_resources": "Preparing the selected files again with new CPUs "
+                "and memory (nothing is submitted)…",
+                "revise_script": "Saving the job script on the HPC (nothing is submitted)…",
+                "check_submissions": "Checking unconfirmed submissions on the HPC "
+                "(nothing is submitted)…",
                 "load_jobs": "Finding your recent jobs on the HPC…",
                 "restore_jobs": "Copying jobs that are not on this computer…",
                 "search_jobs": "Looking for your input files in the chosen folder…",
@@ -469,6 +562,8 @@ class DesktopApp:
             kind, data = self.events.get_nowait()
             if kind == "message":
                 self.log(data)
+            elif kind == "release":
+                self.show_release(data)
             elif kind == "job_details":
                 self.show_job_details(data)
             elif kind == "jobs_found":
@@ -480,9 +575,23 @@ class DesktopApp:
             elif kind == "history":
                 self.show_history(data)
             elif kind == "row":
+                previous = self.rows.get(data["path"])
                 self.rows[data["path"]] = data
+                if self.watching():
+                    finished = notify.outcome(
+                        previous.get("state") if previous else None, data["state"]
+                    )
+                    if finished == "returned":
+                        self.finished["returned"].append(data["name"])
+                    elif finished == "failed":
+                        self.finished["failed"].append(
+                            (data["name"], notify.state_name(data["state"]))
+                        )
                 if self.table.exists(data["path"]):
-                    r = data["resources"]
+                    r = {
+                        key: "—" if value is None else value
+                        for key, value in data["resources"].items()
+                    }
                     self.table.item(
                         data["path"],
                         values=(
@@ -493,7 +602,8 @@ class DesktopApp:
                             r["hours"],
                             data["stages"],
                             data["state"]
-                            + (" (input edited)" if data.get("input_changed") else ""),
+                            + (" (input edited)" if data.get("input_changed") else "")
+                            + (" (script edited)" if data.get("script_edited") else ""),
                             data["job_id"],
                         ),
                     )
@@ -503,6 +613,8 @@ class DesktopApp:
             elif kind == "review":
                 self.review = data
                 self.refresh_overview()
+            elif kind == "script_result":
+                self.script_result(data)
             elif kind == "recovery_required":
                 self.recovery_request = data
             elif kind == "target":
@@ -520,6 +632,7 @@ class DesktopApp:
                     self.log("HPC setup: " + data["line"])
             elif kind == "setup_result":
                 self.setup_done = data
+                self.script_unsupported = False
                 if self.settings["ink_path"] == data["launcher"]:
                     self.hpc_state = {
                         "state": "current",
@@ -530,6 +643,8 @@ class DesktopApp:
                     }
             elif kind == "request_error":
                 # Something asked for during the watch was not done; watching continues.
+                if self.script_window:
+                    self.script_window.finished()
                 self.log(data)
                 messagebox.showerror("Not done", data, parent=self.root)
             elif kind == "notice":
@@ -557,6 +672,8 @@ class DesktopApp:
                 else:
                     messagebox.showerror("Handoff stopped", data, parent=self.root)
             elif kind == "done":
+                if data == "revise_script" and self.script_window:
+                    self.script_window.finished()
                 if self.stop_deadline:
                     self.root.after_cancel(self.stop_deadline)
                     self.stop_deadline = None
@@ -576,6 +693,7 @@ class DesktopApp:
             if not self.busy and self.after_done and not self.closed:
                 step, self.after_done = self.after_done, None
                 step()
+        self.announce()
         if (
             self.recovery_request
             and (not self.busy or self.watching())
@@ -686,6 +804,89 @@ class DesktopApp:
             )
         return "break"
 
+    def start_release_check(self):
+        """Check in the background and deliver the result on the Tk thread."""
+        if (
+            not self.release_checks_allowed
+            or not self.check_releases.get()
+            or not updates.enabled()
+            or self.closed
+            or (self.release_worker and self.release_worker.is_alive())
+        ):
+            return
+        directory, events = self.path.parent, self.events
+
+        def check():
+            # No Tk objects are read or written by this worker.
+            try:
+                release = updates.check(directory)
+            except Exception:
+                release = None
+            events.put(("release", release))
+
+        self.release_worker = threading.Thread(target=check, daemon=True)
+        self.release_worker.start()
+
+    def hide_release(self):
+        self.release_url = None
+        self.release_notice.pack_forget()
+
+    def show_release(self, release):
+        info = updates.newer(
+            updates.release_info(release.get("tag")) if release else None,
+            updates.__version__,
+        )
+        if (
+            self.closed
+            or not self.check_releases.get()
+            or not updates.enabled()
+            or not info
+        ):
+            self.hide_release()
+            return
+        changed = self.release_url != info["url"]
+        self.release_url = info["url"]
+        self.release_notice.configure(
+            text=f"Inkly Desktop {info['version']} is available: open the download page"
+        )
+        self.release_notice.pack(anchor="w", pady=(2, 0))
+        if changed:
+            self.log(
+                f"Inkly Desktop {info['version']} is available (this Desktop is "
+                f"{updates.__version__}). After downloading it, Connection settings "
+                "can update Inkly on the HPC."
+            )
+
+    def open_release(self, event=None):
+        if not self.release_url:
+            return "break"
+        try:
+            opened = webbrowser.open(self.release_url)
+        except (OSError, webbrowser.Error):
+            opened = False
+        if not opened:
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(self.release_url)
+                self.log(
+                    "The release download page address was copied to the clipboard."
+                )
+            except tk.TclError:
+                self.log(f"Open the release page: {self.release_url}")
+        return "break"
+
+    def save_release_choice(self):
+        try:
+            preferences.save(
+                self.path.parent, updates.PREFERENCE, self.check_releases.get()
+            )
+        except OSError as error:
+            self.log(f"Could not save the release-check choice: {error}")
+        if self.check_releases.get():
+            self.start_release_check()
+        else:
+            self.hide_release()
+
     def layout_report(self):
         """Geometry evidence for the packaged smoke test and scaled-font tests."""
         self.root.update_idletasks()
@@ -718,6 +919,7 @@ class DesktopApp:
             "clear": self.clear_button,
             "cancel": self.cancel_button,
             "rerun": self.rerun_button,
+            "resources": self.resources_button,
             "preview": self.preview_button,
             "submit": self.submit_button,
             "monitor": self.monitor_button,
@@ -725,6 +927,7 @@ class DesktopApp:
             "script": self.script_button,
             "results": self.results_button,
             "details": self.details_button,
+            "notify": self.notify_button,
             "load_jobs": self.load_button,
             "history": self.history_button,
             "status": self.status,
@@ -789,7 +992,12 @@ class DesktopApp:
             state="normal" if self.cancellable() and ready else "disabled"
         )
         self.rerun_button.configure(
-            state="normal" if self.rerunnable() and ready else "disabled"
+            state="normal"
+            if (self.rerunnable() or self.checkable()) and ready
+            else "disabled"
+        )
+        self.resources_button.configure(
+            state="normal" if self.changeable() and ready else "disabled"
         )
         self.script_button.configure(
             state="normal" if self.table.selection() and self.rows else "disabled"
@@ -832,6 +1040,25 @@ class DesktopApp:
                 status.state_name(row.get("state")) != "PREPARED"
                 or row.get("input_changed")
             )
+            for _, row in rows
+        )
+
+    def checkable(self):
+        """Rows whose submission Desktop could not confirm; Run again checks them."""
+        rows = self.selected_rows()
+        return bool(rows) and all(
+            row and status.state_name(row.get("state")) == "SUBMISSION_UNKNOWN"
+            for _, row in rows
+        )
+
+    def changeable(self):
+        """Prepared, unchanged rows: their CPUs and memory may still change."""
+        rows = self.selected_rows()
+        return bool(rows) and all(
+            row
+            and status.state_name(row.get("state")) == "PREPARED"
+            and not row.get("input_changed")
+            and not row.get("job_id")
             for _, row in rows
         )
 
@@ -885,6 +1112,9 @@ class DesktopApp:
     def run_again(self):
         if self.busy and not self.watching():
             return
+        if self.checkable():
+            self.check_unconfirmed()
+            return
         if not self.rerunnable() or not self.settings_ready():
             return
         rows = self.selected_rows()
@@ -902,6 +1132,17 @@ class DesktopApp:
             f"limit ({self.settings['hours']} hour(s)). Nothing is submitted: review "
             "the preview, then choose Submit prepared jobs."
         )
+        edited = [row["name"] for _, row in rows if row.get("script_edited")]
+        if edited:
+            text += (
+                "\n\nEDITED JOB SCRIPT: "
+                + ", ".join(edited)
+                + (" was" if len(edited) == 1 else " were")
+                + " set up with a job script you edited. The new job gets a fresh "
+                "script generated from the input; your edits are not carried over. "
+                "The earlier script stays on the HPC with its old job. Open View "
+                "script on the new row to edit it again."
+            )
         if messagebox.askyesno(
             "Run again as new jobs", text, parent=self.root, default="no"
         ):
@@ -917,6 +1158,155 @@ class DesktopApp:
                 self.buttons()
             else:
                 self.start("rerun", *arguments)
+
+    def check_unconfirmed(self):
+        """Run again on unconfirmed rows: find their jobs, or prepare them again."""
+        if not self.settings_ready():
+            return
+        rows = self.selected_rows()
+        text = (
+            f"Check {len(rows)} unconfirmed submission(s)?\n\n"
+            + self.listing([row["name"] for _, row in rows])
+            + "\n\nDesktop could not confirm whether these were submitted. It will "
+            "look for each job in the HPC's queue, in Slurm's accounting and in its "
+            "job folder:\n\n"
+            "  •  Found: Desktop records the job and shows its status as usual.\n"
+            "  •  Not found: the file is prepared again, so you can review it and "
+            "submit it. If a job did start without leaving any of those traces, "
+            "submitting again would run a second one.\n\n"
+            "Nothing is submitted by this step."
+        )
+        if not messagebox.askyesno(
+            "Check unconfirmed submissions", text, parent=self.root, default="no"
+        ):
+            return
+        self.review = None
+        arguments = (
+            [path for path, _ in rows],
+            [str(path) for path in self.files],
+            dict(self.settings),
+        )
+        if self.watching():
+            self.controller.request("check_submissions", *arguments)
+            self.log("Checking unconfirmed submissions; watching continues.")
+            self.buttons()
+        else:
+            self.start("check_submissions", *arguments)
+
+    def change_resources(self):
+        if self.busy and not self.watching():
+            return
+        if not self.changeable() or not self.settings_ready():
+            return
+        rows = self.selected_rows()
+        changes = self.ask_resources([row for _, row in rows])
+        if changes is None:
+            return
+        edited = [row["name"] for _, row in rows if row.get("script_edited")]
+        if edited and not messagebox.askyesno(
+            "Discard script edits?",
+            f"{len(edited)} selected file(s) have an edited job script:\n\n"
+            + self.listing(edited)
+            + "\n\nChanging CPUs or memory prepares them again from the input, so "
+            "those script edits are discarded. Continue?",
+            parent=self.root,
+            default="no",
+        ):
+            return
+        self.review = None
+        arguments = (
+            [path for path, _ in rows],
+            [str(path) for path in self.files],
+            dict(self.settings),
+            changes,
+        )
+        if self.watching():
+            self.controller.request("change_resources", *arguments)
+            self.log(
+                "Changing CPUs and memory on the open connection; watching continues."
+            )
+            self.buttons()
+        else:
+            self.start("change_resources", *arguments)
+
+    def ask_resources(self, rows):
+        """New CPUs and memory for the selected rows, or None when cancelled."""
+        dialog, _, entries, buttons, result = self.resources_dialog(rows)
+        dialog.grab_set()
+        entries["cpus"].focus_set()
+        self.root.wait_window(dialog)
+        return result["changes"]
+
+    def resources_dialog(self, rows):
+        """The CPUs and memory window, its values, entries, buttons and result."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("CPUs and memory")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=22)
+        frame.pack(fill="both", expand=True)
+        current = self.listing(
+            [f"{row['name']}: {resource_text(row['resources'])}" for row in rows]
+        )
+        ttk.Label(
+            frame,
+            text=(
+                f"New CPUs and memory for {len(rows)} prepared file(s):\n\n{current}"
+                "\n\nLeave a box as it is to keep that value. Each file is prepared "
+                "again as a new job: its old receipt is kept beside the input and "
+                "nothing is submitted. The HPC writes the matching %nprocshared and "
+                "%mem into its own copy of the input; your file is not changed. Slurm "
+                "decides whether the cluster can run what you ask for."
+            ),
+            wraplength=520,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        def common(key):
+            values = {row["resources"][key] for row in rows}
+            return values.pop() if len(values) == 1 else None
+
+        cpus, memory = common("cpus"), common("slurm_memory_mib")
+        prefill = {
+            "cpus": "" if cpus is None else str(cpus),
+            "memory": "" if memory is None else memory_text(memory),
+        }
+        values = {key: tk.StringVar(value=text) for key, text in prefill.items()}
+        entries = {}
+        for row, key, label in (
+            (1, "cpus", "CPUs"),
+            (2, "memory", "Memory (GB, total for Slurm)"),
+        ):
+            ttk.Label(frame, text=label).grid(
+                row=row, column=0, sticky="w", pady=(12 if row == 1 else 6, 0)
+            )
+            entries[key] = ttk.Entry(frame, textvariable=values[key], width=12)
+            entries[key].grid(
+                row=row, column=1, sticky="w", pady=(12 if row == 1 else 6, 0)
+            )
+        problem = ttk.Label(frame, text="", foreground="#a4262c", wraplength=520)
+        problem.grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        result = {"changes": None}
+
+        def apply():
+            try:
+                result["changes"] = parse_resource_entries(
+                    values["cpus"].get(), values["memory"].get(), prefill
+                )
+            except ValueError as error:
+                problem.configure(text=str(error))
+                return
+            dialog.destroy()
+
+        buttons = {
+            "apply": ttk.Button(
+                frame, text="Prepare again", command=apply, style="Accent.TButton"
+            ),
+            "cancel": ttk.Button(frame, text="Cancel", command=dialog.destroy),
+        }
+        buttons["cancel"].grid(row=4, column=0, sticky="w", pady=(14, 0))
+        buttons["apply"].grid(row=4, column=1, sticky="e", pady=(14, 0))
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        return dialog, values, entries, buttons, result
 
     def invalidate(self):
         self.review = None
@@ -1114,9 +1504,18 @@ class DesktopApp:
             wraplength=510,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
+        self.release_check_button = ttk.Checkbutton(
+            frame,
+            text="Check for new Desktop releases",
+            variable=self.check_releases,
+            command=self.save_release_choice,
+        )
+        self.release_check_button.grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(0, 12)
+        )
         ttk.Button(
             frame, text="Save settings", command=save, style="Accent.TButton"
-        ).grid(row=7, column=1, sticky="e")
+        ).grid(row=8, column=1, sticky="e")
 
     def hpc_status_text(self):
         state = self.hpc_state or {}
@@ -1339,12 +1738,16 @@ class DesktopApp:
             return
         review = self.review
         details = "\n".join(
-            f"{job['name']}: {job['cpus']} CPUs, {job['slurm_memory_mib']} MiB, {job['hours']} hour(s)"
-            for job in review["jobs"][:8]
+            f"{job['name']}: {status.job_resources(job)}" for job in review["jobs"][:8]
         )
         if review["count"] > 8:
             details += f"\n…and {review['count'] - 8} more files shown in the table."
         text = f"Submit {review['count']} independent calculations to the HPC?\n\n{details}\n\nIf all run together: {review['cpus']} CPUs and {review['memory_mib']:,} MiB Slurm memory.\nSlurm decides when jobs start. Closing the app does not cancel them."
+        if review.get("memory_unknown"):
+            text += (
+                f"\n{review['memory_unknown']} edited script(s) leave memory to "
+                "Slurm's default, which is not in that total."
+            )
         if review.get("recovered"):
             text += (
                 "\n\nRECOVERED HANDOFF WARNING: "
@@ -1774,7 +2177,8 @@ class DesktopApp:
                 iid=job["bundle"],
                 values=(
                     jobs.local_time(job.get("submitted_at") or job.get("prepared_at")),
-                    job["name"],
+                    job["name"]
+                    + (" (edited script)" if job.get("script_edited") else ""),
                     job.get("job_id") or "—",
                     status.state_name(job.get("state")),
                     job.get("exit_code") or "",
@@ -1895,13 +2299,46 @@ class DesktopApp:
                 parent=self.root,
             )
             return
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Generated SBATCH — " + row["name"])
-        dialog.geometry("900x650")
-        text = tk.Text(dialog, wrap="none", font=("Consolas", 10))
-        text.pack(fill="both", expand=True)
-        text.insert("1.0", row["script"])
-        text.configure(state="disabled")
+        window = self.script_window
+        if window and window.exists():
+            if window.path == selected[0]:
+                window.window.lift()
+                return
+            window.close()
+            if self.script_window:
+                return  # Kept open: its unsaved changes were not discarded.
+        self.script_window = job_script.ScriptWindow(self, selected[0], row)
+
+    def save_script(self, path, script, expected_sha256):
+        """Called by the script window; True when the save was started."""
+        if self.busy and not self.watching():
+            messagebox.showinfo(
+                "Please wait",
+                "Inkly Desktop is busy with another step. Save again when it finishes.",
+                parent=self.root,
+            )
+            return False
+        if not self.settings_ready():
+            return False  # Connection settings opened; nothing was sent.
+        arguments = (path, script, expected_sha256, dict(self.settings))
+        if self.watching():
+            self.controller.request("revise_script", *arguments)
+            self.log(
+                "Saving the job script on the open connection; watching continues."
+            )
+        else:
+            self.start("revise_script", *arguments)
+        return True
+
+    def script_result(self, data):
+        name = Path(data["path"]).name
+        if data["status"] == "unsupported":
+            self.script_unsupported = True
+        if data["status"] != "saved":
+            self.log(f"Job script for {name} was not saved: {data['message']}")
+        window = self.script_window
+        if window and window.exists() and window.path == data["path"]:
+            window.result(data)
 
     def open_results(self):
         selected = set(self.table.selection())
@@ -1921,6 +2358,29 @@ class DesktopApp:
                 parent=self.root,
             )
 
+    def announce(self):
+        """One Windows notification for the watched jobs that just finished."""
+        returned, failed = self.finished["returned"], self.finished["failed"]
+        if not returned and not failed:
+            return
+        self.finished = {"returned": [], "failed": []}
+        if self.closed or not self.notify_jobs.get() or self.notifier.foreground():
+            return  # In front, the table already shows it.
+        watching = sum(
+            1
+            for row in self.rows.values()
+            if row.get("job_id")
+            and notify.state_name(row.get("state")) not in notify.DONE_STATES
+        )
+        title, text = notify.message(returned, failed, watching)
+        self.notifier.show(title, text, warning=bool(failed))
+
+    def save_notify_choice(self):
+        try:
+            notify.save_preference(self.path.parent, self.notify_jobs.get())
+        except OSError as error:
+            self.log(f"Could not save the notification choice: {error}")
+
     def close(self):
         if self.busy and not messagebox.askyesno(
             "Close Inkly Desktop?",
@@ -1937,6 +2397,7 @@ class DesktopApp:
         self.root.after_cancel(self.timer)
         if self.stop_deadline:
             self.root.after_cancel(self.stop_deadline)
+        self.notifier.close()
         self.root.destroy()
         # Free the closed window here, on the Tk thread. Automatic collection
         # stays off: this window's threads may still be finishing.
@@ -1953,7 +2414,7 @@ def main(argv=None):
     # External OpenSSH/PowerShell must use system DLL lookup, not frozen DLLs.
     if os.name == "nt" and getattr(sys, "frozen", False):
         ctypes.windll.kernel32.SetDllDirectoryW(None)
-    app = DesktopApp(root)
+    app = DesktopApp(root, check_updates=False if args.smoke_test else None)
     if args.smoke_test:
         # Local build verification only: draw the real window and invoke no SSH.
         for _ in range(5):

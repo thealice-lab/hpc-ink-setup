@@ -4,11 +4,14 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 
 import pytest
 
 from inkly.gaussian import tensor
+import time
+from datetime import datetime, timedelta, timezone
 
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="HPC endpoint is Linux-only")
@@ -552,3 +555,666 @@ def test_watch_status_reads_accounting_once_per_check(prepared, monkeypatch, sta
     monkeypatch.setattr(tensor, "_scheduler", scheduler)
     response = operate(prepared, "status")
     assert response["state"] == state and calls == ["sacct"]
+
+
+SINFO = "general*|7-00:00:00|64|256000\ndebug|1:00:00|8|16000\n"
+
+
+def script_checks(calls, refusal=None, sinfo=SINFO, assoc="users|normal\n"):
+    """Fake Slurm for script checks; --test-only never submits."""
+
+    def scheduler(args, directory):
+        calls.append(args)
+        if args[:2] == ["sbatch", "--test-only"]:
+            candidate = directory / args[-1]
+            assert candidate.name.startswith(".revise-")
+            assert candidate.stat().st_mode & 0o777 == 0o600
+            if isinstance(refusal, BaseException):
+                raise refusal
+            if isinstance(refusal, tuple):
+                return subprocess.CompletedProcess(args, 1, *refusal)
+            if refusal:
+                return subprocess.CompletedProcess(args, 1, "", refusal)
+            return subprocess.CompletedProcess(args, 0, "", "sbatch: Job 1 to start")
+        if args[0] == "sacctmgr":
+            assert args[:5] == ["sacctmgr", "-n", "-P", "show", "assoc"]
+            if isinstance(assoc, BaseException):
+                raise assoc
+            if assoc is None:
+                return subprocess.CompletedProcess(args, 1, "", "sacctmgr: error")
+            return subprocess.CompletedProcess(args, 0, assoc, "")
+        if args[0] == "sinfo":
+            if sinfo is None:
+                return subprocess.CompletedProcess(args, 1, "", "sinfo: error")
+            return subprocess.CompletedProcess(args, 0, sinfo, "")
+        raise AssertionError(f"unexpected Slurm call {args}")
+
+    return scheduler
+
+
+def revise(prepared, script, expected=None):
+    root, request, result = prepared
+    receipt = json.loads((root / request["bundle"] / "receipt.json").read_text())
+    return operate(
+        prepared,
+        "revise_script",
+        script=script,
+        expected_sha256=expected or receipt["script_sha256"],
+    )
+
+
+def test_revised_script_is_stored_checked_and_submitted(prepared, monkeypatch):
+    root, request, result = prepared
+    directory = root / request["bundle"]
+    generated = result["script"]
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    edited = generated.replace("--time=1:00:00", "--time=4:00:00").replace(
+        "#SBATCH --hint=nomultithread",
+        "#SBATCH --hint=nomultithread\n#SBATCH --mail-type=END",
+    )
+    response = revise(prepared, edited.replace("\n", "\r\n"))
+    assert response["script"] == edited
+    assert response["generated_script"] == generated
+    assert response["script_edited"] is True
+    assert response["state"] == "PREPARED"
+    assert response["script_resources"] == {
+        "cpus": 2,
+        "slurm_memory_mib": 1024,
+        "time_limit": "4:00:00",
+        "hours": 4,
+        "partition": "general",
+    }
+    assert response["resources"] == result["resources"]
+    assert response["warnings"] == []
+    assert calls[0] == [
+        "sbatch",
+        "--test-only",
+        "--comment=inkly:" + request["bundle"],
+        calls[0][-1],
+    ]
+    assert (directory / "job.sbatch").read_text() == edited
+    assert (directory / "job.sbatch.generated").read_text() == generated
+    assert not list(directory.glob(".revise-*"))
+    for path in directory.iterdir():
+        assert path.stat().st_mode & 0o777 == 0o600
+    saved = json.loads((directory / "receipt.json").read_text())
+    assert saved["script_sha256"] == hashlib.sha256(edited.encode()).hexdigest()
+    assert saved["generated_script_sha256"] == result["script_sha256"]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", saved["script_edited_at"])
+    status = operate(prepared, "status")
+    assert status["script"] == edited
+    assert status["generated_script"] == generated
+
+    submitted = []
+    monkeypatch.setattr(
+        tensor,
+        "_scheduler",
+        lambda args, d: (
+            submitted.append(args)
+            or subprocess.CompletedProcess(args, 0, "12345\n", "")
+        ),
+    )
+    assert operate(prepared, "submit", confirm=True)["job_id"] == "12345"
+    assert submitted == [
+        ["sbatch", "--parsable", "--comment=inkly:" + request["bundle"], "job.sbatch"]
+    ]
+
+
+def test_reset_to_generated_needs_no_slurm_and_clears_the_edit(prepared, monkeypatch):
+    root, request, result = prepared
+    directory = root / request["bundle"]
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    revise(prepared, result["script"].replace("--time=1:00:00", "--time=2:00:00"))
+    calls.clear()
+    response = revise(prepared, result["script"])
+    assert calls == []
+    assert response["script_edited"] is False
+    assert "script_resources" not in response
+    assert "script_edited_at" not in response
+    assert response["warnings"] == []
+    assert (directory / "job.sbatch").read_text() == result["script"]
+    assert "generated_script" not in operate(prepared, "status")
+
+
+def test_stale_copy_or_outside_change_is_refused(prepared, monkeypatch):
+    root, request, result = prepared
+    directory = root / request["bundle"]
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    edited = result["script"].replace("--time=1:00:00", "--time=2:00:00")
+    with pytest.raises(ValueError, match="changed since it was opened"):
+        revise(prepared, edited, expected="0" * 64)
+    (directory / "job.sbatch").write_text(result["script"] + "# outside\n")
+    with pytest.raises(ValueError, match="changed since it was opened"):
+        revise(prepared, edited)
+    assert calls == []
+    assert not (directory / "job.sbatch.generated").exists()
+
+
+def test_submitted_job_script_cannot_change(prepared, monkeypatch):
+    submitted(prepared, monkeypatch)
+    with pytest.raises(ValueError, match="not been submitted"):
+        revise(prepared, prepared[2]["script"])
+
+
+@pytest.mark.parametrize(
+    "script, message",
+    [
+        (None, "must be text"),
+        ("#!/bin/bash\n\x00\n", "NUL"),
+        ("#!/bin/bash\n" + "#" * (64 * 1024), "64 KiB"),
+        ("#!/bin/bash\n\ud800\n", "UTF-8"),
+        ("  \n", "empty"),
+        ("#SBATCH --time=1:00:00\nhostname\n", "#!"),
+    ],
+)
+def test_unusable_scripts_are_refused_before_slurm(
+    prepared, monkeypatch, script, message
+):
+    root, request, result = prepared
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    with pytest.raises(ValueError, match=message):
+        revise(prepared, script)
+    assert calls == []
+    assert (root / request["bundle"] / "job.sbatch").read_text() == result["script"]
+
+
+def test_slurm_refusal_is_reported_and_nothing_changes(prepared, monkeypatch):
+    root, request, result = prepared
+    directory = root / request["bundle"]
+    before = (directory / "receipt.json").read_bytes()
+    refusal = (
+        "sbatch: error: Batch job submission failed: Invalid partition name "
+        "specified\x07\nprivate detail\n"
+    )
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([], refusal=refusal))
+    edited = result["script"].replace("--partition=general", "--partition=nope")
+    with pytest.raises(ValueError) as error:
+        revise(prepared, edited)
+    assert str(error.value) == (
+        "Slurm would refuse this script: Invalid partition name specified"
+    )
+    assert (directory / "job.sbatch").read_text() == result["script"]
+    assert (directory / "receipt.json").read_bytes() == before
+    assert not list(directory.glob(".revise-*"))
+
+
+@pytest.mark.parametrize(
+    "output, reason",
+    [
+        (
+            ("", "sbatch: Requested node configuration is not available\n"),
+            "Requested node configuration is not available",
+        ),
+        (
+            ("sbatch: error: Memory specification can not be satisfied\n", ""),
+            "Memory specification can not be satisfied",
+        ),
+        (("", "\n"), None),
+    ],
+)
+def test_slurm_reason_without_an_error_line_is_still_shown(
+    prepared, monkeypatch, output, reason
+):
+    result = prepared[2]
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([], refusal=output))
+    edited = result["script"].replace("--cpus-per-task=2", "--cpus-per-task=4096")
+    with pytest.raises(ValueError) as error:
+        revise(prepared, edited)
+    assert str(error.value) == (
+        f"Slurm would refuse this script: {reason}"
+        if reason
+        else "Slurm would refuse this script; check its #SBATCH lines"
+    )
+
+
+def test_unavailable_check_refuses_only_unlisted_partitions(prepared, monkeypatch):
+    result = prepared[2]
+    monkeypatch.setattr(
+        tensor,
+        "_scheduler",
+        script_checks([], refusal=FileNotFoundError("sbatch")),
+    )
+    with pytest.raises(ValueError, match="no partition named nope"):
+        revise(
+            prepared,
+            result["script"].replace("--partition=general", "--partition=nope"),
+        )
+    response = revise(
+        prepared, result["script"].replace("--partition=general", "--partition=debug")
+    )
+    assert response["script_resources"]["partition"] == "debug"
+    assert any("could not check" in w for w in response["warnings"])
+
+
+@pytest.mark.parametrize(
+    "trouble",
+    [
+        "sbatch: error: Batch job submission failed: Unable to contact slurm "
+        "controller (connect failure)\n",
+        "sbatch: error: Batch job submission failed: Socket timed out on "
+        "send/recv operation\n",
+        "sbatch: error: Slurm backup controller in standby mode\n",
+        subprocess.TimeoutExpired(["sbatch"], 30),
+    ],
+)
+def test_unreachable_controller_saves_with_a_warning(prepared, monkeypatch, trouble):
+    """Slurm being unavailable is not a verdict on the script."""
+    root, request, result = prepared
+    calls = []
+    monkeypatch.setattr(
+        tensor, "_scheduler", script_checks(calls, refusal=trouble, sinfo=None)
+    )
+    edited = result["script"].replace("--time=1:00:00", "--time=2:00:00")
+    response = revise(prepared, edited)
+    assert response["script_edited"] is True
+    assert response["script"] == edited
+    assert any("Slurm could not check this script" in w for w in response["warnings"])
+    assert (root / request["bundle"] / "job.sbatch").read_text() == edited
+    assert [call[0] for call in calls] == ["sbatch", "sinfo"]
+
+
+def test_own_script_is_saved_with_warnings_about_inkly_lines(prepared, monkeypatch):
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([]))
+    own = (
+        "#!/bin/bash\n"
+        "#SBATCH -c 4 --mem=2G\n"
+        "#SBATCH -t 2-00:00:00\n"
+        "#SBATCH --array=1-3 --output=run.out\n"
+        "module load gaussian\n"
+        "g16 < sample_1.gjf > sample_1.out\n"
+    )
+    response = revise(prepared, own)
+    assert response["script"] == own
+    assert response["script_resources"] == {
+        "cpus": 4,
+        "slurm_memory_mib": 2048,
+        "time_limit": "2-00:00:00",
+        "hours": 48,
+        "partition": None,
+    }
+    warnings = "\n".join(response["warnings"])
+    for expected in [
+        "exactly the prepared input",
+        "sample_1.log",
+        "started the way Inkly starts it",
+        "--hint=nomultithread",
+        "--array is set",
+        "--output is set",
+    ]:
+        assert expected in warnings
+    assert "REQUESTED_CPUS" not in warnings
+
+
+def test_cpu_and_memory_mismatches_warn_and_point_to_desktop_fields(
+    prepared, monkeypatch
+):
+    result = prepared[2]
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([]))
+    fewer = revise(
+        prepared,
+        result["script"]
+        .replace("--cpus-per-task=2", "--cpus-per-task=1")
+        .replace("--mem=1024M", "--mem=700M"),
+    )
+    warnings = "\n".join(fewer["warnings"])
+    assert "1 CPUs but starts Gaussian on 2" in warnings
+    assert "stop before Gaussian runs" in warnings
+    assert "768 MB (GAUSSIAN_MEM_MB), more than the 700 MiB" in warnings
+    assert "CPU and memory fields" in warnings
+    tight = revise(
+        prepared,
+        result["script"]
+        .replace("--cpus-per-task=2", "--cpus-per-task=8")
+        .replace("--mem=1024M", "--mem=1000M"),
+    )
+    warnings = "\n".join(tight["warnings"])
+    assert "Gaussian uses only 2" in warnings
+    assert "less room than Inkly's usual headroom" in warnings
+
+
+def test_unknown_account_or_qos_warns_without_refusing(prepared, monkeypatch):
+    result = prepared[2]
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    edited = result["script"].replace(
+        "#SBATCH --hint=nomultithread",
+        "#SBATCH --hint=nomultithread\n#SBATCH -A labx --qos=hiprio",
+    )
+    response = revise(prepared, edited)
+    assert response["script"] == edited
+    warnings = "\n".join(response["warnings"])
+    assert "no account labx for you (yours: users)" in warnings
+    assert "does not list QOS hiprio for you (yours: normal)" in warnings
+    assert calls[-1][:5] == ["sacctmgr", "-n", "-P", "show", "assoc"]
+    assert calls[-1][-1] == "format=account,qos"
+
+
+@pytest.mark.parametrize(
+    "assoc", ["USERS|normal,Long\n", None, FileNotFoundError("sacctmgr"), "\n"]
+)
+def test_known_account_or_no_accounting_gives_no_account_warning(
+    prepared, monkeypatch, assoc
+):
+    """Listed names (any case) pass; without accounting records nothing is said."""
+    result = prepared[2]
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([], assoc=assoc))
+    edited = result["script"].replace(
+        "#SBATCH --hint=nomultithread",
+        "#SBATCH --hint=nomultithread\n#SBATCH --account=users -q long",
+    )
+    response = revise(prepared, edited)
+    assert not [w for w in response["warnings"] if "accounting" in w]
+
+
+def test_accounting_is_not_asked_without_account_or_qos(prepared, monkeypatch):
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    revise(prepared, prepared[2]["script"].replace("--time=1:00:00", "--time=2:00:00"))
+    assert "sacctmgr" not in [call[0] for call in calls]
+
+
+def test_partition_limits_from_sinfo_warn(prepared, monkeypatch):
+    result = prepared[2]
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([]))
+    response = revise(
+        prepared,
+        result["script"]
+        .replace("--partition=general", "--partition=debug")
+        .replace("--time=1:00:00", "--time=3:00:00")
+        .replace("--cpus-per-task=2", "--cpus-per-task=16")
+        .replace("--mem=1024M", "--mem=32G"),
+    )
+    warnings = "\n".join(response["warnings"])
+    assert "longer than partition debug allows" in warnings
+    assert "No node in partition debug has 16 CPUs (largest: 8)" in warnings
+    assert "No node in partition debug has 32768 MiB" in warnings
+
+
+def test_edited_jobs_are_marked_in_history_and_details(prepared, monkeypatch):
+    root, request, result = prepared
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([]))
+    revise(prepared, result["script"].replace("--time=1:00:00", "--time=2:00:00"))
+    jobs = tensor.handle({"action": "jobs", "bundle": "0" * 32}, root)["jobs"]
+    assert [job["script_edited"] for job in jobs] == [True]
+    details = operate(prepared, "job_details")
+    assert details["script_edited"] is True
+
+
+def test_version_offers_revise_script(tmp_path):
+    result = tensor.handle({"action": "version", "bundle": "d" * 32}, tmp_path)
+    assert "revise_script" in result["capabilities"]
+
+
+def test_script_checks_import_without_posix_only_modules(monkeypatch):
+    """Desktop on Windows imports the endpoint package; pwd does not exist there."""
+    import importlib
+    import sys
+
+    from inkly.gaussian import script_revision
+
+    monkeypatch.setitem(sys.modules, "pwd", None)
+    importlib.reload(script_revision)
+    assert script_revision.MAX_SCRIPT == 64 * 1024
+
+
+REFUSAL = (
+    "sbatch: error: Batch job submission failed: Invalid account or "
+    "account/partition combination specified\n"
+)
+
+
+def slurm_answers(
+    calls, sbatch=(1, "", REFUSAL), squeue=(0, "", ""), sacct=(0, "", "")
+):
+    """Fake sbatch, squeue and sacct; a BaseException answer is raised."""
+
+    def scheduler(args, directory):
+        calls.append(args)
+        answer = {"sbatch": sbatch, "squeue": squeue, "sacct": sacct}[args[0]]
+        if isinstance(answer, BaseException):
+            raise answer
+        return subprocess.CompletedProcess(args, *answer)
+
+    return scheduler
+
+
+def receipt_of(prepared):
+    root, request, _ = prepared
+    return json.loads((root / request["bundle"] / "receipt.json").read_text())
+
+
+def test_clear_refusal_reopens_the_job_with_slurms_reason(prepared, monkeypatch):
+    calls = []
+    other = "999|inkly:" + "f" * 32 + "\n"
+    monkeypatch.setattr(
+        tensor, "_scheduler", slurm_answers(calls, squeue=(0, other, ""))
+    )
+    with pytest.raises(ValueError) as error:
+        operate(prepared, "submit", confirm=True)
+    assert str(error.value) == (
+        "Slurm refused the job, so nothing was submitted: Invalid account or "
+        "account/partition combination specified. It is still prepared; change "
+        "it and submit again."
+    )
+    assert [call[0] for call in calls] == ["sbatch", "squeue"]
+    assert calls[1][:4] == ["squeue", "--noheader", "--user", str(os.getuid())]
+    receipt = receipt_of(prepared)
+    assert receipt["submission"] == "PREPARED"
+    assert receipt["submit_refused"]["reason"].startswith("Invalid account")
+    assert re.fullmatch(
+        r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", receipt["submit_attempted_at"]
+    )
+    assert operate(prepared, "status")["state"] == "PREPARED"
+    # A later, accepted submission clears the refusal.
+    monkeypatch.setattr(
+        tensor, "_scheduler", slurm_answers([], sbatch=(0, "4242\n", ""))
+    )
+    assert operate(prepared, "submit", confirm=True)["job_id"] == "4242"
+    assert "submit_refused" not in receipt_of(prepared)
+
+
+@pytest.mark.parametrize(
+    "sbatch",
+    [
+        (
+            1,
+            "",
+            "sbatch: error: Batch job submission failed: Socket timed out on "
+            "send/recv operation\n",
+        ),
+        (
+            1,
+            "",
+            "sbatch: error: Batch job submission failed: Unable to contact "
+            "slurm controller (connect failure)\n",
+        ),
+        (
+            1,
+            "",
+            "sbatch: error: Slurm temporarily unable to accept job\n"
+            "sbatch: error: Batch job submission failed: Resource temporarily "
+            "unavailable\n",
+        ),
+        (
+            1,
+            "",
+            "sbatch: error: Batch job submission failed: Zero Bytes were "
+            "transmitted or received\n",
+        ),
+        (1, "12345\n", REFUSAL),  # A job ID was printed: never call it refused.
+        (1, "", "private output"),
+    ],
+)
+def test_uncertain_failures_stay_unconfirmed(prepared, monkeypatch, sbatch):
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", slurm_answers(calls, sbatch=sbatch))
+    with pytest.raises(ValueError, match="Submission unconfirmed"):
+        operate(prepared, "submit", confirm=True)
+    assert receipt_of(prepared)["submission"] == "SUBMISSION_UNKNOWN"
+    assert [call[0] for call in calls] == ["sbatch"]
+
+
+@pytest.mark.parametrize(
+    "squeue",
+    [
+        (0, "777|inkly:BUNDLE\n", ""),  # The job is in the queue after all.
+        (1, "", "squeue: error"),
+        subprocess.TimeoutExpired(["squeue"], 30),
+    ],
+)
+def test_refusal_stays_unconfirmed_unless_the_queue_shows_no_job(
+    prepared, monkeypatch, squeue
+):
+    if isinstance(squeue, tuple):
+        squeue = (squeue[0], squeue[1].replace("BUNDLE", prepared[1]["bundle"]), "")
+    monkeypatch.setattr(tensor, "_scheduler", slurm_answers([], squeue=squeue))
+    with pytest.raises(ValueError, match="Submission unconfirmed"):
+        operate(prepared, "submit", confirm=True)
+    assert receipt_of(prepared)["submission"] == "SUBMISSION_UNKNOWN"
+    with pytest.raises(ValueError, match="Already attempted"):
+        operate(prepared, "submit", confirm=True)
+
+
+def unconfirmed(prepared, monkeypatch, minutes_ago=10):
+    """A submission whose outcome is unknown, attempted some minutes ago."""
+    monkeypatch.setattr(
+        tensor, "_scheduler", slurm_answers([], sbatch=(1, "", "lost reply"))
+    )
+    with pytest.raises(ValueError, match="unconfirmed"):
+        operate(prepared, "submit", confirm=True)
+    root, request, _ = prepared
+    path = root / request["bundle"] / "receipt.json"
+    receipt = json.loads(path.read_text())
+    moment = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    receipt["submit_attempted_at"] = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    path.write_text(json.dumps(receipt))
+    return root / request["bundle"]
+
+
+def test_check_submission_finds_a_job_in_the_queue(prepared, monkeypatch):
+    unconfirmed(prepared, monkeypatch)
+    calls = []
+    line = f"31|inkly:{prepared[1]['bundle']}\n"
+    monkeypatch.setattr(
+        tensor,
+        "_scheduler",
+        lambda args, d: (
+            calls.append(args)
+            or subprocess.CompletedProcess(
+                args, 0, line if args[0] == "squeue" else "31|PENDING|0:0\n", ""
+            )
+        ),
+    )
+    response = operate(prepared, "check_submission", reopen=True)
+    assert response["found"] is True
+    assert response["job_id"] == "31" and response["submission"] == "SUBMITTED"
+    assert receipt_of(prepared)["job_id"] == "31"
+    assert "submission_found_at" in receipt_of(prepared)
+
+
+def test_check_submission_finds_an_ended_job_by_folder_or_log(prepared, monkeypatch):
+    directory = unconfirmed(prepared, monkeypatch)
+    calls = []
+    accounting = f"55|{directory}|\n"
+    monkeypatch.setattr(
+        tensor, "_scheduler", slurm_answers(calls, sacct=(0, accounting, ""))
+    )
+    response = operate(prepared, "check_submission")
+    assert response["found"] is True and response["job_id"] == "55"
+    sacct = [call for call in calls if call[0] == "sacct"][0]
+    assert sacct[:3] == ["sacct", "--uid", str(os.getuid())]
+    assert "JobIDRaw,WorkDir,Comment" in sacct
+
+
+def test_check_submission_finds_a_started_job_by_its_slurm_log(prepared, monkeypatch):
+    directory = unconfirmed(prepared, monkeypatch)
+    (directory / "slurm-88.out").write_text("started\n")
+    monkeypatch.setattr(tensor, "_scheduler", slurm_answers([]))
+    response = operate(prepared, "check_submission")
+    assert response["found"] is True and response["job_id"] == "88"
+
+
+def test_nothing_found_reopens_only_when_asked_and_settled(prepared, monkeypatch):
+    unconfirmed(prepared, monkeypatch, minutes_ago=1)
+    monkeypatch.setattr(tensor, "_scheduler", slurm_answers([]))
+    looked = operate(prepared, "check_submission")
+    assert looked["found"] is False and looked["submission"] == "SUBMISSION_UNKNOWN"
+    with pytest.raises(ValueError, match="less than 2 minutes"):
+        operate(prepared, "check_submission", reopen=True)
+    assert receipt_of(prepared)["submission"] == "SUBMISSION_UNKNOWN"
+    unconfirmed_path = prepared[0] / prepared[1]["bundle"] / "receipt.json"
+    receipt = json.loads(unconfirmed_path.read_text())
+    receipt["submission"] = "SUBMISSION_UNKNOWN"
+    old = datetime.now(timezone.utc) - timedelta(minutes=5)
+    receipt["submit_attempted_at"] = old.strftime("%Y-%m-%dT%H:%M:%SZ")
+    unconfirmed_path.write_text(json.dumps(receipt))
+    reopened = operate(prepared, "check_submission", reopen=True)
+    assert reopened["found"] is False and reopened["submission"] == "PREPARED"
+    assert "submission_reopened_at" in receipt_of(prepared)
+    monkeypatch.setattr(tensor, "_scheduler", slurm_answers([], sbatch=(0, "9\n", "")))
+    assert operate(prepared, "submit", confirm=True)["job_id"] == "9"
+
+
+@pytest.mark.parametrize("broken", ["squeue", "sacct"])
+def test_reopen_needs_every_place_checked(prepared, monkeypatch, broken):
+    unconfirmed(prepared, monkeypatch)
+    answers = {broken: (1, "", "error")}
+    monkeypatch.setattr(tensor, "_scheduler", slurm_answers([], **answers))
+    with pytest.raises(ValueError, match="could not be checked"):
+        operate(prepared, "check_submission", reopen=True)
+    assert receipt_of(prepared)["submission"] == "SUBMISSION_UNKNOWN"
+
+
+def test_old_receipts_use_their_last_write_as_the_attempt(prepared, monkeypatch):
+    directory = unconfirmed(prepared, monkeypatch)
+    path = directory / "receipt.json"
+    receipt = json.loads(path.read_text())
+    del receipt["submit_attempted_at"]
+    path.write_text(json.dumps(receipt))
+    monkeypatch.setattr(tensor, "_scheduler", slurm_answers([]))
+    with pytest.raises(ValueError, match="less than 2 minutes"):
+        operate(prepared, "check_submission", reopen=True)
+    past = time.time() - 600
+    os.utime(path, (past, past))
+    assert (
+        operate(prepared, "check_submission", reopen=True)["submission"] == "PREPARED"
+    )
+
+
+def test_check_submission_is_only_for_unconfirmed_jobs(prepared, monkeypatch):
+    with pytest.raises(ValueError, match="Only an unconfirmed submission"):
+        operate(prepared, "check_submission", reopen=True)
+    result = tensor.handle({"action": "version", "bundle": "e" * 32}, prepared[0])
+    assert "check_submission" in result["capabilities"]
+
+
+@pytest.mark.parametrize(
+    "reason, clear",
+    [
+        (
+            "Job violates accounting/QOS policy (job submit limit, user's size "
+            "and/or time limits)",
+            True,
+        ),
+        ("Requested node configuration is not available", True),
+        ("Invalid qos specification", True),
+        ("Socket timed out on send/recv operation", False),
+        ("Slurm backup controller in standby mode", False),
+        ("Protocol authentication error", False),
+    ],
+)
+def test_which_sbatch_failures_count_as_a_clear_refusal(reason, clear):
+    from inkly.gaussian import submission
+
+    result = subprocess.CompletedProcess(
+        ["sbatch"], 1, "", f"sbatch: error: Batch job submission failed: {reason}\n"
+    )
+    assert (submission.refusal(result) == reason) is clear
+    assert (
+        submission.refusal(subprocess.CompletedProcess(["sbatch"], 0, "5\n", ""))
+        is None
+    )

@@ -20,14 +20,14 @@ Inkly is designed for command-line use in shared research environments and can b
 ## Windows Desktop: one double-click from this checkout
 
 Double-click [Get-InklyDesktop-Test.cmd](Get-InklyDesktop-Test.cmd). It downloads
-[Inkly Desktop 0.6.0 (preview)](https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.6.0)
+[Inkly Desktop 0.6.2 (preview)](https://github.com/thealice-lab/hpc-ink-setup/releases/tag/desktop-v0.6.2)
 from this repository's Releases, checks the EXE's exact SHA-256, runs a
 local-only smoke test and opens the app. No GitHub sign-in is needed, and the
 EXE is **not inside Git**.
 
-This is an **unsigned pre-release**, built by GitHub Actions from `6f95d03`.
+This is an **unsigned pre-release**, built by GitHub Actions from `5e222a5`.
 Its EXE SHA-256 is
-`5813D970CEDA56656BCDEFC2A0BEC5760ADF3EBAC35475629019777A3A357CD5`.
+`CB38D30336E5F9C3B6C265137E7181C7D0E98A4C3A4AF007A644F023664AD60E`.
 Windows PowerShell 5.1 and Windows OpenSSH Client are required; Python is
 bundled. Actual HPC use also needs the site's network/VPN, verified host key
 and an authorized account. From Inkly Desktop 0.6.0, Desktop can install or
@@ -36,12 +36,18 @@ on the HPC**); earlier builds need a matching Inkly HPC endpoint. See
 [Desktop download and testing instructions](docs/DESKTOP.md#download-and-open-inkly-desktop)
 for the install location, troubleshooting and standalone helper use.
 
+The packaged Desktop can notify you when a newer release is available, without
+downloading or installing it. Turn off **Check for new Desktop releases** in
+Connection settings if you prefer not to check.
+
 ## What Inkly Does
 
 Inkly helps users interact with an HPC system in a more natural and productive way.
 
 Examples of what it can do:
 - explain Slurm usage and queue behavior
+- answer questions about your own jobs and the cluster from live, read-only
+  Slurm data ([details](docs/INK_SLURM.md))
 - summarize node and partition information
 - surface cluster-specific documentation snippets
 - provide historical job-intelligence summaries
@@ -107,6 +113,14 @@ In interactive terminal use, Inkly can display:
 
 This makes the CLI feel more responsive while still preserving the full response for runtime use.
 
+### 6. Live, read-only Slurm answers
+
+`ink` can answer "why is my job pending?", "how efficient were my jobs?" or
+"how many idle nodes are there?" from live `squeue`, `sinfo` and `sacct`
+data. It runs only fixed, read-only commands, shows job details only for your
+own jobs, never reads job names, and lists the commands it used after the
+answer. See [Live Slurm answers in `ink`](docs/INK_SLURM.md).
+
 ## Architecture Overview
 
 At a high level, Inkly works like this:
@@ -136,6 +150,7 @@ A simplified view of the important pieces:
 inkly/
   config.py
   ink_core.py
+  slurm_readonly.py
   db.py
   jobs.py
   llm/
@@ -148,6 +163,8 @@ inkly/
     manager.py
     queue_status.py
     node_info.py
+    my_jobs.py
+    my_recent_jobs.py
     jobs_summary.py
     docs_gaussian.py
   retrieval/
@@ -174,13 +191,16 @@ preview, confirmed submission and result monitoring in an application window.
 Open `InklyDesktop.exe` or double-click `Inkly Desktop.pyw` when running from source.
 Its job summary follows each file's latest status after submission. While it
 watches, you can add, preview and submit more inputs on the same connection,
-and Stop watching keeps the connection so watching can resume. **Load my jobs**
+and Stop watching keeps the connection so watching can resume. Windows notifies
+you when a watched job returns or ends without a result. **Load my jobs**
 fills the list with pending, running and recently finished jobs without
 choosing files, and **Job history** lists older jobs with state, date and name
 filters; see [Load my jobs and Job history](docs/DESKTOP.md#load-my-jobs-and-job-history). Select
 rows to **Cancel job** (pending jobs only, also while Desktop is watching) or **Run again** (cancelled, failed or
 edited files, prepared as new jobs and never submitted without confirmation);
 see [Cancel a pending job or run a file again](docs/DESKTOP.md#cancel-a-pending-job-or-run-a-file-again).
+Before submitting, **CPUs & memory…** sets other CPUs or memory for selected
+prepared files; see [Change CPUs and memory](docs/DESKTOP.md#change-cpus-and-memory-before-submitting).
 For questions or issues, use the contact line under the window title
 (rrv9177@uncw.edu).
 

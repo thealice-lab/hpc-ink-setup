@@ -13,6 +13,63 @@ from typing import Dict, Iterable, List
 # - "GPU_4" stays as one token
 TOKEN_RE = re.compile(r"[a-zA-Z0-9_\-]+")
 
+# Common words that carry no meaning for choosing a plugin. Without this list,
+# a question such as "what is 2+2" matches plugins through "what" and "is" in
+# their example queries and runs cluster commands for nothing. Words that do
+# separate plugins (i, me, my, why, when, now, job, start) are kept.
+STOPWORDS = frozenset(
+    {
+        "a",
+        "about",
+        "am",
+        "an",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "by",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "how",
+        "in",
+        "is",
+        "it",
+        "its",
+        "much",
+        "many",
+        "of",
+        "on",
+        "or",
+        "should",
+        "so",
+        "some",
+        "that",
+        "the",
+        "there",
+        "this",
+        "to",
+        "was",
+        "were",
+        "what",
+        "which",
+        "will",
+        "with",
+        "would",
+        "you",
+    }
+)
+
 
 class TfidfEmbedder:
     """
@@ -60,11 +117,12 @@ class TfidfEmbedder:
 
         Example:
         "How busy is the GPU queue?"
-        -> ["how", "busy", "is", "the", "gpu", "queue"]
+        -> ["busy", "gpu", "queue"]
         """
         if not text:
             return []
-        return [tok.lower() for tok in TOKEN_RE.findall(text)]
+        tokens = (tok.lower() for tok in TOKEN_RE.findall(text))
+        return [tok for tok in tokens if tok not in STOPWORDS]
 
     def fit(self, texts: Iterable[str]) -> None:
         """

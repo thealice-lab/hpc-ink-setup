@@ -168,16 +168,20 @@ class PluginRetriever:
 
         Reuse path:
         - load the saved index from disk
-        - if indexed item IDs match current plugin IDs, reuse the store
+        - if indexed items match the current plugins' text, reuse the store
         - refit the embedder from stored item text
 
         Rebuild path:
-        - if the store is missing or plugin IDs changed, rebuild the index
+        - if the store is missing or any plugin or its text changed, rebuild
         """
         # store.load() returns True if an index file exists and was loaded.
         # set(self.store.items) gives the indexed item IDs.
         # set(plugins) gives the current plugin mapping keys.
-        if self.store.load() and set(self.store.items) == set(plugins):
+        # Reuse only an index built from exactly the current plugin text, so
+        # edited descriptions or example queries take effect on the next run.
+        if self.store.load() and {
+            item_id: item.text for item_id, item in self.store.items.items()
+        } == {name: self.build_plugin_text(plugin) for name, plugin in plugins.items()}:
             self._last_plugins = dict(plugins)
 
             # Refit the embedder from the stored item text so new queries can be encoded

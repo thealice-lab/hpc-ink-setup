@@ -12,6 +12,11 @@ REQUIRED_PLUGIN_META_FIELDS = (
     "example_queries",
 )
 
+# Plugins that read live Slurm data end their output with one line per
+# command they used, starting with this prefix. The runtime removes these
+# lines from the prompt and lists the commands after the answer itself.
+SOURCE_COMMAND_PREFIX = "Slurm command: "
+
 
 def validate_plugin_meta(meta: Mapping[str, Any]) -> None:
     """

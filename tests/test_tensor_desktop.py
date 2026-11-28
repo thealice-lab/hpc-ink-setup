@@ -118,8 +118,14 @@ def workflow(tmp_path, monkeypatch):
                     "state": "PREPARED",
                     "script": "# synthetic SBATCH",
                     "resources": {
-                        "cpus": 2,
-                        "slurm_memory_mib": 1024,
+                        "cpus": request.get("cpus") or 2,
+                        "cpus_source": "explicit override"
+                        if request.get("cpus") is not None
+                        else "TENSOR export",
+                        "slurm_memory_mib": request.get("memory_mib") or 1024,
+                        "memory_source": "explicit Slurm override"
+                        if request.get("memory_mib") is not None
+                        else "TENSOR export plus cluster headroom",
                         "gaussian_memory_mb": 768,
                         "hours": request["hours"],
                     },
@@ -273,7 +279,17 @@ def record_for(workflow, path):
 def test_connection_needs_no_inputs_slurm_or_receipts(workflow, probe):
     c = workflow.controller
     before = {path: path.read_bytes() for path in workflow.paths}
-    every = ["prepare", "submit", "status", "fetch", "cancel", "job_details", "jobs"]
+    every = [
+        "prepare",
+        "submit",
+        "status",
+        "fetch",
+        "cancel",
+        "job_details",
+        "jobs",
+        "revise_script",
+        "check_submission",
+    ]
     workflow.endpoint["capabilities"] = every
     if probe == "older-release":
         # A compatible HPC copy from an earlier release is not a warning.
@@ -1432,6 +1448,140 @@ def test_run_again_archives_receipt_and_prepares_without_submitting(workflow):
     assert [e["status"] for e in reruns] == ["approved", "prepared"]
 
 
+def resource_events(workflow):
+    workflow.controller.execute("close")
+    return [
+        e["payload"]["status"]
+        for e in workflow.controller.journal.take()
+        if e["event_type"] == "desktop_resources"
+    ]
+
+
+def test_cpus_and_memory_change_prepares_a_new_handoff_without_submitting(workflow):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    receipt_path = w.paths[0].with_suffix(".gjf.inkly.json")
+    original = receipt_path.read_bytes()
+    w.calls.clear()
+    w.events.clear()
+    w.controller.change_resources(
+        [w.paths[0]], w.paths, SETTINGS, {"cpus": 8, "memory_mib": 16384}
+    )
+    archives = list(w.paths[0].parent.glob("sample_1.gjf.inkly.json.resources-*.bak"))
+    assert len(archives) == 1 and archives[0].read_bytes() == original
+    new_receipt = json.loads(receipt_path.read_text())
+    assert new_receipt["bundle"] != json.loads(original)["bundle"]
+    resources = w.records[new_receipt["bundle"]]["resources"]
+    assert (resources["cpus"], resources["slurm_memory_mib"]) == (8, 16384)
+    assert resources["cpus_source"] == "explicit override"
+    assert "submit" not in actions(w)
+    assert actions(w)[:2] == ["status", "prepare"]
+    assert actions(w).count("prepare") == 1
+    assert w.controller.review()["count"] == 2
+    assert rows_for(w, w.paths[0])[-1]["resources"]["cpus"] == 8
+    assert any(
+        "now 8 CPUs, 16 GB Slurm memory (was 2 CPUs, 1 GB Slurm memory). "
+        "Nothing was submitted." in text
+        for text in messages(w)
+    )
+    assert resource_events(w) == ["approved", "prepared"]
+
+
+def test_a_blank_value_keeps_an_earlier_choice(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 8, "memory_mib": None}
+    )
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": None, "memory_mib": 4096}
+    )
+    bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    resources = w.records[bundle]["resources"]
+    assert (resources["cpus"], resources["slurm_memory_mib"]) == (8, 4096)
+    assert len(list(w.paths[0].parent.glob("*.resources-*.bak"))) == 2
+
+
+def test_unchanged_resources_prepare_nothing(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.calls.clear()
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 2, "memory_mib": 1024}
+    )
+    assert "prepare" not in actions(w)
+    assert not list(w.paths[0].parent.glob("*.resources-*.bak"))
+    assert any("it was left as it is" in text for text in messages(w))
+    assert resource_events(w) == []
+
+
+@pytest.mark.parametrize(
+    "state", ["PENDING", "RUNNING", "COMPLETED", "CANCELLED by 1000", "UNKNOWN"]
+)
+def test_only_unsubmitted_jobs_get_new_cpus_and_memory(workflow, state):
+    w = workflow
+    w.controller.preview(w.paths, SETTINGS)
+    receipt_path = w.paths[1].with_suffix(".gjf.inkly.json")
+    original = receipt_path.read_bytes()
+    recorded_job(w, w.paths[1], state, "2")
+    w.calls.clear()
+    with pytest.raises(ValueError, match="Only jobs that have not been submitted"):
+        w.controller.change_resources(w.paths, w.paths, SETTINGS, {"cpus": 8})
+    assert receipt_path.read_bytes() == original
+    assert not list(w.paths[0].parent.glob("*.resources-*.bak"))
+    assert "prepare" not in actions(w) and "submit" not in actions(w)
+
+
+def test_an_edited_input_must_run_again_before_its_resources_change(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.paths[0].write_bytes(w.paths[0].read_bytes() + b"\n")
+    w.calls.clear()
+    with pytest.raises(ValueError, match="Choose Run again to prepare the edited file"):
+        w.controller.change_resources(w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 8})
+    assert "prepare" not in actions(w)
+
+
+@pytest.mark.parametrize(
+    "changes", [{"cpus": 0}, {"memory_mib": 100}, {}, {"hours": 4}]
+)
+def test_invalid_resource_changes_are_refused_before_connecting(workflow, changes):
+    w = workflow
+    with pytest.raises(ValueError):
+        w.controller.change_resources(w.paths[:1], w.paths[:1], SETTINGS, changes)
+    assert not w.connections and not w.calls
+
+
+def test_run_again_keeps_the_cpus_and_memory_chosen_for_the_earlier_job(workflow):
+    w = workflow
+    w.controller.preview(w.paths[:1], SETTINGS)
+    w.controller.change_resources(
+        w.paths[:1], w.paths[:1], SETTINGS, {"cpus": 8, "memory_mib": None}
+    )
+    recorded_job(w, w.paths[0], "FAILED", "7")
+    w.events.clear()
+    w.controller.rerun(w.paths[:1], w.paths[:1], SETTINGS)
+    bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    resources = w.records[bundle]["resources"]
+    assert resources["cpus"] == 8 and resources["cpus_source"] == "explicit override"
+    assert resources["memory_source"] == "TENSOR export plus cluster headroom"
+    assert any(
+        "keeping the 8 CPUs chosen for its earlier job" in text for text in messages(w)
+    )
+
+
+def test_cpus_and_memory_can_change_while_watching(workflow):
+    w = workflow
+    assert "change_resources" in w.controller.WATCH_REQUESTS
+    w.controller.execute("preview", w.paths, SETTINGS)
+    w.controller.execute(
+        "change_resources", [w.paths[0]], w.paths, SETTINGS, {"memory_mib": 2048}
+    )
+    bundle = json.loads(w.paths[0].with_suffix(".gjf.inkly.json").read_text())["bundle"]
+    assert w.records[bundle]["resources"]["slurm_memory_mib"] == 2048
+    assert "submit" not in actions(w)
+
+
 @pytest.mark.parametrize(
     "state, advice",
     [
@@ -2352,6 +2502,7 @@ def test_native_job_history_filters_and_adds_selected_jobs(
             hpc_job("e" * 32, "COMPLETED", "old.gjf", ended_days=60),
         ]
         w.endpoint["jobs"][1]["submitted_at"] = w.endpoint["jobs"][1]["ended_at"]
+        w.endpoint["jobs"][1]["script_edited"] = True
         # Well away from the 30-day boundary, so the clock tick cannot matter.
         w.endpoint["jobs"][3]["submitted_at"] = w.endpoint["jobs"][3]["ended_at"]
         app.history_button.invoke()
@@ -2360,6 +2511,8 @@ def test_native_job_history_filters_and_adds_selected_jobs(
         # Default view: finished and cancelled jobs from the last 30 days.
         assert table.get_children() == ("b" * 32, "a" * 32)
         assert "Showing 2 of 4" in app.history_summary.cget("text")
+        assert table.item("a" * 32)["values"][1] == "water.gjf (edited script)"
+        assert table.item("b" * 32)["values"][1] == "ethanol.gjf"
         assert str(tmp_path / "copies") in app.copies_label.cget("text")
         app.history_state.set("All")
         app.history_period.set("All time")
@@ -3017,6 +3170,143 @@ def test_release_versions_compare_by_number(version, than, older):
 GUI_RELEASE = {"version": "0.6.0", "commit": "f" * 40}
 
 
+@native_display
+def test_native_cpus_and_memory_follow_prepared_selected_rows(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w = workflow
+    first, second = (str(path) for path in w.paths)
+
+    def show(path, **changes):
+        app.events.put(("row", {**app.rows[path], **changes}))
+        app.drain()
+
+    def state():
+        app.buttons()
+        return str(app.resources_button["state"])
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        assert state() == "disabled"  # Nothing selected.
+        app.table.selection_set(first)
+        assert state() == "normal"
+        show(first, input_changed=True)
+        assert state() == "disabled"
+        show(first, input_changed=False, state="PENDING", job_id="123")
+        assert state() == "disabled"
+        show(first, state="PREPARED", job_id="")
+        assert state() == "normal"
+
+        scheduled, asked, questions = [], [], []
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+        monkeypatch.setattr(app, "ask_resources", lambda rows: asked.append(rows))
+        app.resources_button.invoke()
+        assert [row["name"] for row in asked[-1]] == ["sample_1.gjf"]
+        assert not scheduled  # Cancelled.
+        changes = {"cpus": 8, "memory_mib": None}
+        monkeypatch.setattr(app, "ask_resources", lambda rows: dict(changes))
+        app.resources_button.invoke()
+        expected = ("change_resources", [first], [first, second], SETTINGS, changes)
+        assert scheduled == [expected]
+
+        # An edited job script is only discarded after an explicit yes.
+        show(first, script_edited=True)
+
+        def answer(value):
+            def ask(title, text, **kwargs):
+                questions.append((title, text, kwargs.get("default")))
+                return value
+
+            return ask
+
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.resources_button.invoke()
+        assert len(scheduled) == 1
+        assert questions[-1][0] == "Discard script edits?"
+        assert "sample_1.gjf" in questions[-1][1] and questions[-1][2] == "no"
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(True))
+        app.resources_button.invoke()
+        assert scheduled[-1] == expected
+
+        # While watching, the change goes to the watch on its open connection.
+        show(first, script_edited=False)
+        requests = []
+        monkeypatch.setattr(
+            w.controller, "request", lambda *args: requests.append(args)
+        )
+        app.busy, app.action = True, "submit"
+        assert state() == "normal"
+        app.resources_button.invoke()
+        assert requests == [expected]
+        assert len(scheduled) == 2
+    finally:
+        app.busy = False
+        app.close()
+
+
+@native_display
+def test_native_cpus_and_memory_window_reads_and_checks_values(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    row = {"name": "a.gjf", "resources": {"cpus": 4, "slurm_memory_mib": 7680}}
+    try:
+        dialog, values, _, buttons, result = app.resources_dialog([row])
+        assert dialog.title() == "CPUs and memory"
+        assert (values["cpus"].get(), values["memory"].get()) == ("4", "7.5")
+        buttons["apply"].invoke()  # Nothing changed: the window stays open.
+        assert result["changes"] is None and dialog.winfo_exists()
+        values["cpus"].set("eight")
+        buttons["apply"].invoke()
+        assert result["changes"] is None and dialog.winfo_exists()
+        values["cpus"].set("8")
+        values["memory"].set("16 GB")
+        buttons["apply"].invoke()
+        assert result["changes"] == {"cpus": 8, "memory_mib": 16384}
+        assert not dialog.winfo_exists()
+
+        # Rows with different values start blank; Cancel changes nothing.
+        other = {"name": "b.gjf", "resources": {"cpus": 2, "slurm_memory_mib": 7680}}
+        dialog, values, _, buttons, result = app.resources_dialog([row, other])
+        assert (values["cpus"].get(), values["memory"].get()) == ("", "7.5")
+        buttons["cancel"].invoke()
+        assert result["changes"] is None and not dialog.winfo_exists()
+    finally:
+        app.close()
+
+
+@native_display
+@pytest.mark.parametrize(
+    "cpus, memory, expected",
+    [
+        ("8", "", {"cpus": 8, "memory_mib": None}),
+        (" 8 ", "1.5", {"cpus": 8, "memory_mib": 1536}),
+        ("", "16gb", {"cpus": None, "memory_mib": 16384}),
+        ("4", "7.5", "Change the CPUs, the memory or both first"),
+        ("", "", "Change the CPUs, the memory or both first"),
+        ("8.5", "", "CPUs must be a whole number"),
+        ("", "-2", "Memory must be a number of GB"),
+        ("", "nan", "Memory must be a number of GB"),
+        ("", "0.5", "Memory must be from 1 to 4096 GB"),
+        ("2000", "", "CPUs must be a whole number from 1 to 1024"),
+    ],
+)
+def test_native_resource_entries_are_parsed_in_gb(cpus, memory, expected):
+    import tensor_desktop as gui
+
+    prefill = {"cpus": "4", "memory": "7.5"}
+    if isinstance(expected, dict):
+        assert gui.parse_resource_entries(cpus, memory, prefill) == expected
+    else:
+        with pytest.raises(ValueError, match=expected):
+            gui.parse_resource_entries(cpus, memory, prefill)
+
+
 def setup_window(workflow, tmp_path, monkeypatch):
     """A Desktop window whose message boxes fail fast and whose dialogs never wait."""
     import tkinter as tk
@@ -3039,6 +3329,96 @@ def setup_window(workflow, tmp_path, monkeypatch):
 
 def activity(app):
     return app.activity.get("1.0", "end")
+
+
+@native_display
+def test_native_release_notice_and_connection_preference(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    monkeypatch.delenv("INKLY_DESKTOP_UPDATE_CHECK", raising=False)
+    opened = []
+    monkeypatch.setattr(gui.webbrowser, "open", lambda url: opened.append(url) or True)
+    try:
+        assert app.check_releases.get() is True
+        assert app.release_worker is None  # Unpackaged source and tests stay offline.
+        assert app.release_notice.winfo_manager() != "pack"
+        release = gui.updates.release_info("desktop-v99.0.0")
+        app.events.put(("release", release))
+        app.drain()
+        assert app.release_notice.winfo_manager() == "pack"
+        assert app.release_notice.master is app.banner
+        assert "99.0.0 is available" in app.release_notice.cget("text")
+        assert "99.0.0 is available" in activity(app)
+        assert app.open_release() == "break"
+        assert opened == [release["url"]]
+
+        # Preferences can be changed without saving HPC credentials.
+        app.configure()
+        assert app.release_check_button.cget("text") == "Check for new Desktop releases"
+        app.release_check_button.invoke()
+        assert not gui.preferences.load(tmp_path, gui.updates.PREFERENCE)
+        assert gui.notify.load_preference(tmp_path)
+        assert app.release_notice.winfo_manager() != "pack"
+        app.events.put(("release", release))  # An already-running check finished.
+        app.drain()
+        assert app.release_notice.winfo_manager() != "pack"
+        assert app.open_release() == "break" and len(opened) == 1
+        app.notify_jobs.set(False)
+        app.save_notify_choice()
+        app.release_check_button.invoke()
+        assert gui.preferences.load(tmp_path, gui.updates.PREFERENCE)
+        assert not gui.notify.load_preference(tmp_path)
+    finally:
+        app.close()
+
+
+@native_display
+def test_native_release_check_runs_in_background_and_respects_saved_choice(
+    workflow, tmp_path, monkeypatch
+):
+    import tkinter as tk
+    import tensor_desktop as gui
+
+    monkeypatch.delenv("INKLY_DESKTOP_UPDATE_CHECK", raising=False)
+    calls = []
+    release = gui.updates.release_info("desktop-v99.0.0")
+    monkeypatch.setattr(
+        gui.updates, "check", lambda path: calls.append(path) or release
+    )
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+        check_updates=True,
+    )
+    try:
+        assert app.release_worker is not None
+        app.release_worker.join(timeout=2)
+        app.drain()
+        assert calls == [tmp_path]
+        assert app.release_url == release["url"]
+        app.check_releases.set(False)
+        app.save_release_choice()
+    finally:
+        app.close()
+
+    root = tk.Tk()
+    root.withdraw()
+    app = gui.DesktopApp(
+        root,
+        controller_factory=lambda emit, askpass: workflow.controller,
+        settings_path=tmp_path / "gui-settings.json",
+        check_updates=True,
+    )
+    try:
+        assert not app.check_releases.get()
+        assert app.release_worker is None
+        assert calls == [tmp_path]
+    finally:
+        app.close()
 
 
 @native_display
@@ -3383,4 +3763,689 @@ def test_native_framed_sections_and_checkboxes_match_the_window(
         for name in ("TLabelframe", "TLabelframe.Label", "TCheckbutton"):
             assert styled[name]["background"] == window, name
     finally:
+        app.close()
+
+
+@native_display
+def test_native_watched_jobs_that_finish_notify_once_per_check(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w = workflow
+    first, second = (str(path) for path in w.paths)
+    shown, in_front = [], {"value": False}
+    monkeypatch.setattr(
+        app.notifier,
+        "show",
+        lambda title, text, warning=False: shown.append((title, text, warning)),
+    )
+    monkeypatch.setattr(app.notifier, "foreground", lambda: in_front["value"])
+
+    def rows(*changes):
+        for path, state in changes:
+            job = "1" if path == first else "2"
+            app.events.put(("row", {**app.rows[path], "state": state, "job_id": job}))
+        app.drain()
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        assert app.notify_jobs.get() is True  # On unless turned off.
+        # Not watching: a finished state shown by a preview or a load is quiet.
+        rows((first, "RETURNED"))
+        assert shown == []
+
+        app.busy, app.action = True, "monitor"
+        rows((first, "RUNNING"), (second, "RUNNING"))
+        assert shown == []
+        rows((first, "RETURNED"), (second, "OUT_OF_MEMORY"))
+        assert len(shown) == 1  # One notification for the whole check.
+        title, text, warning = shown[0]
+        assert title == "Inkly: 1 returned and 1 ended without a result"
+        assert "Returned: sample_1.gjf" in text
+        assert "No result: sample_2.gjf (OUT_OF_MEMORY)" in text
+        assert "All watched jobs are done." in text and warning
+        rows((first, "RETURNED"))  # The same state again is not news.
+        assert len(shown) == 1
+
+        # With Desktop in front, the table already shows it.
+        rows((first, "RUNNING"))
+        in_front["value"] = True
+        rows((first, "RETURNED"))
+        assert len(shown) == 1
+
+        # Turned off, nothing is shown, and the choice is kept for next time.
+        in_front["value"] = False
+        app.notify_jobs.set(False)
+        app.save_notify_choice()
+        rows((first, "RUNNING"))
+        rows((first, "RETURNED"))
+        assert len(shown) == 1
+        assert gui.notify.load_preference(tmp_path) is False
+    finally:
+        app.busy = False
+        app.close()
+
+
+EDITED_SCRIPT = (
+    "#!/bin/bash\n#SBATCH --cpus-per-task=4\n#SBATCH --time=3:00:00\nhostname\n"
+)
+
+
+def script_endpoint(workflow):
+    """Imitate revise_script on the preview's session; records what was sent."""
+    workflow.endpoint["capabilities"].append("revise_script")
+    sent = []
+    session = workflow.controller.session
+    original = session.exchange
+
+    def exchange(request, *, receipt):
+        if request["action"] != "revise_script":
+            return original(request, receipt=receipt)
+        workflow.calls.append((receipt["bundle"], "revise_script"))
+        sent.append(request)
+        record = workflow.records[receipt["bundle"]]
+        if "REFUSE" in request["script"]:
+            raise backend.bridge.RemoteRefusal(
+                "Slurm would refuse this script: Invalid partition name specified"
+            )
+        if request["expected_sha256"] != record["script_sha256"]:
+            raise backend.bridge.RemoteRefusal(
+                "The script changed since it was opened; open View script again"
+            )
+        generated = record.get("generated_script") or record["script"]
+        edited = request["script"] != generated
+        record.update(
+            script=request["script"],
+            script_sha256=hashlib.sha256(request["script"].encode()).hexdigest(),
+            script_edited=edited,
+            generated_script=generated,
+        )
+        if edited:
+            record["script_resources"] = {
+                "cpus": 4,
+                "slurm_memory_mib": None,
+                "time_limit": "3:00:00",
+                "hours": 3,
+                "partition": None,
+            }
+        else:
+            record.pop("script_resources", None)
+        return {
+            **record,
+            "resources": dict(record["resources"]),
+            "warnings": ["Inkly no longer writes Gaussian's output to sample_1.log."]
+            if edited
+            else [],
+        }
+
+    session.exchange = exchange
+    return sent
+
+
+def script_results(workflow):
+    return [data for kind, data in workflow.events if kind == "script_result"]
+
+
+def test_saved_script_updates_row_review_and_submits_on_one_connection(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    review = c.review_id
+    sent = script_endpoint(workflow)
+    c.revise_script(str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    assert sent[0]["script"] == EDITED_SCRIPT and sent[0]["expected_sha256"] == "abc"
+    result = script_results(workflow)[-1]
+    assert result["status"] == "saved" and result["edited"] is True
+    assert "sample_1.log" in result["warnings"][0]
+    row = rows_for(workflow, path)[-1]
+    assert row["script_edited"] is True
+    assert row["resources"]["cpus"] == 4
+    assert row["resources"]["slurm_memory_mib"] is None
+    assert row["resources"]["hours"] == 3
+    # The approval now shows what the edited script asks for.
+    latest = [data for kind, data in workflow.events if kind == "review"][-1]
+    assert c.review_id == review == latest["id"]
+    assert latest["cpus"] == 4 + 2
+    assert latest["memory_mib"] == 1024 and latest["memory_unknown"] == 1
+    assert "1 warning(s)" in messages(workflow)[-1]
+    assert "Nothing was submitted" in messages(workflow)[-1]
+    assert "submit" not in actions(workflow)
+    c.submit(review, True, watch=False)
+    assert "with your edited job script" in " ".join(messages(workflow))
+    assert len(workflow.connections) == 1
+
+
+def test_refused_script_keeps_connection_preview_and_receipt(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    review, sidecar = c.review_id, path.with_suffix(".gjf.inkly.json").read_bytes()
+    script_endpoint(workflow)
+    c.execute("revise_script", str(path), "#!/bin/bash\n# REFUSE\n", "abc", SETTINGS)
+    result = script_results(workflow)[-1]
+    assert result == {
+        "path": str(path),
+        "status": "refused",
+        "message": "Slurm would refuse this script: Invalid partition name specified",
+    }
+    assert not [kind for kind, _ in workflow.events if kind == "error"]
+    assert c.session is not None and c.review_id == review
+    assert path.with_suffix(".gjf.inkly.json").read_bytes() == sidecar
+    c.execute("revise_script", str(path), EDITED_SCRIPT, "stale", SETTINGS)
+    assert "open View script again" in script_results(workflow)[-1]["message"]
+    assert len(workflow.connections) == 1
+
+
+def test_older_hpc_copy_is_told_to_update_and_nothing_is_sent(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    sent = script_endpoint(workflow)
+    workflow.endpoint["capabilities"].remove("revise_script")
+    c.revise_script(str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    assert script_results(workflow)[-1]["status"] == "unsupported"
+    assert "Update Inkly on the HPC" in script_results(workflow)[-1]["message"]
+    assert sent == [] and "revise_script" not in actions(workflow)
+
+
+def test_submitted_job_script_is_never_sent(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    sent = script_endpoint(workflow)
+    c.submit(c.review_id, True, watch=False)
+    c.revise_script(str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    result = script_results(workflow)[-1]
+    assert result["status"] == "refused" and "not been submitted" in result["message"]
+    assert sent == []
+
+
+def test_script_save_while_watching_uses_the_watch_session(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    script_endpoint(workflow)
+    c.request("revise_script", str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    assert c.handle_requests() is True
+    assert script_results(workflow)[-1]["status"] == "saved"
+    assert len(workflow.connections) == 1
+
+
+def test_reset_restores_generated_script_and_prepared_resources(workflow):
+    c, path = workflow.controller, workflow.paths[0]
+    c.preview(workflow.paths, SETTINGS)
+    script_endpoint(workflow)
+    c.revise_script(str(path), EDITED_SCRIPT, "abc", SETTINGS)
+    saved = script_results(workflow)[-1]
+    c.revise_script(
+        str(path), saved["generated_script"], saved["script_sha256"], SETTINGS
+    )
+    result = script_results(workflow)[-1]
+    assert result["status"] == "saved" and result["edited"] is False
+    row = rows_for(workflow, path)[-1]
+    assert row["script_edited"] is False
+    assert row["resources"]["cpus"] == 2 and row["resources"]["hours"] == 2
+    assert "Restored the generated job script" in messages(workflow)[-1]
+
+
+def test_edited_script_wording_for_review_and_submit():
+    import tensor_desktop_status as wording
+
+    job = {"cpus": 4, "slurm_memory_mib": None, "hours": None, "script_edited": True}
+    assert wording.job_resources(job) == (
+        "4 CPUs, Slurm's default memory, the partition's time limit (edited script)"
+    )
+    plain = {"cpus": 2, "slurm_memory_mib": 2048, "hours": 3}
+    assert wording.job_resources(plain) == "2 CPUs, 2,048 MiB, 3 hour(s)"
+    review = {"count": 2, "cpus": 6, "memory_mib": 1024, "memory_unknown": 1}
+    assert "1 edited script(s) leave memory" in wording.review_overview(review)
+
+
+def test_script_files_and_differences_are_read_safely(tmp_path):
+    import tensor_desktop_status as job_script
+
+    good = tmp_path / "mine.sh"
+    good.write_bytes(b"\xef\xbb\xbf#!/bin/bash\r\nhostname\r\n")
+    assert job_script.read_script_file(good) == "#!/bin/bash\nhostname\n"
+    big = tmp_path / "big.sh"
+    big.write_bytes(b"#" * (64 * 1024 + 1))
+    with pytest.raises(ValueError, match="64 KiB"):
+        job_script.read_script_file(big)
+    binary = tmp_path / "binary.sh"
+    binary.write_bytes(b"\xff\xfe\x00")
+    with pytest.raises(ValueError, match="UTF-8"):
+        job_script.read_script_file(binary)
+    diff = job_script.diff_text("a\nb\n", "a\nc")
+    assert "-b\n" in diff and "+c\n" in diff
+    assert "No differences" in job_script.diff_text("a\n", "a\n")
+    row = {"state": "PREPARED", "script_sha256": "abc"}
+    assert job_script.editable(row)
+    assert not job_script.editable({**row, "input_changed": True})
+    assert not job_script.editable({**row, "state": "RUNNING"})
+    assert not job_script.editable({"state": "PREPARED"})
+
+
+@native_display
+def test_native_script_window_warns_once_saves_loads_and_resets(
+    workflow, tmp_path, monkeypatch
+):
+    import tensor_desktop_script as job_script
+
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first = workflow, str(workflow.paths[0])
+    questions = []
+
+    def ask(title, text, **kwargs):
+        questions.append((title, text, kwargs.get("default")))
+        return True
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        sent = script_endpoint(w)
+        w.controller.emit = lambda kind, data: app.events.put((kind, data))
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.table.selection_set(first)
+        app.buttons()
+        app.script_button.invoke()
+        window = app.script_window
+        assert window.current() == "# synthetic SBATCH"
+        assert str(window.edit_button["state"]) == "normal"
+        assert str(window.save_button["state"]) == "disabled"
+        assert str(window.reset_button["state"]) == "disabled"
+
+        monkeypatch.setattr(job_script.messagebox, "askyesno", ask)
+        window.edit_button.invoke()
+        assert "sample_1.log" in questions[-1][1] and questions[-1][2] == "no"
+        assert str(window.save_button["state"]) == "normal"
+        window.set_text(EDITED_SCRIPT)
+        window.save_button.invoke()
+        assert window.review_window is not None
+        assert not sent  # Nothing reaches the HPC before the changes are confirmed.
+        window.confirm_button.invoke()
+        pump(app)
+        assert sent[-1]["script"] == EDITED_SCRIPT
+        findings = window.findings.get("1.0", "end-1c")
+        assert "sample_1.log" in findings and "Nothing was submitted" in findings
+        assert str(app.table.item(first)["values"][6]).endswith("(script edited)")
+        assert window.current() == EDITED_SCRIPT and not window.editing
+
+        # The warning is shown once per window; loading a file asks nothing more.
+        mine = tmp_path / "mine.sh"
+        mine.write_bytes(b"#!/bin/bash\r\nhostname\r\n")
+        monkeypatch.setattr(
+            job_script.filedialog, "askopenfilename", lambda **k: str(mine)
+        )
+        asked = len(questions)
+        window.load_button.invoke()
+        assert len(questions) == asked
+        assert window.current() == "#!/bin/bash\nhostname\n"
+
+        # Reset to generated replaces the saved edit on the HPC once confirmed.
+        window.reset_button.invoke()
+        pump(app)
+        assert questions[-1][0] == "Reset to generated"
+        assert sent[-1]["script"] == "# synthetic SBATCH"
+        assert window.current() == "# synthetic SBATCH"
+        assert "edited" not in str(app.table.item(first)["values"][6])
+        assert "Restored" in window.findings.get("1.0", "end-1c")
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+@native_display
+def test_native_refused_script_keeps_text_and_connection(
+    workflow, tmp_path, monkeypatch
+):
+    import tensor_desktop_script as job_script
+
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first = workflow, str(workflow.paths[0])
+    questions = []
+
+    def answer(value):
+        def ask(title, text, **kwargs):
+            questions.append((title, text))
+            return value
+
+        return ask
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        script_endpoint(w)
+        w.controller.emit = lambda kind, data: app.events.put((kind, data))
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.table.selection_set(first)
+        app.buttons()
+        app.script_button.invoke()
+        window = app.script_window
+        monkeypatch.setattr(job_script.messagebox, "askyesno", answer(True))
+        window.edit_button.invoke()
+        window.set_text("#!/bin/bash\n# REFUSE\n")
+        window.save_button.invoke()
+        window.confirm_button.invoke()
+        pump(app)
+        assert "Invalid partition name" in window.findings.get("1.0", "end-1c")
+        assert window.current() == "#!/bin/bash\n# REFUSE\n" and window.editing
+        assert "was not saved" in activity(app)
+        assert w.controller.session is not None
+
+        # Closing with unsaved changes asks first; "no" keeps the window open.
+        monkeypatch.setattr(job_script.messagebox, "askyesno", answer(False))
+        window.close()
+        assert app.script_window is window and window.exists()
+        monkeypatch.setattr(job_script.messagebox, "askyesno", answer(True))
+        window.close()
+        assert app.script_window is None
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+def test_job_details_mark_an_edited_script():
+    import tensor_desktop_status as wording
+
+    details = wording.job_details_text(
+        {"name": "sample.gjf", "state": "COMPLETED", "script_edited": True}
+    )
+    assert "Job script: edited by you before submitting" in details
+    assert "edited" not in wording.job_details_text(
+        {"name": "sample.gjf", "state": "COMPLETED"}
+    )
+
+
+@native_display
+def test_native_run_again_says_edited_scripts_are_not_carried_over(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first = workflow, str(workflow.paths[0])
+    questions = []
+
+    def answer(value):
+        def ask(title, text, **kwargs):
+            questions.append((title, text))
+            return value
+
+        return ask
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.table.selection_set(first)
+        # Run again on a job whose script was edited says the edits stay behind.
+        app.events.put(
+            (
+                "row",
+                {
+                    **app.rows[first],
+                    "state": "CANCELLED by 1000",
+                    "script_edited": True,
+                },
+            )
+        )
+        app.drain()
+        app.buttons()
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.rerun_button.invoke()
+        assert not [e for e in w.events if e[0] == "error"]
+        assert "EDITED JOB SCRIPT: sample_1.gjf was" in questions[-1][1]
+        assert "not carried over" in questions[-1][1]
+        app.table.selection_set(str(w.paths[1]))
+        app.events.put(
+            ("row", {**app.rows[str(w.paths[1])], "state": "CANCELLED by 1000"})
+        )
+        app.drain()
+        app.buttons()
+        app.rerun_button.invoke()
+        assert "EDITED JOB SCRIPT" not in questions[-1][1]
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+@native_display
+def test_native_saved_script_edit_makes_cpus_and_memory_ask_once(
+    workflow, tmp_path, monkeypatch
+):
+    """A script saved through View script reaches #60's discard prompt."""
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first, second = workflow, *(str(path) for path in workflow.paths)
+    questions, scheduled = [], []
+
+    def answer(value):
+        def ask(title, text, **kwargs):
+            questions.append((title, text, kwargs.get("default")))
+            return value
+
+        return ask
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        script_endpoint(w)
+        w.controller.revise_script(first, EDITED_SCRIPT, "abc", SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        assert app.rows[first]["script_edited"] is True
+        assert app.rows[second]["script_edited"] is False
+        changes = {"cpus": 8, "memory_mib": None}
+        monkeypatch.setattr(app, "ask_resources", lambda rows: dict(changes))
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+        app.table.selection_set(first)
+        app.buttons()
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.resources_button.invoke()
+        # One prompt, defaulting to No; nothing is prepared again.
+        assert [question[0] for question in questions] == ["Discard script edits?"]
+        assert "sample_1.gjf" in questions[0][1] and questions[0][2] == "no"
+        assert scheduled == []
+        # An unedited row is changed without that prompt.
+        app.table.selection_set(second)
+        app.buttons()
+        app.resources_button.invoke()
+        assert len(questions) == 1
+        assert scheduled == [
+            ("change_resources", [second], [first, second], SETTINGS, changes)
+        ]
+    finally:
+        app.busy, app.action = False, None
+        app.close()
+
+
+def submission_endpoint(workflow, refuse=(), outcomes=None):
+    """Imitate submit refusals and check_submission on the preview's session."""
+    workflow.endpoint["capabilities"].append("check_submission")
+    session = workflow.controller.session
+    original = session.exchange
+    names = {bundle: record["name"] for bundle, record in workflow.records.items()}
+
+    def exchange(request, *, receipt):
+        bundle = receipt["bundle"]
+        record = workflow.records[bundle]
+        if request["action"] == "submit" and names[bundle] in refuse:
+            workflow.calls.append((bundle, "submit"))
+            record.update(submission="PREPARED", state="PREPARED")
+            raise ValueError(
+                f"{backend.SLURM_REFUSED}: Invalid account or account/partition "
+                "combination specified. It is still prepared; change it and submit "
+                "again."
+            )
+        if request["action"] == "check_submission":
+            workflow.calls.append((bundle, "check_submission"))
+            assert request["reopen"] is True
+            outcome = (outcomes or {})[names[bundle]]
+            if isinstance(outcome, Exception):
+                raise outcome
+            if outcome == "found":
+                record.update(submission="SUBMITTED", state="PENDING", job_id="77")
+            else:
+                record.update(submission="PREPARED", state="PREPARED")
+            return {
+                **record,
+                "resources": dict(record["resources"]),
+                "found": outcome == "found",
+            }
+        return original(request, receipt=receipt)
+
+    session.exchange = exchange
+
+
+def test_refused_submission_is_prepared_again_and_others_still_submit(workflow):
+    from inkly.gaussian import submission
+
+    assert backend.SLURM_REFUSED == submission.REFUSED
+    c, first, second = workflow.controller, *workflow.paths
+    c.preview(workflow.paths, SETTINGS)
+    submission_endpoint(workflow, refuse={"sample_1.gjf"})
+    c.submit(c.review_id, True, watch=False)
+    assert rows_for(workflow, first)[-1]["state"] == "PREPARED"
+    assert rows_for(workflow, second)[-1]["state"] == "SUBMITTED"
+    text = " ".join(messages(workflow))
+    assert "sample_1.gjf: Slurm refused the job, so nothing was submitted" in text
+    assert "Submitted sample_2.gjf: job 123" in text
+    notices = [data for kind, data in workflow.events if kind == "notice"]
+    assert "Slurm refused 1 job(s)" in notices[-1] and "sample_1.gjf" in notices[-1]
+    assert not [kind for kind, _ in workflow.events if kind == "error"]
+    assert c.review_id is None  # Submitting again needs a new preview.
+    assert len(workflow.connections) == 1
+
+
+def test_other_submission_failures_still_stop(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    session = c.session
+    original = session.exchange
+
+    def exchange(request, *, receipt):
+        if request["action"] == "submit":
+            raise ValueError(
+                "Submission unconfirmed; inspect squeue before any new attempt"
+            )
+        return original(request, receipt=receipt)
+
+    session.exchange = exchange
+    with pytest.raises(ValueError, match="Submission unconfirmed"):
+        c.submit(c.review_id, True, watch=False)
+    assert not [kind for kind, _ in workflow.events if kind == "notice"]
+
+
+def unconfirmed_rows(workflow):
+    for record in workflow.records.values():
+        record.update(submission="SUBMISSION_UNKNOWN", state="SUBMISSION_UNKNOWN")
+
+
+def test_check_submissions_records_found_jobs_and_reopens_the_rest(workflow):
+    c, first, second = workflow.controller, *workflow.paths
+    c.preview(workflow.paths, SETTINGS)
+    submission_endpoint(
+        workflow, outcomes={"sample_1.gjf": "found", "sample_2.gjf": "reopened"}
+    )
+    unconfirmed_rows(workflow)
+    paths = [str(path) for path in workflow.paths]
+    c.check_submissions(paths, paths, SETTINGS)
+    assert [a for _, a in workflow.calls].count("check_submission") == 2
+    assert "submit" not in actions(workflow)
+    text = " ".join(messages(workflow))
+    assert "sample_1.gjf: found job 77, so it was submitted after all" in text
+    assert "sample_2.gjf: no job was found" in text and "prepared again" in text
+    assert rows_for(workflow, first)[-1]["state"] == "PENDING"
+    assert rows_for(workflow, second)[-1]["state"] == "PREPARED"
+    # The list is read again, so the reopened file can be approved and submitted.
+    assert c.review_id and c.review()["count"] == 1
+    assert len(workflow.connections) == 1
+
+
+def test_check_submissions_too_soon_changes_nothing_and_continues(workflow):
+    c = workflow.controller
+    c.preview(workflow.paths, SETTINGS)
+    later = ValueError(
+        "The submission was attempted less than 2 minutes ago; check again in a "
+        "few minutes"
+    )
+    submission_endpoint(
+        workflow, outcomes={"sample_1.gjf": later, "sample_2.gjf": "reopened"}
+    )
+    unconfirmed_rows(workflow)
+    paths = [str(path) for path in workflow.paths]
+    c.check_submissions(paths, paths, SETTINGS)
+    text = " ".join(messages(workflow))
+    assert "sample_1.gjf: The submission was attempted less than 2 minutes ago" in text
+    assert "sample_2.gjf: no job was found" in text
+
+
+def test_check_submissions_refuses_other_rows_and_old_hpc_copies(workflow):
+    c, first = workflow.controller, str(workflow.paths[0])
+    c.preview(workflow.paths, SETTINGS)
+    with pytest.raises(ValueError, match="only a submission Desktop could not confirm"):
+        c.check_submissions([first], [first], SETTINGS)
+    unconfirmed_rows(workflow)
+    with pytest.raises(ValueError, match="too old to check unconfirmed"):
+        c.check_submissions([first], [first], SETTINGS)
+    assert "check_submission" not in actions(workflow)
+
+
+def test_unconfirmed_wording_points_to_run_again():
+    import tensor_desktop_status as wording
+
+    rows = [{"path": "a", "name": "a.gjf", "state": "SUBMISSION_UNKNOWN"}]
+    text = wording.overview_text(None, rows)
+    assert "check your Slurm jobs before submitting again" in text
+    assert "choose Run again: Desktop looks for their jobs" in text
+    rows = [{"path": "a", "name": "a.gjf", "state": "UNKNOWN", "job_id": "5"}]
+    assert "Run again" not in wording.overview_text(None, rows)
+
+
+@native_display
+def test_native_run_again_on_unconfirmed_rows_checks_after_a_warning(
+    workflow, tmp_path, monkeypatch
+):
+    gui, app = setup_window(workflow, tmp_path, monkeypatch)
+    w, first, second = workflow, *(str(path) for path in workflow.paths)
+    questions, scheduled = [], []
+
+    def answer(value):
+        def ask(title, text, **kwargs):
+            questions.append((title, text, kwargs.get("default")))
+            return value
+
+        return ask
+
+    try:
+        app.add_paths(w.paths)
+        w.controller.preview(w.paths, SETTINGS)
+        for event in w.events:
+            app.events.put(event)
+        app.drain()
+        app.events.put(("row", {**app.rows[first], "state": "SUBMISSION_UNKNOWN"}))
+        app.drain()
+        monkeypatch.setattr(app, "start", lambda *args: scheduled.append(args))
+        app.table.selection_set(first)
+        app.buttons()
+        assert str(app.rerun_button["state"]) == "normal"
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(False))
+        app.rerun_button.invoke()
+        title, text, default = questions[-1]
+        assert title == "Check unconfirmed submissions" and default == "no"
+        assert "sample_1.gjf" in text and "would run a second one" in text
+        assert "Nothing is submitted by this step." in text
+        assert scheduled == []
+        monkeypatch.setattr(gui.messagebox, "askyesno", answer(True))
+        app.rerun_button.invoke()
+        assert scheduled == [("check_submissions", [first], [first, second], SETTINGS)]
+        # A mix of unconfirmed and prepared rows is neither check nor Run again.
+        app.table.selection_set(first, second)
+        app.buttons()
+        assert str(app.rerun_button["state"]) == "disabled"
+    finally:
+        app.busy, app.action = False, None
         app.close()
