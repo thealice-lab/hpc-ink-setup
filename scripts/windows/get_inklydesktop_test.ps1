@@ -8,16 +8,16 @@ param(
 )
 
 $repo = 'thealice-lab/hpc-ink-setup'
-$version = '0.6.1'
+$version = '0.6.2'
 $releaseTag = "desktop-v$version"
 $zipName = "InklyDesktop-$version-windows.zip"
 # Public release downloads need no GitHub sign-in and do not expire.
 $releaseUrl = "https://github.com/$repo/releases/tag/$releaseTag"
 $downloadUrl = "https://github.com/$repo/releases/download/$releaseTag/$zipName"
-$sourceCommit = 'de706ff6100f8872f4b0a024f13097d5bf1aac35'
+$sourceCommit = '5e222a52037f87725f1d7faa8a8aeea3a04dd031'
 $build = $version
 # InklyDesktop.exe SHA-256 from the release's SHA256SUMS.txt.
-$expectedSha = 'D20D38A8A424761E8AB30E5BFEC06BCD8CE7C92466235E87601AF1FE1ABE189A'
+$expectedSha = 'CB38D30336E5F9C3B6C265137E7181C7D0E98A4C3A4AF007A644F023664AD60E'
 
 function Assert-InklyExeHash([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
