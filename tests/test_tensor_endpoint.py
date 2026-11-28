@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 
 import pytest
@@ -552,3 +553,347 @@ def test_watch_status_reads_accounting_once_per_check(prepared, monkeypatch, sta
     monkeypatch.setattr(tensor, "_scheduler", scheduler)
     response = operate(prepared, "status")
     assert response["state"] == state and calls == ["sacct"]
+
+
+SINFO = "general*|7-00:00:00|64|256000\ndebug|1:00:00|8|16000\n"
+
+
+def script_checks(calls, refusal=None, sinfo=SINFO):
+    """Fake Slurm for script checks; --test-only never submits."""
+
+    def scheduler(args, directory):
+        calls.append(args)
+        if args[:2] == ["sbatch", "--test-only"]:
+            candidate = directory / args[-1]
+            assert candidate.name.startswith(".revise-")
+            assert candidate.stat().st_mode & 0o777 == 0o600
+            if isinstance(refusal, BaseException):
+                raise refusal
+            if isinstance(refusal, tuple):
+                return subprocess.CompletedProcess(args, 1, *refusal)
+            if refusal:
+                return subprocess.CompletedProcess(args, 1, "", refusal)
+            return subprocess.CompletedProcess(args, 0, "", "sbatch: Job 1 to start")
+        if args[0] == "sinfo":
+            if sinfo is None:
+                return subprocess.CompletedProcess(args, 1, "", "sinfo: error")
+            return subprocess.CompletedProcess(args, 0, sinfo, "")
+        raise AssertionError(f"unexpected Slurm call {args}")
+
+    return scheduler
+
+
+def revise(prepared, script, expected=None):
+    root, request, result = prepared
+    receipt = json.loads((root / request["bundle"] / "receipt.json").read_text())
+    return operate(
+        prepared,
+        "revise_script",
+        script=script,
+        expected_sha256=expected or receipt["script_sha256"],
+    )
+
+
+def test_revised_script_is_stored_checked_and_submitted(prepared, monkeypatch):
+    root, request, result = prepared
+    directory = root / request["bundle"]
+    generated = result["script"]
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    edited = generated.replace("--time=1:00:00", "--time=4:00:00").replace(
+        "#SBATCH --hint=nomultithread",
+        "#SBATCH --hint=nomultithread\n#SBATCH --mail-type=END",
+    )
+    response = revise(prepared, edited.replace("\n", "\r\n"))
+    assert response["script"] == edited
+    assert response["generated_script"] == generated
+    assert response["script_edited"] is True
+    assert response["state"] == "PREPARED"
+    assert response["script_resources"] == {
+        "cpus": 2,
+        "slurm_memory_mib": 1024,
+        "time_limit": "4:00:00",
+        "hours": 4,
+        "partition": "general",
+    }
+    assert response["resources"] == result["resources"]
+    assert response["warnings"] == []
+    assert calls[0] == [
+        "sbatch",
+        "--test-only",
+        "--comment=inkly:" + request["bundle"],
+        calls[0][-1],
+    ]
+    assert (directory / "job.sbatch").read_text() == edited
+    assert (directory / "job.sbatch.generated").read_text() == generated
+    assert not list(directory.glob(".revise-*"))
+    for path in directory.iterdir():
+        assert path.stat().st_mode & 0o777 == 0o600
+    saved = json.loads((directory / "receipt.json").read_text())
+    assert saved["script_sha256"] == hashlib.sha256(edited.encode()).hexdigest()
+    assert saved["generated_script_sha256"] == result["script_sha256"]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", saved["script_edited_at"])
+    status = operate(prepared, "status")
+    assert status["script"] == edited
+    assert status["generated_script"] == generated
+
+    submitted = []
+    monkeypatch.setattr(
+        tensor,
+        "_scheduler",
+        lambda args, d: (
+            submitted.append(args)
+            or subprocess.CompletedProcess(args, 0, "12345\n", "")
+        ),
+    )
+    assert operate(prepared, "submit", confirm=True)["job_id"] == "12345"
+    assert submitted == [
+        ["sbatch", "--parsable", "--comment=inkly:" + request["bundle"], "job.sbatch"]
+    ]
+
+
+def test_reset_to_generated_needs_no_slurm_and_clears_the_edit(prepared, monkeypatch):
+    root, request, result = prepared
+    directory = root / request["bundle"]
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    revise(prepared, result["script"].replace("--time=1:00:00", "--time=2:00:00"))
+    calls.clear()
+    response = revise(prepared, result["script"])
+    assert calls == []
+    assert response["script_edited"] is False
+    assert "script_resources" not in response
+    assert "script_edited_at" not in response
+    assert response["warnings"] == []
+    assert (directory / "job.sbatch").read_text() == result["script"]
+    assert "generated_script" not in operate(prepared, "status")
+
+
+def test_stale_copy_or_outside_change_is_refused(prepared, monkeypatch):
+    root, request, result = prepared
+    directory = root / request["bundle"]
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    edited = result["script"].replace("--time=1:00:00", "--time=2:00:00")
+    with pytest.raises(ValueError, match="changed since it was opened"):
+        revise(prepared, edited, expected="0" * 64)
+    (directory / "job.sbatch").write_text(result["script"] + "# outside\n")
+    with pytest.raises(ValueError, match="changed since it was opened"):
+        revise(prepared, edited)
+    assert calls == []
+    assert not (directory / "job.sbatch.generated").exists()
+
+
+def test_submitted_job_script_cannot_change(prepared, monkeypatch):
+    submitted(prepared, monkeypatch)
+    with pytest.raises(ValueError, match="not been submitted"):
+        revise(prepared, prepared[2]["script"])
+
+
+@pytest.mark.parametrize(
+    "script, message",
+    [
+        (None, "must be text"),
+        ("#!/bin/bash\n\x00\n", "NUL"),
+        ("#!/bin/bash\n" + "#" * (64 * 1024), "64 KiB"),
+        ("#!/bin/bash\n\ud800\n", "UTF-8"),
+        ("  \n", "empty"),
+        ("#SBATCH --time=1:00:00\nhostname\n", "#!"),
+    ],
+)
+def test_unusable_scripts_are_refused_before_slurm(
+    prepared, monkeypatch, script, message
+):
+    root, request, result = prepared
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    with pytest.raises(ValueError, match=message):
+        revise(prepared, script)
+    assert calls == []
+    assert (root / request["bundle"] / "job.sbatch").read_text() == result["script"]
+
+
+def test_slurm_refusal_is_reported_and_nothing_changes(prepared, monkeypatch):
+    root, request, result = prepared
+    directory = root / request["bundle"]
+    before = (directory / "receipt.json").read_bytes()
+    refusal = (
+        "sbatch: error: Batch job submission failed: Invalid partition name "
+        "specified\x07\nprivate detail\n"
+    )
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([], refusal=refusal))
+    edited = result["script"].replace("--partition=general", "--partition=nope")
+    with pytest.raises(ValueError) as error:
+        revise(prepared, edited)
+    assert str(error.value) == (
+        "Slurm would refuse this script: Invalid partition name specified"
+    )
+    assert (directory / "job.sbatch").read_text() == result["script"]
+    assert (directory / "receipt.json").read_bytes() == before
+    assert not list(directory.glob(".revise-*"))
+
+
+@pytest.mark.parametrize(
+    "output, reason",
+    [
+        (
+            ("", "sbatch: Requested node configuration is not available\n"),
+            "Requested node configuration is not available",
+        ),
+        (
+            ("sbatch: error: Memory specification can not be satisfied\n", ""),
+            "Memory specification can not be satisfied",
+        ),
+        (("", "\n"), None),
+    ],
+)
+def test_slurm_reason_without_an_error_line_is_still_shown(
+    prepared, monkeypatch, output, reason
+):
+    result = prepared[2]
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([], refusal=output))
+    edited = result["script"].replace("--cpus-per-task=2", "--cpus-per-task=4096")
+    with pytest.raises(ValueError) as error:
+        revise(prepared, edited)
+    assert str(error.value) == (
+        f"Slurm would refuse this script: {reason}"
+        if reason
+        else "Slurm would refuse this script; check its #SBATCH lines"
+    )
+
+
+def test_unavailable_check_refuses_only_unlisted_partitions(prepared, monkeypatch):
+    result = prepared[2]
+    monkeypatch.setattr(
+        tensor,
+        "_scheduler",
+        script_checks([], refusal=FileNotFoundError("sbatch")),
+    )
+    with pytest.raises(ValueError, match="no partition named nope"):
+        revise(
+            prepared,
+            result["script"].replace("--partition=general", "--partition=nope"),
+        )
+    response = revise(
+        prepared, result["script"].replace("--partition=general", "--partition=debug")
+    )
+    assert response["script_resources"]["partition"] == "debug"
+    assert any("could not check" in w for w in response["warnings"])
+
+
+@pytest.mark.parametrize(
+    "trouble",
+    [
+        "sbatch: error: Batch job submission failed: Unable to contact slurm "
+        "controller (connect failure)\n",
+        "sbatch: error: Batch job submission failed: Socket timed out on "
+        "send/recv operation\n",
+        "sbatch: error: Slurm backup controller in standby mode\n",
+        subprocess.TimeoutExpired(["sbatch"], 30),
+    ],
+)
+def test_unreachable_controller_saves_with_a_warning(prepared, monkeypatch, trouble):
+    """Slurm being unavailable is not a verdict on the script."""
+    root, request, result = prepared
+    calls = []
+    monkeypatch.setattr(
+        tensor, "_scheduler", script_checks(calls, refusal=trouble, sinfo=None)
+    )
+    edited = result["script"].replace("--time=1:00:00", "--time=2:00:00")
+    response = revise(prepared, edited)
+    assert response["script_edited"] is True
+    assert response["script"] == edited
+    assert any("Slurm could not check this script" in w for w in response["warnings"])
+    assert (root / request["bundle"] / "job.sbatch").read_text() == edited
+    assert [call[0] for call in calls] == ["sbatch", "sinfo"]
+
+
+def test_own_script_is_saved_with_warnings_about_inkly_lines(prepared, monkeypatch):
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([]))
+    own = (
+        "#!/bin/bash\n"
+        "#SBATCH -c 4 --mem=2G\n"
+        "#SBATCH -t 2-00:00:00\n"
+        "#SBATCH --array=1-3 --output=run.out\n"
+        "module load gaussian\n"
+        "g16 < sample_1.gjf > sample_1.out\n"
+    )
+    response = revise(prepared, own)
+    assert response["script"] == own
+    assert response["script_resources"] == {
+        "cpus": 4,
+        "slurm_memory_mib": 2048,
+        "time_limit": "2-00:00:00",
+        "hours": 48,
+        "partition": None,
+    }
+    warnings = "\n".join(response["warnings"])
+    for expected in [
+        "exactly the prepared input",
+        "sample_1.log",
+        "started the way Inkly starts it",
+        "--hint=nomultithread",
+        "--array is set",
+        "--output is set",
+    ]:
+        assert expected in warnings
+    assert "REQUESTED_CPUS" not in warnings
+
+
+def test_cpu_and_memory_mismatches_warn_and_point_to_desktop_fields(
+    prepared, monkeypatch
+):
+    result = prepared[2]
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([]))
+    fewer = revise(
+        prepared,
+        result["script"]
+        .replace("--cpus-per-task=2", "--cpus-per-task=1")
+        .replace("--mem=1024M", "--mem=700M"),
+    )
+    warnings = "\n".join(fewer["warnings"])
+    assert "1 CPUs but starts Gaussian on 2" in warnings
+    assert "stop before Gaussian runs" in warnings
+    assert "768 MB (GAUSSIAN_MEM_MB), more than the 700 MiB" in warnings
+    assert "CPU and memory fields" in warnings
+    tight = revise(
+        prepared,
+        result["script"]
+        .replace("--cpus-per-task=2", "--cpus-per-task=8")
+        .replace("--mem=1024M", "--mem=1000M"),
+    )
+    warnings = "\n".join(tight["warnings"])
+    assert "Gaussian uses only 2" in warnings
+    assert "less room than Inkly's usual headroom" in warnings
+
+
+def test_partition_limits_from_sinfo_warn(prepared, monkeypatch):
+    result = prepared[2]
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([]))
+    response = revise(
+        prepared,
+        result["script"]
+        .replace("--partition=general", "--partition=debug")
+        .replace("--time=1:00:00", "--time=3:00:00")
+        .replace("--cpus-per-task=2", "--cpus-per-task=16")
+        .replace("--mem=1024M", "--mem=32G"),
+    )
+    warnings = "\n".join(response["warnings"])
+    assert "longer than partition debug allows" in warnings
+    assert "No node in partition debug has 16 CPUs (largest: 8)" in warnings
+    assert "No node in partition debug has 32768 MiB" in warnings
+
+
+def test_edited_jobs_are_marked_in_history_and_details(prepared, monkeypatch):
+    root, request, result = prepared
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([]))
+    revise(prepared, result["script"].replace("--time=1:00:00", "--time=2:00:00"))
+    jobs = tensor.handle({"action": "jobs", "bundle": "0" * 32}, root)["jobs"]
+    assert [job["script_edited"] for job in jobs] == [True]
+    details = operate(prepared, "job_details")
+    assert details["script_edited"] is True
+
+
+def test_version_offers_revise_script(tmp_path):
+    result = tensor.handle({"action": "version", "bundle": "d" * 32}, tmp_path)
+    assert "revise_script" in result["capabilities"]

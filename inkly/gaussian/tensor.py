@@ -20,6 +20,7 @@ from inkly.core.storage import history_lock, private_directory, private_open
 from inkly.gaussian.job_spec import GaussianJobSpec
 from inkly.gaussian.job_insights import job_details
 from inkly.gaussian.job_list import list_jobs
+from inkly.gaussian import script_revision
 from inkly.gaussian.sbatch import generate_sbatch
 
 
@@ -37,6 +38,7 @@ CAPABILITIES = (
     "job_details",
     "jobs",
     "input",
+    "revise_script",
 )
 # Slurm accounting can lag scancel by a moment; re-read briefly, never retry it.
 CANCEL_STATUS_READS = 5
@@ -248,6 +250,76 @@ def _cancel(directory, receipt, request):
     return {**receipt, **status}
 
 
+def _revise(directory, receipt, request):
+    """Store the researcher's own script for a job that was never submitted.
+
+    Nothing is locked: the researcher may change or replace any line. Only a
+    script Slurm cannot accept is refused; anything else comes back as
+    warnings. The first generated script is kept so it can be restored.
+    """
+    if receipt["submission"] != "PREPARED":
+        raise ValueError(
+            "Only a prepared job that has not been submitted can have its script changed"
+        )
+    current = _read(directory / "job.sbatch", script_revision.MAX_SCRIPT * 4)
+    if (
+        request.get("expected_sha256") != receipt["script_sha256"]
+        or hashlib.sha256(current).hexdigest() != receipt["script_sha256"]
+    ):
+        raise ValueError(
+            "The script changed since it was opened; open View script again"
+        )
+    text = script_revision.normalize(request.get("script"))
+    original = directory / "job.sbatch.generated"
+    if not receipt.get("script_edited"):
+        # job.sbatch is still the generated script; keep that copy once.
+        if not original.exists():
+            _write(original, current)
+        receipt["generated_script_sha256"] = receipt["script_sha256"]
+    generated = _read(original, script_revision.MAX_SCRIPT * 4)
+    if hashlib.sha256(generated).hexdigest() != receipt["generated_script_sha256"]:
+        raise ValueError("The saved generated script changed; prepare again")
+    data = text.encode()
+    temporary = directory / f".revise-{os.urandom(8).hex()}.sbatch"
+    try:
+        _write(temporary, data)
+        if data == generated:
+            # Back to what Inkly generated: nothing for Slurm to check.
+            warnings = []
+            for key in ("script_edited_at", "script_resources"):
+                receipt.pop(key, None)
+            receipt["script_edited"] = False
+        else:
+            resources, warnings = script_revision.check(
+                text,
+                generated.decode("utf-8"),
+                _scheduler,
+                directory,
+                temporary.name,
+                f"inkly:{receipt['bundle']}",
+                resolve_cluster_profile(),
+            )
+            receipt.update(
+                script_edited=True,
+                script_edited_at=datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                script_resources=resources,
+            )
+        os.replace(temporary, directory / "job.sbatch")
+    finally:
+        temporary.unlink(missing_ok=True)
+    receipt["script_sha256"] = hashlib.sha256(data).hexdigest()
+    _save(directory / "receipt.json", receipt)
+    return {
+        **receipt,
+        **_state(directory, receipt),
+        "script": text,
+        "generated_script": generated.decode("utf-8"),
+        "warnings": warnings,
+    }
+
+
 def handle(request, root=None):
     """Process exactly one explicit operation; never retry a submission."""
     if os.name != "posix":
@@ -352,6 +424,8 @@ def handle(request, root=None):
             return receipt
         if action == "cancel":
             return _cancel(directory, receipt, request)
+        if action == "revise_script":
+            return _revise(directory, receipt, request)
         if action == "input":
             # The researcher's own prepared input, unchanged, so Desktop on
             # another computer can keep a copy beside the returned result.
@@ -371,6 +445,10 @@ def handle(request, root=None):
         if action == "status":
             if receipt["submission"] == "PREPARED":
                 response["script"] = _read(directory / "job.sbatch").decode("utf-8")
+                if receipt.get("script_edited"):
+                    response["generated_script"] = _read(
+                        directory / "job.sbatch.generated"
+                    ).decode("utf-8")
             return response
         if status != {"state": "COMPLETED", "exit_code": "0:0"}:
             raise ValueError(
