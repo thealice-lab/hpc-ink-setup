@@ -117,9 +117,8 @@ class RecentJob:
         cpus = int(self.cpus) if self.cpus.isdigit() else 0
         if not elapsed or elapsed < MIN_EFFICIENCY_SECONDS or not cpus:
             return None
-        used = self.step_cpu_seconds
-        if used is None:
-            used = parse_duration(self.total_cpu)
+        # Zero CPU time means Slurm did not record it, not an idle job.
+        used = self.step_cpu_seconds or parse_duration(self.total_cpu)
         if not used:
             return None
         return used / (elapsed * cpus)
@@ -127,7 +126,8 @@ class RecentJob:
     def memory_use(self) -> float | None:
         requested = self.memory_mib
         elapsed = self.elapsed_seconds
-        if not requested or self.peak_memory_mib is None:
+        # A blank or zero peak means Slurm did not record memory use.
+        if not requested or not self.peak_memory_mib:
             return None
         if not elapsed or elapsed < MIN_EFFICIENCY_SECONDS:
             return None
@@ -173,7 +173,7 @@ def _apply_steps(jobs: list[RecentJob], output: str) -> None:
         if cpu is not None:
             job.step_cpu_seconds = (job.step_cpu_seconds or 0) + cpu
         rss = parse_bytes_as_mib(fields[2])
-        if rss is not None:
+        if rss:
             job.peak_memory_mib = max(job.peak_memory_mib or 0, rss)
 
 
@@ -244,6 +244,37 @@ def _average(values: list[float]) -> str:
     return _percent(sum(values) / len(values))
 
 
+def _efficiency_lines(shown: list[RecentJob]) -> list[str]:
+    cpu = [value for job in shown if (value := job.cpu_use()) is not None]
+    memory = [value for job in shown if (value := job.memory_use()) is not None]
+    long_enough = [
+        job for job in shown if (job.elapsed_seconds or 0) >= MIN_EFFICIENCY_SECONDS
+    ]
+    lines = []
+    if cpu or memory:
+        figures = []
+        if cpu:
+            figures.append(f"average CPU use {_average(cpu)}")
+        if memory:
+            figures.append(f"average memory peak {_average(memory)} of the request")
+        lines.append(f"Across the jobs listed: {', '.join(figures)}.")
+    if long_enough and not cpu and not memory:
+        lines.append(
+            "Efficiency is unavailable: Slurm recorded no CPU time or memory use "
+            "for these jobs (job accounting may not collect it on this cluster)."
+        )
+    elif long_enough and not memory:
+        lines.append(
+            "Memory peak is unavailable: Slurm recorded no memory use for these jobs."
+        )
+    if memory:
+        lines.append(
+            "Memory peak is the largest step's sampled maximum; short spikes, such "
+            "as the one that ends an out-of-memory job, may not show."
+        )
+    return lines
+
+
 def collect(query: str = "") -> tuple[list[str], list[slurm_readonly.SlurmResult]]:
     days = _days(query)
     allocations = slurm_readonly.run("my_recent_jobs", days=days)
@@ -284,19 +315,7 @@ def collect(query: str = "") -> tuple[list[str], list[slurm_readonly.SlurmResult
         if len(finished) > len(shown):
             lines.append(f"- and {len(finished) - len(shown)} more finished jobs")
 
-        cpu = [value for job in shown if (value := job.cpu_use()) is not None]
-        memory = [value for job in shown if (value := job.memory_use()) is not None]
-        if cpu or memory:
-            figures = []
-            if cpu:
-                figures.append(f"average CPU use {_average(cpu)}")
-            if memory:
-                figures.append(f"average memory peak {_average(memory)} of the request")
-            lines.append(f"Across the jobs listed: {', '.join(figures)}.")
-        lines.append(
-            "Memory peak is the largest step's sampled maximum; short spikes, such "
-            "as the one that ends an out-of-memory job, may not show."
-        )
+        lines += _efficiency_lines(shown)
     for wanted in ids:
         if len(wanted.split("_", 1)[0]) >= 5 and not any(
             _mentioned(job, [wanted]) for job in jobs

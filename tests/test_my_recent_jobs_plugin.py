@@ -135,3 +135,63 @@ def test_unavailable_accounting(monkeypatch, missing, outputs, message):
     output = my_recent_jobs.run("")
 
     assert f"Your recent jobs are unavailable: {message}" in output
+
+
+# Accounting that does not gather usage: zero CPU time, blank or zero MaxRSS.
+NO_USAGE_ALLOCATIONS = "\n".join(
+    [
+        "300001|300001|COMPLETED|0:0|general|02:00:00|1-00:00:00|4|1|00:00:00|"
+        "billing=4,cpu=4,mem=16G,node=1",
+        "300002|300002|FAILED|1:0|general|00:30:00|1-00:00:00|8|1|00:00:00|"
+        "billing=8,cpu=8,mem=8G,node=1",
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        "300001.batch|00:00:00|\n300002.batch|00:00:00|",
+        "300001.batch|00:00:00|0\n300002.batch|00:00:00|0",
+        "",
+    ],
+)
+def test_disabled_accounting_makes_efficiency_unavailable_not_zero(monkeypatch, steps):
+    install_fake_slurm(
+        monkeypatch, {"my_recent_jobs": NO_USAGE_ALLOCATIONS, "my_job_steps": steps}
+    )
+
+    output = my_recent_jobs.run("how efficient were my jobs?")
+
+    assert "- 300001: completed; general, 4 CPUs, 16.0 GiB; ran 2 h of 1 d" in output
+    assert "CPU use" not in output
+    assert "memory peak" not in output.lower()
+    assert "0%" not in output
+    assert (
+        "Efficiency is unavailable: Slurm recorded no CPU time or memory use" in output
+    )
+
+
+@pytest.mark.parametrize("max_rss", ["", "0", "0K"])
+def test_blank_max_rss_makes_memory_unavailable_not_zero(monkeypatch, max_rss):
+    allocations = NO_USAGE_ALLOCATIONS.replace(
+        "|02:00:00|1-00:00:00|4|1|00:00:00|", "|02:00:00|1-00:00:00|4|1|06:00:00|"
+    )
+    install_fake_slurm(
+        monkeypatch,
+        {
+            "my_recent_jobs": allocations,
+            "my_job_steps": f"300001.batch|06:00:00|{max_rss}",
+        },
+    )
+
+    output = my_recent_jobs.run("")
+
+    assert (
+        "- 300001: completed; general, 4 CPUs, 16.0 GiB; ran 2 h of 1 d; CPU use 75%"
+        in output
+    )
+    assert "memory peak 0" not in output
+    assert "0% of the request" not in output
+    assert "Memory peak is unavailable: Slurm recorded no memory use" in output
+    assert "largest step's sampled maximum" not in output
