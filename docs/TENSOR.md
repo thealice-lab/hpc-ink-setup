@@ -383,6 +383,9 @@ Everything else is saved with warnings, for example:
   CPUs and memory changes these values together.
 - A time limit longer than the partition allows, or more CPUs or memory than
   any node in the partition has, according to `sinfo`.
+- An `--account` or `--qos` that Slurm's accounting (`sacctmgr`) does not list
+  for you. Clusters that enforce accounts refuse those in `--test-only`;
+  others accept any name and run the job anyway.
 - `--array`, `--chdir`, `--output`, `--error`, more than one node or task,
   or no `--hint=nomultithread`.
 

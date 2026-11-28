@@ -558,7 +558,7 @@ def test_watch_status_reads_accounting_once_per_check(prepared, monkeypatch, sta
 SINFO = "general*|7-00:00:00|64|256000\ndebug|1:00:00|8|16000\n"
 
 
-def script_checks(calls, refusal=None, sinfo=SINFO):
+def script_checks(calls, refusal=None, sinfo=SINFO, assoc="users|normal\n"):
     """Fake Slurm for script checks; --test-only never submits."""
 
     def scheduler(args, directory):
@@ -574,6 +574,13 @@ def script_checks(calls, refusal=None, sinfo=SINFO):
             if refusal:
                 return subprocess.CompletedProcess(args, 1, "", refusal)
             return subprocess.CompletedProcess(args, 0, "", "sbatch: Job 1 to start")
+        if args[0] == "sacctmgr":
+            assert args[:5] == ["sacctmgr", "-n", "-P", "show", "assoc"]
+            if isinstance(assoc, BaseException):
+                raise assoc
+            if assoc is None:
+                return subprocess.CompletedProcess(args, 1, "", "sacctmgr: error")
+            return subprocess.CompletedProcess(args, 0, assoc, "")
         if args[0] == "sinfo":
             if sinfo is None:
                 return subprocess.CompletedProcess(args, 1, "", "sinfo: error")
@@ -865,6 +872,47 @@ def test_cpu_and_memory_mismatches_warn_and_point_to_desktop_fields(
     warnings = "\n".join(tight["warnings"])
     assert "Gaussian uses only 2" in warnings
     assert "less room than Inkly's usual headroom" in warnings
+
+
+def test_unknown_account_or_qos_warns_without_refusing(prepared, monkeypatch):
+    result = prepared[2]
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    edited = result["script"].replace(
+        "#SBATCH --hint=nomultithread",
+        "#SBATCH --hint=nomultithread\n#SBATCH -A labx --qos=hiprio",
+    )
+    response = revise(prepared, edited)
+    assert response["script"] == edited
+    warnings = "\n".join(response["warnings"])
+    assert "no account labx for you (yours: users)" in warnings
+    assert "does not list QOS hiprio for you (yours: normal)" in warnings
+    assert calls[-1][:5] == ["sacctmgr", "-n", "-P", "show", "assoc"]
+    assert calls[-1][-1] == "format=account,qos"
+
+
+@pytest.mark.parametrize(
+    "assoc", ["USERS|normal,Long\n", None, FileNotFoundError("sacctmgr"), "\n"]
+)
+def test_known_account_or_no_accounting_gives_no_account_warning(
+    prepared, monkeypatch, assoc
+):
+    """Listed names (any case) pass; without accounting records nothing is said."""
+    result = prepared[2]
+    monkeypatch.setattr(tensor, "_scheduler", script_checks([], assoc=assoc))
+    edited = result["script"].replace(
+        "#SBATCH --hint=nomultithread",
+        "#SBATCH --hint=nomultithread\n#SBATCH --account=users -q long",
+    )
+    response = revise(prepared, edited)
+    assert not [w for w in response["warnings"] if "accounting" in w]
+
+
+def test_accounting_is_not_asked_without_account_or_qos(prepared, monkeypatch):
+    calls = []
+    monkeypatch.setattr(tensor, "_scheduler", script_checks(calls))
+    revise(prepared, prepared[2]["script"].replace("--time=1:00:00", "--time=2:00:00"))
+    assert "sacctmgr" not in [call[0] for call in calls]
 
 
 def test_partition_limits_from_sinfo_warn(prepared, monkeypatch):

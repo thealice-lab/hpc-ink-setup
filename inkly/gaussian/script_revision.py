@@ -10,6 +10,8 @@ Everything else becomes a plain warning, so the researcher decides.
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -17,6 +19,7 @@ import subprocess
 MAX_SCRIPT = 64 * 1024
 # Options whose value may follow as the next word ("--time 2:00:00").
 _LONG_VALUES = {
+    "account",
     "array",
     "chdir",
     "cpus-per-task",
@@ -29,9 +32,11 @@ _LONG_VALUES = {
     "ntasks",
     "output",
     "partition",
+    "qos",
     "time",
 }
 _SHORT = {
+    "A": "account",
     "a": "array",
     "c": "cpus-per-task",
     "D": "chdir",
@@ -41,6 +46,7 @@ _SHORT = {
     "n": "ntasks",
     "o": "output",
     "p": "partition",
+    "q": "qos",
     "t": "time",
 }
 # sbatch says these when Slurm's controller cannot be reached, not when the
@@ -323,6 +329,56 @@ def _limits(resources, listed, default):
     return warnings
 
 
+def _accounting(scheduler, directory, options):
+    """Warn about an --account or --qos that accounting does not list for you.
+
+    Only a warning: clusters that do not enforce accounts accept any name and
+    record it, and clusters that do already refuse it in sbatch --test-only.
+    """
+    account, qos = options.get("account"), options.get("qos")
+    if not account and not qos:
+        return []
+    user = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        result = scheduler(
+            [
+                "sacctmgr",
+                "-n",
+                "-P",
+                "show",
+                "assoc",
+                f"user={user}",
+                "format=account,qos",
+            ],
+            directory,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    accounts, allowed = set(), set()
+    for line in result.stdout.splitlines() if result.returncode == 0 else ():
+        fields = line.strip().split("|")
+        if len(fields) >= 2 and fields[0].strip():
+            accounts.add(fields[0].strip().lower())
+            allowed |= {name.strip().lower() for name in fields[1].split(",")}
+    allowed.discard("")
+    if not accounts:
+        return []  # No accounting records to compare with.
+    warnings = []
+    if account and account.lower() not in accounts:
+        warnings.append(
+            f"Slurm's accounting lists no account {account} for you (yours: "
+            f"{', '.join(sorted(accounts))}). Depending on the cluster, Slurm "
+            "refuses the job when it is submitted or runs it anyway."
+        )
+    if qos and allowed and qos.lower() not in allowed:
+        warnings.append(
+            f"Slurm's accounting does not list QOS {qos} for you (yours: "
+            f"{', '.join(sorted(allowed))}). Depending on the cluster, Slurm "
+            "refuses the job when it is submitted or runs it anyway."
+        )
+    return warnings
+
+
 def _refusal(stderr, stdout=""):
     """Slurm's own reason, from its error line or else its first line."""
     lines = [line.strip() for line in (stderr + "\n" + stdout).splitlines()]
@@ -383,4 +439,5 @@ def check(text, generated, scheduler, directory, filename, comment, profile):
     warnings += _inkly_changes(text, generated, options)
     warnings += _consistency(text, resources, fraction)
     warnings += _limits(resources, listed, default)
+    warnings += _accounting(scheduler, directory, options)
     return resources, warnings
